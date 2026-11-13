@@ -3,10 +3,13 @@
   "version": "1.0.0",
   "description": "Sistema de automação de cobranças Pix via WhatsApp com liquidação automática em carteira Cripto (USDT, USDC, BTC, DePix)",
   "type": "module",
+  "engines": {
+    "node": ">=24.0.0 <25.0.0"
+  },
   "scripts": {
     "dev": "node --watch src/index.ts",
     "start": "node src/index.ts",
-    "build": "tsc",
+    "build": "node -e \"console.log('Pronto para Node 24 nativo')\"",
     "typecheck": "tsc --noEmit",
     "test": "node --test tests/automation.test.ts"
   },

@@ -1,14 +1,14 @@
-# Configuração automática para 1 clique no Render.com (Plano Gratuito, sem cartão)
+# Configuração Node.js Nativo para Plano Gratuito sem Cartão no Render.com
 services:
   - type: web
     name: robo-pix-cripto
-    runtime: docker
+    runtime: node
     plan: free
-    dockerfilePath: ./Dockerfile
-    dockerContext: .
+    buildCommand: npm install
+    startCommand: npm start
     healthCheckPath: /health
     envVars:
-      - key: PORT
-        value: "3000"
+      - key: NODE_VERSION
+        value: "24"
       - key: REQUIRE_PAYER_DOCUMENT
         value: "false"
