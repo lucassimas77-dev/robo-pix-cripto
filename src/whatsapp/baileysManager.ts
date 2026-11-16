@@ -27,10 +27,12 @@ export interface BaileysStatusSnapshot {
 
 const MAX_UNSCANNED_QR_CYCLES = 3;
 const MAX_JID_MAP_ENTRIES = 5_000;
+const SESSION_FLOW_FRESHNESS_MS = 2 * 60 * 60 * 1000; // 2 horas
 
 export class BaileysDirectManager {
   private sock: WASocket | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  private connectGeneration = 0;
   private state: BaileysStatusSnapshot['state'] = 'DISCONNECTED';
   private qrCodeDataUrl: string | undefined;
   private connectedPhone: string | undefined;
@@ -127,6 +129,7 @@ export class BaileysDirectManager {
       return this.getStatus();
     }
 
+    const gen = ++this.connectGeneration;
     this.clearReconnectTimer();
     if (resetQrAttempts) {
       this.unscannedQrCount = 0;
@@ -139,12 +142,20 @@ export class BaileysDirectManager {
 
     try {
       const { state: authState, saveCreds } = await useMultiFileAuthState(this.authDir);
+      if (this.intentionalStop || gen !== this.connectGeneration) {
+        return this.getStatus();
+      }
+
       let version: [number, number, number] | undefined;
       try {
         const latest = await fetchLatestBaileysVersion();
         version = latest.version;
       } catch {
         // Fallback embutido
+      }
+
+      if (this.intentionalStop || gen !== this.connectGeneration) {
+        return this.getStatus();
       }
 
       const logger = pino({ level: 'silent' });
@@ -160,6 +171,7 @@ export class BaileysDirectManager {
       this.sock = sock;
 
       sock.ev.on('creds.update', () => {
+        if (this.intentionalStop || gen !== this.connectGeneration) return;
         Promise.resolve(saveCreds()).catch((err) => {
           console.error('[WhatsApp QR] Erro ao salvar credenciais:', err);
         });
@@ -167,7 +179,7 @@ export class BaileysDirectManager {
 
       sock.ev.on('connection.update', async (update) => {
         try {
-          if (this.sock !== sock) return;
+          if (this.sock !== sock || gen !== this.connectGeneration) return;
 
           const { connection, lastDisconnect, qr } = update;
 
@@ -187,7 +199,11 @@ export class BaileysDirectManager {
                 'QR Code expirou por falta de leitura. Clique em "Gerar QR Code" para tentar novamente.';
               return;
             }
-            this.qrCodeDataUrl = await QRCode.toDataURL(qr, { width: 280, margin: 2 });
+            const dataUrl = await QRCode.toDataURL(qr, { width: 280, margin: 2 });
+            if (this.sock !== sock || gen !== this.connectGeneration || this.intentionalStop) {
+              return;
+            }
+            this.qrCodeDataUrl = dataUrl;
             this.state = 'QR_READY';
           }
 
@@ -217,12 +233,12 @@ export class BaileysDirectManager {
               this.state = 'DISCONNECTED';
               this.connectedPhone = undefined;
               this.lastError = 'Sessão desconectada pelo celular. Gere um novo QR Code.';
-            } else if (!this.intentionalStop) {
+            } else if (!this.intentionalStop && gen === this.connectGeneration) {
               this.state = 'DISCONNECTED';
               this.clearReconnectTimer();
               this.reconnectTimer = setTimeout(() => {
                 this.reconnectTimer = null;
-                if (!this.intentionalStop) {
+                if (!this.intentionalStop && gen === this.connectGeneration) {
                   void this.startConnection(false);
                 }
               }, 3000);
@@ -236,7 +252,7 @@ export class BaileysDirectManager {
       });
 
       sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        if (this.sock !== sock) return;
+        if (this.sock !== sock || gen !== this.connectGeneration) return;
         if (type !== 'notify') return;
 
         for (const msg of messages) {
@@ -253,7 +269,6 @@ export class BaileysDirectManager {
               continue;
             }
 
-            // Desembrulha mensagens temporárias (`ephemeralMessage`), `viewOnce`, etc.
             const normalized = normalizeMessageContent(msg.message);
             if (!normalized) continue;
 
@@ -273,7 +288,7 @@ export class BaileysDirectManager {
               : altJid || remoteJid;
             const userPart = bestJidForDigits.split('@')[0]?.split(':')[0]?.split('_')[0] || '';
             const senderDigits = onlyDigits(userPart);
-            if (senderDigits.length < 8) continue; // Ignora 0@s.whatsapp.net / JIDs inválidos
+            if (senderDigits.length < 8) continue;
 
             this.rememberJid(senderDigits, remoteJid);
 
@@ -288,7 +303,12 @@ export class BaileysDirectManager {
             if (this.filterMode === 'keyword_only') {
               const session = this.repository.getSession(senderDigits);
               const activeOrder = this.repository.findActivePendingOrderByPhone(senderDigits);
-              const isAlreadyInFlow = session.stage !== 'IDLE' || activeOrder !== null;
+              const sessionAgeMs = Date.now() - new Date(session.updatedAt).getTime();
+              const isFreshSession =
+                session.stage !== 'IDLE' &&
+                Number.isFinite(sessionAgeMs) &&
+                sessionAgeMs < SESSION_FLOW_FRESHNESS_MS;
+              const isAlreadyInFlow = isFreshSession || activeOrder !== null;
               const hasPixKeyword =
                 /\bpix\b|pagar|pagamento|chave\s*pix|gerar\s*pix|mand[ae]\s*o?\s*pix|comprovante/i.test(
                   text
@@ -313,14 +333,17 @@ export class BaileysDirectManager {
         }
       });
     } catch (err) {
-      this.state = 'DISCONNECTED';
-      this.lastError = err instanceof Error ? err.message : String(err);
+      if (gen === this.connectGeneration && !this.intentionalStop) {
+        this.state = 'DISCONNECTED';
+        this.lastError = err instanceof Error ? err.message : String(err);
+      }
     }
 
     return this.getStatus();
   }
 
   public async disconnect(wipeSession = false): Promise<BaileysStatusSnapshot> {
+    this.connectGeneration++;
     this.intentionalStop = true;
     this.clearReconnectTimer();
     const currentSock = this.sock;

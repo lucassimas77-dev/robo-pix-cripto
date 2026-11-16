@@ -3,9 +3,10 @@ import type { IWhatsAppGateway, PixCryptoOrder } from '../types/domain.ts';
 import { formatBrl } from '../utils/cpfCnpjValidator.ts';
 import type { ConversationEngine } from './conversationEngine.ts';
 
-const MAX_API_POLLS_PER_SWEEP = 4; // Máx 16 req/min em ciclos de 15s (abaixo do teto de 30 req/min da DePix)
+const MAX_API_POLLS_PER_SWEEP = 3;
+const MAX_TOTAL_API_CALLS_PER_SWEEP = 5; // Teto global estrito (máx 20 req/min < 30 req/min da DePix)
 const PENDING_POLL_COOLDOWN_MS = 14_000;
-const CONFIRMED_POLL_COOLDOWN_MS = 120_000; // Pedidos no Cofre consultados a cada 2 minutos
+const CONFIRMED_POLL_COOLDOWN_MS = 120_000;
 
 export class ExpirationWatcher {
   private timer: NodeJS.Timeout | null = null;
@@ -58,9 +59,9 @@ export class ExpirationWatcher {
       const nowMs = now.getTime();
       let expiredCount = 0;
       let warnedCount = 0;
+      let apiCallsUsed = 0;
       const provider = this.engine?.getCryptoProvider();
 
-      // Poda IDs antigos do mapa de rate-limit para zero vazamento de memória
       const activeIds = new Set(activeOrders.map((o) => o.id));
       for (const cachedId of this.lastPolledAt.keys()) {
         if (!activeIds.has(cachedId)) {
@@ -68,7 +69,6 @@ export class ExpirationWatcher {
         }
       }
 
-      // Seleciona em round-robin até MAX_API_POLLS_PER_SWEEP pedidos elegíveis para consulta externa
       const eligibleForPoll: PixCryptoOrder[] = [];
       if (provider) {
         for (const order of activeOrders) {
@@ -90,8 +90,13 @@ export class ExpirationWatcher {
       );
 
       for (const order of activeOrders) {
-        // 1. Consulta ativa controlada por orçamento de rate-limit
-        if (provider && pollIdsThisCycle.has(order.id)) {
+        // 1. Consulta ativa respeitando orçamento global por ciclo
+        if (
+          provider &&
+          pollIdsThisCycle.has(order.id) &&
+          apiCallsUsed < MAX_TOTAL_API_CALLS_PER_SWEEP
+        ) {
+          apiCallsUsed++;
           this.lastPolledAt.set(order.id, nowMs);
           const remote = await provider.checkChargeStatus(order.providerChargeId);
           if (remote) {
@@ -122,24 +127,36 @@ export class ExpirationWatcher {
           }
         }
 
-        // 2. Pedidos já pagos (`PIX_CONFIRMED`) no Cofre nunca expiram localmente
+        // 2. Pedidos já pagos (`PIX_CONFIRMED`) no Cofre nunca expiram
         if (order.status !== 'PENDING') {
           continue;
         }
 
-        // 3. Expiração local pontual para TODOS os pedidos `PENDING`
+        // 3. Verificação de expiração de `PENDING`
         const expiresMs = new Date(order.expiresAt).getTime();
         const diffMs = expiresMs - nowMs;
 
         if (diffMs <= 0) {
-          // Antes de expirar um `prd_...` que não coube no lote de poll acima, faz 1 checagem final se possível
-          if (provider && order.provider === provider.name && !pollIdsThisCycle.has(order.id)) {
+          // Se o provedor suporta consulta remota e não foi checado neste ciclo, exige 1 checagem final dentro do orçamento!
+          if (
+            provider &&
+            order.provider === provider.name &&
+            order.provider !== 'mock' &&
+            !pollIdsThisCycle.has(order.id)
+          ) {
+            if (apiCallsUsed >= MAX_TOTAL_API_CALLS_PER_SWEEP) {
+              // Adia 15s para o próximo ciclo em vez de expirar às cegas sem checar na API!
+              continue;
+            }
+            apiCallsUsed++;
             this.lastPolledAt.set(order.id, nowMs);
             const lastChance = await provider.checkChargeStatus(order.providerChargeId);
             if (lastChance) {
               if (
                 this.engine &&
-                (lastChance.status === 'SETTLED_CRYPTO' || lastChance.status === 'PIX_CONFIRMED')
+                (lastChance.status === 'SETTLED_CRYPTO' ||
+                  lastChance.status === 'PIX_CONFIRMED' ||
+                  lastChance.status === 'FAILED')
               ) {
                 await this.engine.handleSettlementWebhook({
                   provider: order.provider,
@@ -166,9 +183,31 @@ export class ExpirationWatcher {
           const updated = this.repository.updateOrderStatus(order.id, 'EXPIRED');
           if (updated) {
             expiredCount++;
-            if (provider && provider.name === order.provider && provider.expireCharge) {
-              void provider.expireCharge(order.providerChargeId);
+            if (
+              provider &&
+              provider.name === order.provider &&
+              provider.expireCharge &&
+              apiCallsUsed < MAX_TOTAL_API_CALLS_PER_SWEEP
+            ) {
+              apiCallsUsed++;
+              await provider.expireCharge(order.providerChargeId);
             }
+
+            // Coloca sessão em `AWAITING_AMOUNT` para que o cliente possa responder o valor direto no modo `keyword_only`!
+            const otherActive = this.repository.findActivePendingOrderByPhone(
+              order.customerPhone,
+              now.toISOString()
+            );
+            if (!otherActive) {
+              const sess = this.repository.getSession(order.customerPhone);
+              this.repository.saveSession({
+                phone: order.customerPhone,
+                customerJid: order.customerJid ?? sess.customerJid,
+                stage: 'AWAITING_AMOUNT',
+                updatedAt: now.toISOString(),
+              });
+            }
+
             try {
               await this.whatsapp.sendText(
                 order.customerPhone,

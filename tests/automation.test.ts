@@ -88,16 +88,32 @@ test('Concorrência, mensagens pós-pagamento ("já paguei"), estado AWAITING_AM
   });
   assert.equal(repository.listRecentOrders().length, 1);
 
-  // Transição para FAILED avisa tanto cliente quanto adminWhatsappPhone!
+  // Transição para FAILED avisa tanto cliente quanto adminWhatsappPhone e ativa AWAITING_AMOUNT!
   await engine.handleSettlementWebhook({
     provider: 'mock',
     externalId: firstOrder.externalId,
     newStatus: 'FAILED',
     rawEventName: 'TEST_REFUNDED',
   });
+  assert.equal(repository.getSession(clientPhone).stage, 'AWAITING_AMOUNT');
   const adminMsgs = repository.listMessages('5511900000000');
   assert.equal(adminMsgs.length, 1);
   assert.match(adminMsgs[0].body, /Estornado\/Cancelado/i);
+
+  // Mesmo após FAILED (ou sem cobrança ativa), "Já paguei o pix de 250" NUNCA cria nova cobrança duplicada!
+  await engine.handleIncomingMessage({
+    phone: clientPhone,
+    customerJid: clientLid,
+    text: 'Já paguei o pix de 250',
+  });
+  assert.equal(repository.listRecentOrders().length, 1);
+
+  // Número novo nunca visto mandando "Fiz o pix de 80" também não gera cobrança fantasma!
+  await engine.handleIncomingMessage({
+    phone: '5511955554444',
+    text: 'Fiz o pix de 80',
+  });
+  assert.equal(repository.listRecentOrders().length, 1);
 
   // Valor acima do máximo mantém sessão em AWAITING_AMOUNT para aceitar próximo número puro!
   await engine.handleIncomingMessage({
@@ -303,6 +319,13 @@ test('DePixAppProvider detecta estorno (cancelled -> FAILED) em prd_..., prioriz
     const pollPaid = await depix.checkChargeStatus('prd_refund_test');
     assert.equal(pollPaid?.status, 'SETTLED_CRYPTO');
     assert.equal(pollPaid?.txHash, 'tx_liquid_ok');
+
+    // Sub-checkout expirado (`product_id` presente) é ignorado em parseWebhookPayload para não matar `prd_...` prematuramente
+    const subExpired = depix.parseWebhookPayload({
+      event: 'checkout.expired',
+      data: { id: 'chk_sub_1', product_id: 'prd_refund_test', status: 'expired', is_live: true },
+    });
+    assert.equal(subExpired, null);
   } finally {
     fakeDepixServer.close();
   }

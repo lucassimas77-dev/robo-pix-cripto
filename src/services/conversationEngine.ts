@@ -138,38 +138,69 @@ export class ConversationEngine {
       return;
     }
 
-    // Mensagens pós-pagamento ("já paguei o pix de 50", "fiz o pix", "status", "comprovante") NÃO geram nova cobrança!
+    // Mensagens pós-pagamento ("já paguei o pix de 50", "fiz o pix", "status", "comprovante") NUNCA geram nova cobrança!
     if (
       ['status', 'comprovante', 'meu pix'].includes(lower) ||
       isPaymentConfirmationMessage(text)
     ) {
       const recent = this.repository.findMostRecentOrderByPhone(phone);
-      if (recent) {
-        if (recent.status === 'SETTLED_CRYPTO') {
-          await this.safeSendText(
-            phone,
-            `✅ Seu pagamento de *${formatBrl(recent.amountBrl)}* (protocolo \`${recent.externalId}\`) já está *100% confirmado*!`,
-            session.customerJid
-          );
-          return;
-        }
-        if (recent.status === 'PIX_CONFIRMED') {
-          await this.safeSendText(
-            phone,
-            `🎉 Seu pagamento de *${formatBrl(recent.amountBrl)}* já foi recebido pela processadora e está em liquidação final!`,
-            session.customerJid
-          );
-          return;
-        }
-        if (recent.status === 'PENDING' && new Date(recent.expiresAt).getTime() > Date.now()) {
-          await this.safeSendText(
-            phone,
-            `⏳ Recebemos seu aviso! Assim que o banco compensar sua cobrança de *${formatBrl(recent.amountBrl)}*, enviarei a confirmação automática aqui mesmo em instantes.`,
-            session.customerJid
-          );
-          return;
-        }
+      if (!recent) {
+        session.stage = 'AWAITING_AMOUNT';
+        this.repository.saveSession(session);
+        await this.safeSendText(
+          phone,
+          `ℹ️ Não encontrei nenhuma cobrança registrada recentemente para este número.\n\nSe desejar gerar um novo Pix, envie apenas o *valor em Reais* (ex: *50,00*):`,
+          session.customerJid
+        );
+        return;
       }
+
+      if (recent.status === 'SETTLED_CRYPTO') {
+        await this.safeSendText(
+          phone,
+          `✅ Seu pagamento de *${formatBrl(recent.amountBrl)}* (protocolo \`${recent.externalId}\`) já está *100% confirmado*!`,
+          session.customerJid
+        );
+        return;
+      }
+
+      if (recent.status === 'PIX_CONFIRMED') {
+        await this.safeSendText(
+          phone,
+          `🎉 Seu pagamento de *${formatBrl(recent.amountBrl)}* já foi recebido pela processadora e está em liquidação final!`,
+          session.customerJid
+        );
+        return;
+      }
+
+      if (recent.status === 'PENDING' && new Date(recent.expiresAt).getTime() > Date.now()) {
+        await this.safeSendText(
+          phone,
+          `⏳ Recebemos seu aviso! Assim que o banco compensar sua cobrança de *${formatBrl(recent.amountBrl)}*, enviarei a confirmação automática aqui mesmo em instantes.`,
+          session.customerJid
+        );
+        return;
+      }
+
+      if (recent.status === 'EXPIRED' || recent.status === 'PENDING') {
+        session.stage = 'AWAITING_AMOUNT';
+        this.repository.saveSession(session);
+        await this.safeSendText(
+          phone,
+          `⏰ Sua última cobrança de *${formatBrl(recent.amountBrl)}* (\`${recent.externalId}\`) consta com o prazo encerrado. Se você pagou antes do vencimento, aguarde alguns instantes pela compensação; caso não tenha pago e queira gerar outra, envie apenas o *valor em Reais*:`,
+          session.customerJid
+        );
+        return;
+      }
+
+      session.stage = 'AWAITING_AMOUNT';
+      this.repository.saveSession(session);
+      await this.safeSendText(
+        phone,
+        `⚠️ Sua última cobrança de *${formatBrl(recent.amountBrl)}* (\`${recent.externalId}\`) consta como *${recent.status === 'FAILED' ? 'cancelada/estornada' : 'cancelada'}*.\n\nSe desejar gerar uma nova cobrança, envie apenas o *valor em Reais*:`,
+        session.customerJid
+      );
+      return;
     }
 
     // Decisão sobre cobrança ativa
@@ -540,6 +571,17 @@ export class ConversationEngine {
         );
       }
     } else if (updatedOrder.status === 'FAILED') {
+      const otherActive = this.repository.findActivePendingOrderByPhone(updatedOrder.customerPhone);
+      if (!otherActive) {
+        const sess = this.repository.getSession(updatedOrder.customerPhone);
+        this.repository.saveSession({
+          phone: updatedOrder.customerPhone,
+          customerJid: updatedOrder.customerJid ?? sess.customerJid,
+          stage: 'AWAITING_AMOUNT',
+          updatedAt: new Date().toISOString(),
+        });
+      }
+
       await this.safeSendText(
         updatedOrder.customerPhone,
         `⚠️ O pagamento da cobrança *${updatedOrder.externalId}* foi cancelado ou estornado pela processadora. Para gerar uma nova cobrança, envie o valor desejado.`,
@@ -556,6 +598,31 @@ export class ConversationEngine {
             `Protocolo: \`${updatedOrder.externalId}\` — A processadora recusou/estornou o pagamento.`
         );
       }
+    } else if (updatedOrder.status === 'EXPIRED') {
+      if (
+        this.cryptoProvider.name === updatedOrder.provider &&
+        this.cryptoProvider.expireCharge
+      ) {
+        void this.cryptoProvider.expireCharge(updatedOrder.providerChargeId);
+      }
+
+      const otherActive = this.repository.findActivePendingOrderByPhone(updatedOrder.customerPhone);
+      if (!otherActive) {
+        const sess = this.repository.getSession(updatedOrder.customerPhone);
+        this.repository.saveSession({
+          phone: updatedOrder.customerPhone,
+          customerJid: updatedOrder.customerJid ?? sess.customerJid,
+          stage: 'AWAITING_AMOUNT',
+          updatedAt: new Date().toISOString(),
+        });
+      }
+
+      await this.safeSendText(
+        updatedOrder.customerPhone,
+        `⏰ *Atenção: A cobrança Pix de ${formatBrl(updatedOrder.amountBrl)} expirou.*\n\n` +
+          `Não realize o pagamento em link/código vencido. Se quiser pagar agora, basta enviar o valor (*${updatedOrder.amountBrl.toFixed(2).replace('.', ',')}*) que gero uma nova na hora!`,
+        updatedOrder.customerJid
+      );
     }
 
     return { matched: true, changed: true, order: updatedOrder };

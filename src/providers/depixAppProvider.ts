@@ -211,7 +211,12 @@ export class DePixAppProvider implements IPixCryptoProvider {
       eventName === 'checkout.approved'
     ) {
       newStatus = 'PIX_CONFIRMED';
-    } else if (rawStatus === 'expired' || eventName === 'checkout.expired') {
+    } else if (
+      (rawStatus === 'expired' || eventName === 'checkout.expired') &&
+      !data.product_id
+    ) {
+      // Ignora `checkout.expired` de sub-checkout individual quando há `product_id` (`prd_...`),
+      // pois um 2º QR pode estar ativo no mesmo link; o `ExpirationWatcher` controla o vencimento de `prd_...`.
       newStatus = 'EXPIRED';
     } else if (
       rawStatus === 'cancelled' ||

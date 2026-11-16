@@ -135,8 +135,8 @@ export function createAppHttpServer(params: {
     return '';
   };
 
-  const getEffectiveAccount = (): RuntimeAccountSettings =>
-    repository.getRuntimeSettings({
+  const getEffectiveAccount = (): RuntimeAccountSettings => {
+    const saved = repository.getRuntimeSettings({
       provider: config.cryptoProvider,
       apiKey: getDefaultApiKey(config.cryptoProvider),
       webhookSecret: getDefaultWebhookSecret(config.cryptoProvider),
@@ -148,6 +148,12 @@ export function createAppHttpServer(params: {
       waFilterMode: 'keyword_only',
       waAllowedTestPhone: '',
     });
+    return {
+      ...saved,
+      apiKey: saved.apiKey?.trim() || getDefaultApiKey(saved.provider),
+      webhookSecret: saved.webhookSecret?.trim() || getDefaultWebhookSecret(saved.provider),
+    };
+  };
 
   const isPasswordConfigured = (): boolean => {
     if (config.adminPassword) return true;

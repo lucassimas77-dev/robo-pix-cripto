@@ -16,7 +16,7 @@ async function bootstrap(): Promise<void> {
 
   const repository = new OrderRepository(dbPath);
 
-  const savedAccount = repository.getRuntimeSettings({
+  const rawSaved = repository.getRuntimeSettings({
     provider: baseConfig.cryptoProvider,
     apiKey: '',
     webhookSecret: '',
@@ -28,6 +28,29 @@ async function bootstrap(): Promise<void> {
     waFilterMode: 'keyword_only',
     waAllowedTestPhone: '',
   });
+
+  const envApiKey =
+    rawSaved.provider === 'depixapp'
+      ? baseConfig.depixapp.apiKey
+      : rawSaved.provider === 'hodle'
+        ? baseConfig.hodle.apiKey
+        : rawSaved.provider === 'noxpay'
+          ? baseConfig.noxpay.apiKey
+          : '';
+  const envWebhookSecret =
+    rawSaved.provider === 'depixapp'
+      ? baseConfig.depixapp.webhookSecret
+      : rawSaved.provider === 'hodle'
+        ? baseConfig.hodle.webhookSecret
+        : rawSaved.provider === 'noxpay'
+          ? baseConfig.noxpay.webhookSecret
+          : '';
+
+  const savedAccount = {
+    ...rawSaved,
+    apiKey: rawSaved.apiKey?.trim() || envApiKey,
+    webhookSecret: rawSaved.webhookSecret?.trim() || envWebhookSecret,
+  };
 
   const activeConfig = {
     ...baseConfig,
