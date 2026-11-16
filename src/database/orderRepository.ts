@@ -250,20 +250,38 @@ export class OrderRepository {
     return rows.map((r) => this.mapRowToOrder(r));
   }
 
-  public markWarningSent(orderId: string): void {
-    this.db.prepare(`UPDATE orders SET warning_sent = 1 WHERE id = ?`).run(orderId);
+  public markWarningSent(orderId: string): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE orders SET warning_sent = 1 WHERE id = ? AND status = 'PENDING' AND warning_sent = 0`
+      )
+      .run(orderId);
+    return Number(result.changes) > 0;
   }
 
   public extendOrderExpiration(orderId: string, newExpiresAtIso: string): void {
     this.db
-      .prepare(`UPDATE orders SET expires_at = ? WHERE id = ? AND expires_at < ?`)
+      .prepare(
+        `UPDATE orders SET expires_at = ? WHERE id = ? AND status = 'PENDING' AND expires_at < ?`
+      )
       .run(newExpiresAtIso, orderId, newExpiresAtIso);
   }
 
-  public updateOrderStatus(orderId: string, newStatus: OrderStatus): boolean {
-    const result = this.db
-      .prepare(`UPDATE orders SET status = ? WHERE id = ? AND status != ?`)
-      .run(newStatus, orderId, newStatus);
+  public updateOrderStatus(
+    orderId: string,
+    newStatus: 'CANCELLED' | 'EXPIRED',
+    nowIso?: string
+  ): boolean {
+    const result =
+      newStatus === 'EXPIRED' && nowIso
+        ? this.db
+            .prepare(
+              `UPDATE orders SET status = 'EXPIRED' WHERE id = ? AND status = 'PENDING' AND expires_at <= ?`
+            )
+            .run(orderId, nowIso)
+        : this.db
+            .prepare(`UPDATE orders SET status = ? WHERE id = ? AND status = 'PENDING'`)
+            .run(newStatus, orderId);
     return Number(result.changes) > 0;
   }
 
@@ -304,11 +322,12 @@ export class OrderRepository {
           .run(params.eventId, new Date().toISOString());
       }
 
-      // SETTLED_CRYPTO é imutável; EXPIRED só aplica se ainda estiver PENDING
+      // SETTLED_CRYPTO é imutável; FAILED só pode ser superado por SETTLED_CRYPTO; EXPIRED só aplica em PENDING
       if (
         current.status === 'SETTLED_CRYPTO' ||
         current.status === params.newStatus ||
-        (params.newStatus === 'EXPIRED' && current.status !== 'PENDING')
+        (params.newStatus === 'EXPIRED' && current.status !== 'PENDING') ||
+        (current.status === 'FAILED' && params.newStatus !== 'SETTLED_CRYPTO')
       ) {
         this.db.exec('COMMIT');
         return { changed: false, updatedOrder: current };

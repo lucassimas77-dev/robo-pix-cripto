@@ -571,6 +571,13 @@ export class ConversationEngine {
         );
       }
     } else if (updatedOrder.status === 'FAILED') {
+      if (
+        this.cryptoProvider.name === updatedOrder.provider &&
+        this.cryptoProvider.expireCharge
+      ) {
+        void this.cryptoProvider.expireCharge(updatedOrder.providerChargeId);
+      }
+
       const otherActive = this.repository.findActivePendingOrderByPhone(updatedOrder.customerPhone);
       if (!otherActive) {
         const sess = this.repository.getSession(updatedOrder.customerPhone);

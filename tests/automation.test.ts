@@ -100,6 +100,23 @@ test('Concorrência, mensagens pós-pagamento ("já paguei"), estado AWAITING_AM
   assert.equal(adminMsgs.length, 1);
   assert.match(adminMsgs[0].body, /Estornado\/Cancelado/i);
 
+  // Webhook atrasado fora de ordem de PIX_CONFIRMED NUNCA ressuscita pedido já FAILED!
+  const lateProcessingAfterFailed = await engine.handleSettlementWebhook({
+    provider: 'mock',
+    externalId: firstOrder.externalId,
+    newStatus: 'PIX_CONFIRMED',
+    rawEventName: 'LATE_PROCESSING_RETRY',
+  });
+  assert.equal(lateProcessingAfterFailed.changed, false);
+  assert.equal(repository.getOrderById(firstOrder.id)?.status, 'FAILED');
+
+  // E updateOrderStatus('EXPIRED') NUNCA sobrescreve pedido que não esteja PENDING!
+  assert.equal(
+    repository.updateOrderStatus(firstOrder.id, 'EXPIRED', new Date(Date.now() + 9999999).toISOString()),
+    false
+  );
+  assert.equal(repository.getOrderById(firstOrder.id)?.status, 'FAILED');
+
   // Mesmo após FAILED (ou sem cobrança ativa), "Já paguei o pix de 250" NUNCA cria nova cobrança duplicada!
   await engine.handleIncomingMessage({
     phone: clientPhone,
@@ -243,6 +260,15 @@ test('Servidor HTTP bloqueia Bearer password brute-force, CSRF cross-site, NaN e
     assert.equal(whRes2.status, 200);
     const whJson2 = (await whRes2.json()) as Record<string, unknown>;
     assert.equal(whJson2.duplicate, true);
+
+    // 6. Payload acima de 256 KB recebe HTTP 413 limpo (sem ECONNRESET)!
+    const hugeBody = JSON.stringify({ junk: 'x'.repeat(300 * 1024) });
+    const tooLargeRes = await fetch(`${url}/api/account`, {
+      method: 'POST',
+      headers: { Cookie: authCookie, 'Content-Type': 'application/json' },
+      body: hugeBody,
+    });
+    assert.equal(tooLargeRes.status, 413);
   } finally {
     server.close();
     repository.close();

@@ -636,7 +636,18 @@ export function createAppHttpServer(params: {
       sendJson(res, 404, { error: 'Rota não encontrada.' });
     } catch (error) {
       if (error instanceof PayloadTooLargeError) {
-        sendJson(res, 413, { error: 'Requisição excede o tamanho máximo permitido (256 KB).' });
+        if (!res.headersSent) {
+          res.writeHead(413, {
+            'Content-Type': 'application/json; charset=utf-8',
+            Connection: 'close',
+          });
+          res.end(
+            JSON.stringify({ error: 'Requisição excede o tamanho máximo permitido (256 KB).' }),
+            () => req.destroy()
+          );
+        } else {
+          req.destroy();
+        }
         return;
       }
       if (error instanceof BadJsonError) {
@@ -661,7 +672,7 @@ function readRawBody(req: http.IncomingMessage): Promise<string> {
       totalBytes += chunk.length;
       if (totalBytes > MAX_BODY_BYTES) {
         rejected = true;
-        req.destroy();
+        req.pause();
         reject(new PayloadTooLargeError('Payload Too Large'));
         return;
       }

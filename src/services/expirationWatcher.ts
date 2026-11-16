@@ -55,6 +55,7 @@ export class ExpirationWatcher {
 
     this.isSweeping = true;
     try {
+      const sweepStartedMs = Date.now();
       const activeOrders = this.repository.listActiveUnsettledOrders();
       const nowMs = now.getTime();
       let expiredCount = 0;
@@ -180,7 +181,10 @@ export class ExpirationWatcher {
             }
           }
 
-          const updated = this.repository.updateOrderStatus(order.id, 'EXPIRED');
+          const effectiveNowIso = new Date(
+            nowMs + Math.max(0, Date.now() - sweepStartedMs)
+          ).toISOString();
+          const updated = this.repository.updateOrderStatus(order.id, 'EXPIRED', effectiveNowIso);
           if (updated) {
             expiredCount++;
             if (
@@ -196,7 +200,7 @@ export class ExpirationWatcher {
             // Coloca sessão em `AWAITING_AMOUNT` para que o cliente possa responder o valor direto no modo `keyword_only`!
             const otherActive = this.repository.findActivePendingOrderByPhone(
               order.customerPhone,
-              now.toISOString()
+              effectiveNowIso
             );
             if (!otherActive) {
               const sess = this.repository.getSession(order.customerPhone);
@@ -204,7 +208,7 @@ export class ExpirationWatcher {
                 phone: order.customerPhone,
                 customerJid: order.customerJid ?? sess.customerJid,
                 stage: 'AWAITING_AMOUNT',
-                updatedAt: now.toISOString(),
+                updatedAt: effectiveNowIso,
               });
             }
 
@@ -220,17 +224,18 @@ export class ExpirationWatcher {
             }
           }
         } else if (!order.warningSent && diffMs <= this.warningBeforeMinutes * 60_000) {
-          this.repository.markWarningSent(order.id);
-          warnedCount++;
-          const minsLeft = Math.max(1, Math.ceil(diffMs / 60_000));
-          try {
-            await this.whatsapp.sendText(
-              order.customerPhone,
-              `⏳ *Lembrete:* Sua cobrança Pix de *${formatBrl(order.amountBrl)}* vence em *${minsLeft} min*.`,
-              order.customerJid
-            );
-          } catch (err) {
-            console.error('[ExpirationWatcher] Erro ao notificar aviso prévio:', err);
+          if (this.repository.markWarningSent(order.id)) {
+            warnedCount++;
+            const minsLeft = Math.max(1, Math.ceil(diffMs / 60_000));
+            try {
+              await this.whatsapp.sendText(
+                order.customerPhone,
+                `⏳ *Lembrete:* Sua cobrança Pix de *${formatBrl(order.amountBrl)}* vence em *${minsLeft} min*.`,
+                order.customerJid
+              );
+            } catch (err) {
+              console.error('[ExpirationWatcher] Erro ao notificar aviso prévio:', err);
+            }
           }
         }
       }
