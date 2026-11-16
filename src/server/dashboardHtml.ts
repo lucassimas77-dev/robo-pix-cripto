@@ -113,14 +113,14 @@ export function renderDashboardHtml(): string {
         <label>
           Plataforma Conversora (Pix ➔ Cripto)
           <select id="provider">
-            <option value="depixapp">DePix App (Sem pedir CPF no chat - Rede Liquid)</option>
+            <option value="depixapp">DePix App (Rede Liquid - DePix / L-USDT / BTC)</option>
             <option value="hodle">Hodle (USDT / USDC - Base / Polygon)</option>
             <option value="noxpay">NoxPay CrossRamp (USDT / BTC)</option>
-            <option value="mock">Modo Demonstração (Apenas teste sem dinheiro real)</option>
+            <option value="mock">Modo Teste Interno (Simular sem dinheiro real)</option>
           </select>
         </label>
         <label>
-          Chave de API da Plataforma (sk_live_... / API Key)
+          Chave de API da Plataforma (sk_live_... ou sk_test_...)
           <input id="apiKey" type="password" placeholder="Cole aqui a chave da sua conta..." />
         </label>
         <label>
@@ -134,8 +134,19 @@ export function renderDashboardHtml(): string {
             <input id="walletNetwork" placeholder="LIQUID ou POLYGON" style="width:50%;" />
           </div>
         </label>
+        <label>
+          Formato de Entrega no WhatsApp
+          <select id="requirePayerDocument">
+            <option value="false">🔒 Sem pedir CPF no WhatsApp (Envia Link Privado Único)</option>
+            <option value="true">📋 Código Copia e Cola direto no Chat (Pede CPF do pagador)</option>
+          </select>
+        </label>
+        <label>
+          Segredo de Webhook (Opcional - já detectamos automático!)
+          <input id="webhookSecret" type="password" placeholder="Opcional (whsec_...)" />
+        </label>
       </div>
-      <div style="display:flex;align-items:center;gap:12px;">
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
         <button class="btn" onclick="saveAccount()">💾 Salvar Conta & Carteira</button>
         <span id="saveMsg" class="toast"></span>
       </div>
@@ -183,9 +194,11 @@ export function renderDashboardHtml(): string {
   <script>
     const providerEl = document.getElementById('provider');
     const apiKeyEl = document.getElementById('apiKey');
+    const webhookSecretEl = document.getElementById('webhookSecret');
     const walletAddressEl = document.getElementById('walletAddress');
     const walletAssetEl = document.getElementById('walletAsset');
     const walletNetworkEl = document.getElementById('walletNetwork');
+    const requirePayerDocEl = document.getElementById('requirePayerDocument');
     const accBadge = document.getElementById('accBadge');
     const saveMsg = document.getElementById('saveMsg');
     const waBadge = document.getElementById('waBadge');
@@ -194,6 +207,7 @@ export function renderDashboardHtml(): string {
     const filterMode = document.getElementById('filterMode');
     const allowedPhone = document.getElementById('allowedPhone');
     const ordersList = document.getElementById('ordersList');
+    let isTestKeyActive = false;
 
     async function loadAccount() {
       const res = await fetch('/api/account');
@@ -202,13 +216,21 @@ export function renderDashboardHtml(): string {
       walletAddressEl.value = acc.walletAddress || '';
       walletAssetEl.value = acc.walletAsset || 'DEPIX';
       walletNetworkEl.value = acc.walletNetwork || 'LIQUID';
+      requirePayerDocEl.value = acc.requirePayerDocument ? 'true' : 'false';
+      isTestKeyActive = Boolean(acc.isTestKey);
+
       if (acc.apiKeyPreview) {
         apiKeyEl.placeholder = 'Salva (' + acc.apiKeyPreview + ') - digite p/ trocar';
+      } else {
+        apiKeyEl.placeholder = 'Cole aqui a chave da sua conta...';
       }
+
       if (acc.provider === 'mock') {
-        accBadge.textContent = 'MODO TESTE (SEM CARTEIRA)';
+        accBadge.textContent = 'MODO TESTE INTERNO (SEM DINHEIRO REAL)';
       } else if (!acc.hasApiKey) {
-        accBadge.textContent = 'AGUARDANDO COLAR CHAVE API';
+        accBadge.textContent = 'AGUARDANDO COLAR CHAVE DE API';
+      } else if (acc.isTestKey) {
+        accBadge.textContent = '🧪 CHAVE SANDBOX ATIVA (' + acc.provider.toUpperCase() + ')';
       } else {
         accBadge.textContent = '✅ CONTA REAL ATIVA (' + acc.provider.toUpperCase() + ')';
       }
@@ -222,13 +244,16 @@ export function renderDashboardHtml(): string {
         body: JSON.stringify({
           provider: providerEl.value,
           apiKey: apiKeyEl.value,
+          webhookSecret: webhookSecretEl.value,
           walletAddress: walletAddressEl.value,
           walletAsset: walletAssetEl.value,
-          walletNetwork: walletNetworkEl.value
+          walletNetwork: walletNetworkEl.value,
+          requirePayerDocument: requirePayerDocEl.value === 'true'
         })
       });
       apiKeyEl.value = '';
-      saveMsg.textContent = '✅ Conta salva e ativa!';
+      webhookSecretEl.value = '';
+      saveMsg.textContent = '✅ Configuração salva e ativa!';
       setTimeout(() => { saveMsg.textContent = ''; }, 3500);
       await loadAccount();
     }
@@ -293,7 +318,8 @@ export function renderDashboardHtml(): string {
         ? '<p style="color:var(--muted);font-size:13.5px;">Nenhum Pix solicitado ainda. Assim que alguém pedir no WhatsApp, aparecerá aqui!</p>'
         : orders.map(o => {
             const brl = Number(o.amountBrl).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
-            const simBtn = (o.status === 'PENDING' && o.provider === 'mock')
+            const canSim = o.status === 'PENDING' && (o.provider === 'mock' || (o.provider === 'depixapp' && isTestKeyActive && String(o.providerChargeId).startsWith('chk_')));
+            const simBtn = canSim
               ? '<button class="btn" style="padding:6px 12px;font-size:12px;" onclick="simulatePay(\\'' + o.id + '\\')">Simular Pagamento (Teste)</button>'
               : '';
             return '<div class="order-row">' +
@@ -307,8 +333,8 @@ export function renderDashboardHtml(): string {
     }
 
     loadAccount();
-    setInterval(pollStatus, 2000);
     pollStatus();
+    setInterval(pollStatus, 3500);
   </script>
 </body>
 </html>`;

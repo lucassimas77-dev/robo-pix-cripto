@@ -40,30 +40,41 @@ export class ExpirationWatcher {
     expiredCount: number;
     warnedCount: number;
   }> {
-    const pending = this.repository.listPendingOrders();
+    const activeOrders = this.repository.listActiveUnsettledOrders();
     let expiredCount = 0;
     let warnedCount = 0;
     const provider = this.engine?.getCryptoProvider();
 
-    for (const order of pending) {
-      // 1. Verifica automaticamente na API se o Pix já foi pago (dispensa configurar Webhook!)
+    for (const order of activeOrders) {
+      // 1. Verifica automaticamente na API se o Pix já foi pago ou liquidado (dispensa configurar Webhook!)
       if (provider && provider.name === order.provider && provider.checkChargeStatus) {
         const remote = await provider.checkChargeStatus(order.providerChargeId);
-        if (remote && remote.status === 'SETTLED_CRYPTO' && this.engine) {
-          await this.engine.handleSettlementWebhook({
-            provider: order.provider,
-            providerChargeId: order.providerChargeId,
-            externalId: order.externalId,
-            newStatus: 'SETTLED_CRYPTO',
-            txHash: remote.txHash,
-            cryptoAmount: remote.cryptoAmount,
-            rawEventName: 'AUTO_POLL_CONFIRMED',
-          });
-          continue;
+        if (remote && this.engine) {
+          if (
+            remote.status === 'SETTLED_CRYPTO' ||
+            (remote.status === 'PIX_CONFIRMED' && order.status === 'PENDING') ||
+            remote.status === 'FAILED'
+          ) {
+            await this.engine.handleSettlementWebhook({
+              provider: order.provider,
+              providerChargeId: order.providerChargeId,
+              externalId: order.externalId,
+              newStatus: remote.status,
+              txHash: remote.txHash,
+              cryptoAmount: remote.cryptoAmount,
+              rawEventName: 'AUTO_POLL_STATUS',
+            });
+            continue;
+          }
         }
       }
 
-      // 2. Verifica tempo de expiração da chave Pix
+      // 2. Pedidos que já tiveram o Pix pago (`PIX_CONFIRMED`) aguardando envio on-chain NUNCA expiram!
+      if (order.status !== 'PENDING') {
+        continue;
+      }
+
+      // 3. Verifica tempo de expiração da chave Pix ainda não paga
       const expiresMs = new Date(order.expiresAt).getTime();
       const diffMs = expiresMs - now.getTime();
 
@@ -71,10 +82,13 @@ export class ExpirationWatcher {
         const updated = this.repository.updateOrderStatus(order.id, 'EXPIRED');
         if (updated) {
           expiredCount++;
+          if (provider && provider.name === order.provider && provider.expireCharge) {
+            void provider.expireCharge(order.providerChargeId);
+          }
           await this.whatsapp.sendText(
             order.customerPhone,
-            `⏰ *Atenção: A chave Pix de ${formatBrl(order.amountBrl)} expirou.*\n\n` +
-              `Não realize o pagamento no código vencido. Se quiser pagar agora, basta responder com o valor (*${order.amountBrl.toFixed(2).replace('.', ',')}*) que gero uma chave nova em segundos!`
+            `⏰ *Atenção: A cobrança Pix de ${formatBrl(order.amountBrl)} expirou.*\n\n` +
+              `Não realize o pagamento no código vencido. Se quiser pagar agora, basta enviar o valor (*${order.amountBrl.toFixed(2).replace('.', ',')}*) que gero uma nova na hora!`
           );
         }
       } else if (!order.warningSent && diffMs <= this.warningBeforeMinutes * 60_000) {

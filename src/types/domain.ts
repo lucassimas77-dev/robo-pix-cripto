@@ -115,7 +115,18 @@ export interface IPixCryptoProvider {
     status: OrderStatus;
     txHash?: string;
     cryptoAmount?: number;
+    rejectionReasons?: string[];
   } | null>;
+
+  /**
+   * Cancela/desativa uma cobrança expirada na API remota quando aplicável.
+   */
+  expireCharge?(providerChargeId: string): Promise<void>;
+
+  /**
+   * Simula pagamento no sandbox oficial do provedor (ex: chaves sk_test_).
+   */
+  simulateSandboxPayment?(providerChargeId: string): Promise<boolean>;
 }
 
 export interface RuntimeAccountSettings {
@@ -127,6 +138,7 @@ export interface RuntimeAccountSettings {
   walletNetwork: string;
   pixExpirationMinutes: number;
   adminWhatsappPhone: string;
+  requirePayerDocument?: boolean;
 }
 
 export interface OutgoingWhatsAppMessage {

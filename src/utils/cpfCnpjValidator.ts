@@ -1,6 +1,5 @@
 /**
  * Utilitários de validação matemática de CPF/CNPJ e extração de valores em Reais (BRL).
- * Essencial para evitar rejeição bancária nos gateways Pix-to-Crypto com trava de titularidade.
  */
 
 export function onlyDigits(value: string): string {
@@ -13,7 +12,7 @@ export function onlyDigits(value: string): string {
 export function isValidCpf(rawCpf: string): boolean {
   const cpf = onlyDigits(rawCpf);
   if (cpf.length !== 11) return false;
-  if (/^(\d)\1{10}$/.test(cpf)) return false; // Rejeita sequências repetidas como 111.111.111-11
+  if (/^(\d)\1{10}$/.test(cpf)) return false;
 
   let sum = 0;
   for (let i = 0; i < 9; i++) {
@@ -60,9 +59,13 @@ export function isValidCnpj(rawCnpj: string): boolean {
 }
 
 /**
- * Valida CPF ou CNPJ e retorna os dígitos limpos ou null se inválido.
+ * Valida CPF ou CNPJ e retorna os dígitos limpos ou valid=false.
  */
-export function validateAndCleanDocument(input: string): { valid: boolean; digits: string; type?: 'CPF' | 'CNPJ' } {
+export function validateAndCleanDocument(input: string): {
+  valid: boolean;
+  digits: string;
+  type?: 'CPF' | 'CNPJ';
+} {
   const digits = onlyDigits(input);
   if (digits.length === 11 && isValidCpf(digits)) {
     return { valid: true, digits, type: 'CPF' };
@@ -71,6 +74,38 @@ export function validateAndCleanDocument(input: string): { valid: boolean; digit
     return { valid: true, digits, type: 'CNPJ' };
   }
   return { valid: false, digits };
+}
+
+/**
+ * Procura um CPF (11 dígitos) ou CNPJ (14 dígitos) válido dentro de uma frase livre
+ * (ex: "me manda um pix de 50 cpf 529.982.247-25") e devolve também o texto sem o documento.
+ */
+export function extractDocumentFromText(text: string): {
+  document?: string;
+  textWithoutDocument: string;
+} {
+  const docPatterns = [
+    /\b\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}\b/g,
+    /\b\d{14}\b/g,
+    /\b\d{3}\.\d{3}\.\d{3}-\d{2}\b/g,
+    /\b\d{11}\b/g,
+  ];
+
+  for (const pattern of docPatterns) {
+    const matches = text.match(pattern);
+    if (!matches) continue;
+    for (const candidate of matches) {
+      const check = validateAndCleanDocument(candidate);
+      if (check.valid) {
+        return {
+          document: check.digits,
+          textWithoutDocument: text.replace(candidate, ' ').trim(),
+        };
+      }
+    }
+  }
+
+  return { textWithoutDocument: text };
 }
 
 export function maskDocument(digits: string): string {
@@ -85,28 +120,27 @@ export function maskDocument(digits: string): string {
 
 /**
  * Extrai um valor monetário em Reais de uma mensagem de texto do WhatsApp.
- * Exemplos aceitos: "150", "R$ 150,50", "pix de 1.250,00", "25.90", "quero pagar 80 reais"
+ * Exemplos aceitos: "150", "R$ 150,50", "pix de 1.250,00", "pix de 50 cpf 529.982.247-25"
  */
 export function parseBrlAmountFromText(text: string): number | null {
-  const cleaned = text.trim();
+  const { textWithoutDocument } = extractDocumentFromText(text);
+  const cleaned = textWithoutDocument.trim();
+  if (!cleaned) return null;
 
-  // Evita confundir um CPF (11 dígitos seguidos) com valor em Reais
+  // Evita confundir um CPF inválido de 11+ dígitos puros com valor em Reais
   const pureDigits = onlyDigits(cleaned);
   if (pureDigits.length >= 11 && !cleaned.includes(',') && !cleaned.toLowerCase().includes('r$')) {
     return null;
   }
 
-  // Procura padrões numéricos monetários (ex: 1.250,50 ou 150,50 ou 150.50 ou 150)
   const regex = /(?:r\$\s*)?(\d{1,3}(?:\.\d{3})+,\d{1,2}|\d+,\d{1,2}|\d+\.\d{1,2}|\d+)/i;
   const match = cleaned.match(regex);
   if (!match) return null;
 
   let rawNumber = match[1];
   if (rawNumber.includes(',') && rawNumber.includes('.')) {
-    // Formato brasileiro com milhar: 1.250,50 -> 1250.50
     rawNumber = rawNumber.replace(/\./g, '').replace(',', '.');
   } else if (rawNumber.includes(',')) {
-    // Formato decimal brasileiro: 150,50 -> 150.50
     rawNumber = rawNumber.replace(',', '.');
   }
 

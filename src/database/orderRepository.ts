@@ -201,6 +201,15 @@ export class OrderRepository {
     return rows.map((r) => this.mapRowToOrder(r));
   }
 
+  public listActiveUnsettledOrders(): PixCryptoOrder[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM orders WHERE status IN ('PENDING', 'PIX_CONFIRMED') ORDER BY expires_at ASC`
+      )
+      .all() as Array<Record<string, unknown>>;
+    return rows.map((r) => this.mapRowToOrder(r));
+  }
+
   public listRecentOrders(limit = 50): PixCryptoOrder[] {
     const rows = this.db
       .prepare(`SELECT * FROM orders ORDER BY created_at DESC LIMIT ?`)
@@ -233,11 +242,11 @@ export class OrderRepository {
     const current = this.getOrderById(params.orderId);
     if (!current) return { changed: false, updatedOrder: null };
 
-    // Se já está finalizado em cripto com mesmo status, ignora repetição (idempotência)
-    if (current.status === 'SETTLED_CRYPTO' && params.newStatus === 'SETTLED_CRYPTO') {
+    // Estado terminal SETTLED_CRYPTO nunca retrocede para estados intermediários
+    if (current.status === 'SETTLED_CRYPTO') {
       return { changed: false, updatedOrder: current };
     }
-    if (current.status === 'PIX_CONFIRMED' && params.newStatus === 'PIX_CONFIRMED') {
+    if (current.status === params.newStatus) {
       return { changed: false, updatedOrder: current };
     }
 

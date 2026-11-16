@@ -63,7 +63,10 @@ export class HodleProvider implements IPixCryptoProvider {
       expirationMinutes: input.expirationMinutes,
       webhookUrl: input.webhookUrl,
     };
-    if (input.payerDocument) bodyPayload.payerDocument = input.payerDocument;
+    if (input.payerDocument) {
+      bodyPayload.taxId = input.payerDocument;
+      bodyPayload.payerDocument = input.payerDocument;
+    }
     if (input.customerName) bodyPayload.payerName = input.customerName;
 
     const response = await fetch(`${this.config.apiUrl}/api/deposit/asset`, {

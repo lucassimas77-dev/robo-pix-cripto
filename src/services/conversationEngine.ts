@@ -8,6 +8,7 @@ import type {
   WebhookSettlementEvent,
 } from '../types/domain.ts';
 import {
+  extractDocumentFromText,
   formatBrl,
   maskDocument,
   onlyDigits,
@@ -15,11 +16,6 @@ import {
   validateAndCleanDocument,
 } from '../utils/cpfCnpjValidator.ts';
 
-/**
- * Motor Conversacional com Foco em Privacidade & Zero Identificação:
- * Por padrão (`REQUIRE_PAYER_DOCUMENT=false`), o pagador no WhatsApp informa APENAS o valor
- * (ou já manda "Me gera um Pix de 150") e recebe na hora a chave Pix dinâmica!
- */
 export class ConversationEngine {
   private config: AppConfig;
   private readonly repository: OrderRepository;
@@ -72,6 +68,12 @@ export class ConversationEngine {
       const activeOrder = this.repository.findActivePendingOrderByPhone(phone);
       if (activeOrder) {
         this.repository.updateOrderStatus(activeOrder.id, 'CANCELLED');
+        if (
+          this.cryptoProvider.name === activeOrder.provider &&
+          this.cryptoProvider.expireCharge
+        ) {
+          void this.cryptoProvider.expireCharge(activeOrder.providerChargeId);
+        }
       }
       this.repository.saveSession({
         phone,
@@ -80,7 +82,7 @@ export class ConversationEngine {
       });
       await this.whatsapp.sendText(
         phone,
-        '✅ Atendimento reiniciado.\n\nPara gerar uma nova chave Pix imediata, basta enviar o *valor em Reais* (ex: *150,00*).'
+        '✅ Atendimento reiniciado.\n\nPara gerar uma nova cobrança Pix imediata, basta enviar o *valor em Reais* (ex: *150,00*).'
       );
       return;
     }
@@ -95,7 +97,7 @@ export class ConversationEngine {
         );
         await this.whatsapp.sendText(
           phone,
-          `⏳ Você possui um Pix ativo de *${formatBrl(active.amountBrl)}* válido por mais *${remainingMin} min*.\n\nDigite *1* para reenviar o código ou *2* para cancelar e gerar outro valor.`
+          `⏳ Você possui um Pix ativo de *${formatBrl(active.amountBrl)}* válido por mais *${remainingMin} min*.\n\nDigite *1* para reenviar ou *2* para cancelar e gerar outro valor.`
         );
         session.stage = 'AWAITING_ACTIVE_ORDER_DECISION';
         this.repository.saveSession(session);
@@ -115,6 +117,12 @@ export class ConversationEngine {
         return;
       } else if (lower === '2' || lower.includes('novo') || lower.includes('outro')) {
         this.repository.updateOrderStatus(active.id, 'CANCELLED');
+        if (
+          this.cryptoProvider.name === active.provider &&
+          this.cryptoProvider.expireCharge
+        ) {
+          void this.cryptoProvider.expireCharge(active.providerChargeId);
+        }
         if (session.pendingNewAmountBrl) {
           const amount = session.pendingNewAmountBrl;
           session.pendingNewAmountBrl = undefined;
@@ -125,7 +133,7 @@ export class ConversationEngine {
         this.repository.saveSession(session);
         await this.whatsapp.sendText(
           phone,
-          '🔄 Chave anterior cancelada! Qual o *novo valor em Reais* para o Pix? (Ex: *200,00*)'
+          '🔄 Cobrança anterior cancelada! Qual o *novo valor em Reais* para o Pix? (Ex: *200,00*)'
         );
         return;
       }
@@ -146,20 +154,20 @@ export class ConversationEngine {
 
       await this.whatsapp.sendText(
         phone,
-        `⚠️ Você já tem uma chave Pix ativa de *${formatBrl(activeOrder.amountBrl)}* válida por mais *${remainingMin} min*.\n\n` +
-          `*1* - Reenviar a chave Pix atual (${formatBrl(activeOrder.amountBrl)})\n` +
-          `*2* - Cancelar a anterior e gerar uma nova chave`
+        `⚠️ Você já tem uma cobrança Pix ativa de *${formatBrl(activeOrder.amountBrl)}* válida por mais *${remainingMin} min*.\n\n` +
+          `*1* - Reenviar a cobrança atual (${formatBrl(activeOrder.amountBrl)})\n` +
+          `*2* - Cancelar a anterior e gerar um novo valor`
       );
       return;
     }
 
-    // Estágio opcional (apenas caso o provedor específico exija documento)
+    // Estágio opcional de documento (quando o modo Copia e Cola Direto com CPF está ativo)
     if (session.stage === 'AWAITING_DOCUMENT' && session.draftAmountBrl) {
       const docCheck = validateAndCleanDocument(text);
       if (!docCheck.valid) {
         await this.whatsapp.sendText(
           phone,
-          '❌ Documento inválido. Digite os 11 dígitos do CPF ou 14 do CNPJ (ou digite *cancelar*):'
+          '❌ CPF/CNPJ inválido. Digite os 11 números do CPF ou 14 do CNPJ da conta que vai pagar (ou digite *cancelar*):'
         );
         return;
       }
@@ -172,10 +180,11 @@ export class ConversationEngine {
       return;
     }
 
-    // Detecta o valor direto (ex: "Pix de 150" ou "150,00") e já gera sem burocracia!
+    // Detecta valor (e se o cliente já escreveu o CPF na mesma frase, aproveita na hora!)
+    const { document: inlineDoc } = extractDocumentFromText(text);
     const detectedAmount = parseBrlAmountFromText(text);
     if (detectedAmount !== null) {
-      await this.proceedWithAmount(phone, detectedAmount);
+      await this.proceedWithAmount(phone, detectedAmount, inlineDoc);
       return;
     }
 
@@ -186,12 +195,35 @@ export class ConversationEngine {
     await this.whatsapp.sendText(
       phone,
       `Olá! ⚡ Bem-vindo ao pagamento automático via *Pix*.\n\n` +
-        `Qual o *valor em Reais* que você deseja pagar? _(Ex: 150,00)_`
+        `Qual o *valor em Reais* que você deseja pagar? _(Ex: 50,00)_`
     );
   }
 
-  private async proceedWithAmount(phone: string, amountBrl: number): Promise<void> {
-    const mustAskDoc = this.config.requirePayerDocument || this.cryptoProvider.requiresPayerDocument;
+  private async proceedWithAmount(
+    phone: string,
+    amountBrl: number,
+    inlineDocument?: string
+  ): Promise<void> {
+    // Validação amigável de valor mínimo (DePix exige mín R$ 5,00)
+    if (this.cryptoProvider.name === 'depixapp' && amountBrl < 5) {
+      await this.whatsapp.sendText(
+        phone,
+        `⚠️ O valor mínimo para pagamento via Pix é de *R$ 5,00*. Por favor, envie um valor a partir de *5,00*:`
+      );
+      return;
+    }
+
+    if (inlineDocument) {
+      await this.generateAndDeliverPix({
+        phone,
+        amountBrl,
+        payerDocument: inlineDocument,
+      });
+      return;
+    }
+
+    const mustAskDoc =
+      this.config.requirePayerDocument || this.cryptoProvider.requiresPayerDocument;
 
     if (mustAskDoc) {
       this.repository.saveSession({
@@ -203,12 +235,12 @@ export class ConversationEngine {
 
       await this.whatsapp.sendText(
         phone,
-        `💰 Valor: *${formatBrl(amountBrl)}*.\nDigite o CPF/CNPJ pagador para liberar a chave:`
+        `💰 Valor: *${formatBrl(amountBrl)}*.\nDigite o *CPF ou CNPJ* da conta que vai pagar para gerar o código Pix Copia e Cola:`
       );
       return;
     }
 
-    // Modo Privacidade Padrão: NÃO pede nome nem CPF! Gera a chave Pix imediatamente!
+    // Modo Privacidade no WhatsApp: gera imediatamente sem pedir CPF no chat!
     await this.generateAndDeliverPix({
       phone,
       amountBrl,
@@ -278,15 +310,20 @@ export class ConversationEngine {
       );
 
       const docLine = params.payerDocument
-        ? `👤 *Titular:* ${maskDocument(params.payerDocument)}\n`
+        ? `👤 *Titular pagador:* ${maskDocument(params.payerDocument)}\n`
         : '';
 
+      const isPaymentLink = order.pixCopyPaste.startsWith('http');
+      const actionInstruction = isPaymentLink
+        ? `👇 *Toque no link seguro abaixo* para abrir e pagar seu Pix na hora:`
+        : `👇 *Copie o código Pix Copia e Cola na mensagem abaixo* ou escaneie o QR Code:`;
+
       const summaryText =
-        `✅ *Chave Pix Gerada na Hora!*\n\n` +
+        `✅ *Cobrança Pix Pronta!*\n\n` +
         `💵 *Valor:* ${formatBrl(order.amountBrl)}\n` +
         docLine +
         `⏳ *Validade:* ${validMinutes} minutos (vence às *${timeStr}*)\n\n` +
-        `👇 *Copie o código Pix Copia e Cola na mensagem abaixo* ou escaneie o QR Code:`;
+        actionInstruction;
 
       await this.whatsapp.sendPixCharge({
         phone: params.phone,
@@ -298,9 +335,25 @@ export class ConversationEngine {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error('[ConversationEngine] Erro ao gerar Pix:', msg);
+
+      if (msg.includes('API_KEY_MISSING')) {
+        await this.whatsapp.sendText(
+          params.phone,
+          `⚠️ Conta recebedora ainda não configurada no painel (Passo 1). Configure a Chave de API ou selecione o Modo Demonstração para testar.`
+        );
+        return;
+      }
+      if (msg.includes('MIN_AMOUNT_500')) {
+        await this.whatsapp.sendText(
+          params.phone,
+          `⚠️ O valor mínimo para gerar Pix é de *R$ 5,00*. Envie um valor a partir de *5,00*:`
+        );
+        return;
+      }
+
       await this.whatsapp.sendText(
         params.phone,
-        `⚠️ Instabilidade temporária ao gerar a chave Pix. Por favor, envie o valor novamente em alguns segundos.`
+        `⚠️ Não foi possível gerar a cobrança (${msg}). Verifique os dados e tente novamente.`
       );
     }
   }
@@ -312,12 +365,13 @@ export class ConversationEngine {
       minute: '2-digit',
     });
     const remainingMin = Math.max(1, Math.ceil((expiresDate.getTime() - Date.now()) / 60_000));
+    const isPaymentLink = order.pixCopyPaste.startsWith('http');
 
     const summaryText =
-      `🔄 *Sua Chave Pix Ativa*\n\n` +
+      `🔄 *Sua Cobrança Pix Ativa*\n\n` +
       `💵 *Valor:* ${formatBrl(order.amountBrl)}\n` +
       `⏳ *Tempo restante:* ${remainingMin} min (vence às *${timeStr}*)\n\n` +
-      `👇 Copie o código Pix abaixo:`;
+      (isPaymentLink ? `👇 Toque no link seguro abaixo:` : `👇 Copie o código Pix abaixo:`);
 
     await this.whatsapp.sendPixCharge({
       phone: order.customerPhone,
@@ -358,7 +412,7 @@ export class ConversationEngine {
     if (updatedOrder.status === 'PIX_CONFIRMED') {
       await this.whatsapp.sendText(
         updatedOrder.customerPhone,
-        `🎉 *Pix de ${formatBrl(updatedOrder.amountBrl)} identificado!* Finalizando confirmação...`
+        `🎉 *Pix de ${formatBrl(updatedOrder.amountBrl)} recebido!* Estamos concluindo a confirmação final...`
       );
     } else if (updatedOrder.status === 'SETTLED_CRYPTO') {
       await this.whatsapp.sendText(
@@ -388,7 +442,7 @@ export class ConversationEngine {
     } else if (updatedOrder.status === 'FAILED') {
       await this.whatsapp.sendText(
         updatedOrder.customerPhone,
-        `⚠️ O pagamento da chave *${updatedOrder.externalId}* não pôde ser concluído. Envie o valor novamente para gerar uma nova chave.`
+        `⚠️ O pagamento da cobrança *${updatedOrder.externalId}* foi recusado/estornado pela processadora (verifique se o pagamento partiu do mesmo titular). Envie o valor novamente para gerar uma nova cobrança.`
       );
     }
 

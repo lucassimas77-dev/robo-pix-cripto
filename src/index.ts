@@ -31,6 +31,7 @@ async function bootstrap(): Promise<void> {
     walletNetwork: savedAccount.walletNetwork,
     pixExpirationMinutes: savedAccount.pixExpirationMinutes,
     adminWhatsappPhone: savedAccount.adminWhatsappPhone,
+    requirePayerDocument: savedAccount.requirePayerDocument ?? baseConfig.requirePayerDocument,
   };
 
   const cryptoProvider = createCryptoProvider(activeConfig, savedAccount);

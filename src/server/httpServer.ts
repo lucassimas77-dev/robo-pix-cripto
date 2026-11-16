@@ -33,6 +33,7 @@ export function createAppHttpServer(params: {
       walletNetwork: config.walletNetwork,
       pixExpirationMinutes: config.pixExpirationMinutes,
       adminWhatsappPhone: config.adminWhatsappPhone,
+      requirePayerDocument: config.requirePayerDocument,
     });
 
   return http.createServer(async (req, res) => {
@@ -41,7 +42,7 @@ export function createAppHttpServer(params: {
       const pathname = urlObj.pathname;
       const method = req.method || 'GET';
 
-      // 1. Painel Simples em 3 Passos (Autoatendimento para você ou seu amigo)
+      // 1. Painel Simples em 3 Passos
       if (method === 'GET' && pathname === '/') {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(renderDashboardHtml());
@@ -62,11 +63,24 @@ export function createAppHttpServer(params: {
 
       if (method === 'GET' && pathname === '/api/account') {
         const acc = getEffectiveAccount();
+        const hasKey = Boolean(acc.apiKey && acc.apiKey.trim().length > 0);
+        // NUNCA expõe apiKey ou webhookSecret puros na resposta JSON pública!
         sendJson(res, 200, {
-          ...acc,
-          hasApiKey: Boolean(acc.apiKey && acc.apiKey.trim().length > 0),
-          // Mascara a chave para segurança visual
-          apiKeyPreview: acc.apiKey ? `${acc.apiKey.slice(0, 6)}...${acc.apiKey.slice(-4)}` : '',
+          provider: acc.provider,
+          walletAddress: acc.walletAddress,
+          walletAsset: acc.walletAsset,
+          walletNetwork: acc.walletNetwork,
+          pixExpirationMinutes: acc.pixExpirationMinutes,
+          adminWhatsappPhone: acc.adminWhatsappPhone,
+          requirePayerDocument: acc.requirePayerDocument ?? false,
+          hasApiKey: hasKey,
+          isTestKey: hasKey && acc.apiKey.trim().startsWith('sk_test_'),
+          apiKeyPreview:
+            hasKey && acc.apiKey.length >= 10
+              ? `${acc.apiKey.slice(0, 7)}...${acc.apiKey.slice(-4)}`
+              : hasKey
+                ? 'Chave salva'
+                : '',
         });
         return;
       }
@@ -76,19 +90,29 @@ export function createAppHttpServer(params: {
         const body = JSON.parse(rawBody || '{}') as Record<string, unknown>;
         const current = getEffectiveAccount();
 
-        const provider = (String(body.provider || current.provider).toLowerCase()) as SupportedProviderName;
+        const provider = String(
+          body.provider || current.provider
+        ).toLowerCase() as SupportedProviderName;
+
         const newApiKey =
           body.apiKey !== undefined && String(body.apiKey).trim() !== ''
             ? String(body.apiKey).trim()
             : current.apiKey;
 
+        const newWebhookSecret =
+          body.webhookSecret !== undefined && String(body.webhookSecret).trim() !== ''
+            ? String(body.webhookSecret).trim()
+            : current.webhookSecret;
+
+        const requirePayerDoc =
+          body.requirePayerDocument !== undefined
+            ? Boolean(body.requirePayerDocument)
+            : (current.requirePayerDocument ?? false);
+
         const saved = repository.saveRuntimeSettings({
           provider,
           apiKey: newApiKey,
-          webhookSecret:
-            body.webhookSecret !== undefined
-              ? String(body.webhookSecret).trim()
-              : current.webhookSecret,
+          webhookSecret: newWebhookSecret,
           walletAddress:
             body.walletAddress !== undefined
               ? String(body.walletAddress).trim()
@@ -109,6 +133,7 @@ export function createAppHttpServer(params: {
             body.adminWhatsappPhone !== undefined
               ? String(body.adminWhatsappPhone).replace(/\D/g, '')
               : current.adminWhatsappPhone,
+          requirePayerDocument: requirePayerDoc,
         });
 
         const updatedConfig: AppConfig = {
@@ -119,6 +144,7 @@ export function createAppHttpServer(params: {
           walletNetwork: saved.walletNetwork,
           pixExpirationMinutes: saved.pixExpirationMinutes,
           adminWhatsappPhone: saved.adminWhatsappPhone,
+          requirePayerDocument: saved.requirePayerDocument ?? false,
         };
 
         const newProviderInstance = createCryptoProvider(updatedConfig, saved);
@@ -217,7 +243,7 @@ export function createAppHttpServer(params: {
         return;
       }
 
-      // ==================== HISTÓRICO DE PEDIDOS & TESTE RÁPIDO ====================
+      // ==================== HISTÓRICO DE PEDIDOS & TESTE DE SANDBOX ====================
 
       if (method === 'GET' && pathname === '/api/orders') {
         sendJson(res, 200, repository.listRecentOrders(50));
@@ -232,17 +258,48 @@ export function createAppHttpServer(params: {
           return;
         }
 
-        const result = await engine.handleSettlementWebhook({
-          provider: order.provider,
-          providerChargeId: order.providerChargeId,
-          externalId: order.externalId,
-          newStatus: 'SETTLED_CRYPTO',
-          txHash: `tx_liquid_${crypto.randomBytes(16).toString('hex')}`,
-          cryptoAmount: order.estimatedCryptoAmount,
-          rawEventName: 'SIMULATOR_CLICK_PAY',
-        });
+        const activeProvider = engine.getCryptoProvider();
+        const acc = getEffectiveAccount();
 
-        sendJson(res, 200, { ok: true, result });
+        // Permite simular APENAS em Modo Demonstração ('mock') ou com chave de Sandbox ('sk_test_')!
+        if (order.provider === 'mock') {
+          const result = await engine.handleSettlementWebhook({
+            provider: order.provider,
+            providerChargeId: order.providerChargeId,
+            externalId: order.externalId,
+            newStatus: 'SETTLED_CRYPTO',
+            txHash: `tx_sim_${crypto.randomBytes(12).toString('hex')}`,
+            cryptoAmount: order.estimatedCryptoAmount,
+            rawEventName: 'SIMULATOR_CLICK_PAY',
+          });
+          sendJson(res, 200, { ok: true, result });
+          return;
+        }
+
+        if (
+          order.provider === 'depixapp' &&
+          acc.apiKey.startsWith('sk_test_') &&
+          activeProvider.simulateSandboxPayment
+        ) {
+          const ok = await activeProvider.simulateSandboxPayment(order.providerChargeId);
+          if (ok) {
+            const result = await engine.handleSettlementWebhook({
+              provider: order.provider,
+              providerChargeId: order.providerChargeId,
+              externalId: order.externalId,
+              newStatus: 'SETTLED_CRYPTO',
+              txHash: `tx_sandbox_depix_${crypto.randomBytes(8).toString('hex')}`,
+              cryptoAmount: order.estimatedCryptoAmount,
+              rawEventName: 'DEPIX_SANDBOX_SIMULATE',
+            });
+            sendJson(res, 200, { ok: true, result });
+            return;
+          }
+        }
+
+        sendJson(res, 403, {
+          error: 'Simulação bloqueada para cobranças reais em produção (pague o Pix no banco).',
+        });
         return;
       }
 
