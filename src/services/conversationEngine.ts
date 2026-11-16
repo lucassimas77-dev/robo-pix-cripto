@@ -10,16 +10,11 @@ import type {
 import {
   formatBrl,
   formatTimeSaoPaulo,
+  isPaymentConfirmationMessage,
   onlyDigits,
   parseBrlAmountFromText,
 } from '../utils/cpfCnpjValidator.ts';
 
-/**
- * Motor Conversacional com Modo Fixo de Privacidade (Opção 1):
- * - NUNCA pede CPF, CNPJ nem nome na conversa do WhatsApp!
- * - Possui lock assíncrono por telefone (`phoneLocks`) impedindo cobranças duplicadas concorrentes.
- * - Exibe horários sempre em `America/Sao_Paulo` (horário de Brasília).
- */
 export class ConversationEngine {
   private config: AppConfig;
   private readonly repository: OrderRepository;
@@ -57,7 +52,6 @@ export class ConversationEngine {
     const phone = onlyDigits(params.phone);
     if (!phone || !params.text.trim()) return;
 
-    // Serializa mensagens concorrentes do mesmo telefone para impedir criação dupla de Pix
     const prevLock = this.phoneLocks.get(phone) ?? Promise.resolve();
     const currentTask = prevLock
       .catch(() => {})
@@ -92,8 +86,8 @@ export class ConversationEngine {
       session.customerJid = customerJid;
     }
 
-    // Comando global de cancelamento/reinício
-    if (['cancelar', 'sair', 'reiniciar', 'reset'].includes(lower)) {
+    // Comando de encerrar atendimento (volta para IDLE)
+    if (lower === 'sair') {
       const activeOrder = this.repository.findActivePendingOrderByPhone(phone);
       if (activeOrder) {
         this.repository.updateOrderStatus(activeOrder.id, 'CANCELLED');
@@ -110,52 +104,91 @@ export class ConversationEngine {
         stage: 'IDLE',
         updatedAt: new Date().toISOString(),
       });
-      await this.whatsapp.sendText(
+      await this.safeSendText(
         phone,
-        '✅ Atendimento reiniciado.\n\nPara gerar uma nova cobrança Pix imediata, basta enviar o *valor em Reais* (ex: *150,00*).',
+        '✅ Atendimento encerrado. Quando precisar de um novo Pix, basta enviar uma mensagem!',
         session.customerJid
       );
       return;
     }
 
-    // Consulta de status
-    if (['status', 'comprovante', 'meu pix'].includes(lower)) {
-      const active = this.repository.findActivePendingOrderByPhone(phone);
-      if (active) {
-        const remainingMin = Math.max(
-          1,
-          Math.ceil((new Date(active.expiresAt).getTime() - Date.now()) / 60_000)
-        );
-        session.stage = 'AWAITING_ACTIVE_ORDER_DECISION';
-        this.repository.saveSession(session);
-        await this.whatsapp.sendText(
-          phone,
-          `⏳ Você possui um Pix ativo de *${formatBrl(active.amountBrl)}* válido por mais *${remainingMin} min*.\n\nDigite *1* para reenviar ou *2* para cancelar e gerar outro valor.`,
-          session.customerJid
-        );
-        return;
+    // Comando de reiniciar/cancelar mantendo escuta ativa (`AWAITING_AMOUNT`) para o próximo número enviado!
+    if (['cancelar', 'reiniciar', 'reset'].includes(lower)) {
+      const activeOrder = this.repository.findActivePendingOrderByPhone(phone);
+      if (activeOrder) {
+        this.repository.updateOrderStatus(activeOrder.id, 'CANCELLED');
+        if (
+          this.cryptoProvider.name === activeOrder.provider &&
+          this.cryptoProvider.expireCharge
+        ) {
+          void this.cryptoProvider.expireCharge(activeOrder.providerChargeId);
+        }
+      }
+      this.repository.saveSession({
+        phone,
+        customerJid: session.customerJid,
+        stage: 'AWAITING_AMOUNT',
+        updatedAt: new Date().toISOString(),
+      });
+      await this.safeSendText(
+        phone,
+        '✅ Cobrança reiniciada.\n\nEnvie agora o *novo valor em Reais* desejado (ex: *150,00*):',
+        session.customerJid
+      );
+      return;
+    }
+
+    // Mensagens pós-pagamento ("já paguei o pix de 50", "fiz o pix", "status", "comprovante") NÃO geram nova cobrança!
+    if (
+      ['status', 'comprovante', 'meu pix'].includes(lower) ||
+      isPaymentConfirmationMessage(text)
+    ) {
+      const recent = this.repository.findMostRecentOrderByPhone(phone);
+      if (recent) {
+        if (recent.status === 'SETTLED_CRYPTO') {
+          await this.safeSendText(
+            phone,
+            `✅ Seu pagamento de *${formatBrl(recent.amountBrl)}* (protocolo \`${recent.externalId}\`) já está *100% confirmado*!`,
+            session.customerJid
+          );
+          return;
+        }
+        if (recent.status === 'PIX_CONFIRMED') {
+          await this.safeSendText(
+            phone,
+            `🎉 Seu pagamento de *${formatBrl(recent.amountBrl)}* já foi recebido pela processadora e está em liquidação final!`,
+            session.customerJid
+          );
+          return;
+        }
+        if (recent.status === 'PENDING' && new Date(recent.expiresAt).getTime() > Date.now()) {
+          await this.safeSendText(
+            phone,
+            `⏳ Recebemos seu aviso! Assim que o banco compensar sua cobrança de *${formatBrl(recent.amountBrl)}*, enviarei a confirmação automática aqui mesmo em instantes.`,
+            session.customerJid
+          );
+          return;
+        }
       }
     }
 
-    // Decisão estrita sobre cobrança ativa ainda válida (sem queda acidental para criação dupla!)
+    // Decisão sobre cobrança ativa
     if (session.stage === 'AWAITING_ACTIVE_ORDER_DECISION') {
       const active = this.repository.findActivePendingOrderByPhone(phone);
 
       if (!active) {
-        // A cobrança expirou exatamente antes de o cliente responder "1" ou "2"
         session.stage = 'AWAITING_AMOUNT';
         session.pendingNewAmountBrl = undefined;
         this.repository.saveSession(session);
 
         if (lower === '1' || lower === '2') {
-          await this.whatsapp.sendText(
+          await this.safeSendText(
             phone,
             '⏰ A cobrança anterior já expirou! Qual o *valor em Reais* que deseja gerar agora? _(Ex: 50,00)_',
             session.customerJid
           );
           return;
         }
-        // Se digitou um valor real novo (ex: "150,00"), segue abaixo normalmente
       } else if (lower === '1' || lower.includes('reenviar') || lower.includes('mesmo')) {
         session.stage = 'IDLE';
         session.pendingNewAmountBrl = undefined;
@@ -172,7 +205,7 @@ export class ConversationEngine {
         }
         const pendingAmt = session.pendingNewAmountBrl;
         session.pendingNewAmountBrl = undefined;
-        session.stage = 'IDLE';
+        session.stage = 'AWAITING_AMOUNT';
         this.repository.saveSession(session);
 
         if (pendingAmt) {
@@ -180,16 +213,13 @@ export class ConversationEngine {
           return;
         }
 
-        session.stage = 'AWAITING_AMOUNT';
-        this.repository.saveSession(session);
-        await this.whatsapp.sendText(
+        await this.safeSendText(
           phone,
           '🔄 Cobrança anterior cancelada! Qual o *novo valor em Reais* para o Pix? _(Ex: 200,00)_',
           session.customerJid
         );
         return;
       } else {
-        // Qualquer outra resposta mantém a trava ativa sem criar 2º Pix paralelo!
         const newCandidateAmount = parseBrlAmountFromText(text);
         if (newCandidateAmount !== null) {
           session.pendingNewAmountBrl = newCandidateAmount;
@@ -199,7 +229,7 @@ export class ConversationEngine {
           1,
           Math.ceil((new Date(active.expiresAt).getTime() - Date.now()) / 60_000)
         );
-        await this.whatsapp.sendText(
+        await this.safeSendText(
           phone,
           `⚠️ Você já tem uma cobrança Pix ativa de *${formatBrl(active.amountBrl)}* (vence em ${remainingMin} min).\n\nResponda apenas:\n*1* - Reenviar a cobrança atual\n*2* - Cancelar a atual e gerar ${newCandidateAmount ? formatBrl(newCandidateAmount) : 'um novo valor'}`,
           session.customerJid
@@ -208,7 +238,6 @@ export class ConversationEngine {
       }
     }
 
-    // Evita gerar duas cobranças simultâneas enquanto já há uma válida
     const activeOrder = this.repository.findActivePendingOrderByPhone(phone);
     if (activeOrder) {
       const possibleNewAmount = parseBrlAmountFromText(text);
@@ -221,7 +250,7 @@ export class ConversationEngine {
       session.pendingNewAmountBrl = possibleNewAmount ?? undefined;
       this.repository.saveSession(session);
 
-      await this.whatsapp.sendText(
+      await this.safeSendText(
         phone,
         `⚠️ Você já tem uma cobrança Pix ativa de *${formatBrl(activeOrder.amountBrl)}* válida por mais *${remainingMin} min*.\n\n` +
           `*1* - Reenviar a cobrança atual (${formatBrl(activeOrder.amountBrl)})\n` +
@@ -240,7 +269,7 @@ export class ConversationEngine {
     session.stage = 'AWAITING_AMOUNT';
     this.repository.saveSession(session);
 
-    await this.whatsapp.sendText(
+    await this.safeSendText(
       phone,
       `Olá! ⚡ Bem-vindo ao pagamento automático via *Pix*.\n\n` +
         `Qual o *valor total em Reais* que você deseja pagar? _(Ex: R$ 50,00)_`,
@@ -257,15 +286,29 @@ export class ConversationEngine {
     const maxBrl = this.cryptoProvider.maxAmountBrl;
 
     if (amountBrl < minBrl) {
-      await this.whatsapp.sendText(
+      // Mantém AWAITING_AMOUNT para o modo `keyword_only` aceitar o próximo número enviado!
+      this.repository.saveSession({
+        phone,
+        customerJid,
+        stage: 'AWAITING_AMOUNT',
+        updatedAt: new Date().toISOString(),
+      });
+      await this.safeSendText(
         phone,
         `⚠️ O valor mínimo para pagamento via Pix é de *${formatBrl(minBrl)}*. Envie um valor a partir de *${formatBrl(minBrl)}*:`,
         customerJid
       );
       return;
     }
+
     if (amountBrl > maxBrl) {
-      await this.whatsapp.sendText(
+      this.repository.saveSession({
+        phone,
+        customerJid,
+        stage: 'AWAITING_AMOUNT',
+        updatedAt: new Date().toISOString(),
+      });
+      await this.safeSendText(
         phone,
         `⚠️ O valor máximo por cobrança Pix é de *${formatBrl(maxBrl)}*. Envie um valor até *${formatBrl(maxBrl)}*:`,
         customerJid
@@ -289,7 +332,6 @@ export class ConversationEngine {
     const externalId = `ord_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
     const webhookUrl = `${this.config.publicBaseUrl}/webhooks/${this.cryptoProvider.name}`;
 
-    // Na DePix App a moeda e rede são sempre DEPIX / LIQUID vinculados à conta da chave API
     const effectiveAsset =
       this.cryptoProvider.name === 'depixapp' ? 'DEPIX' : this.config.walletAsset;
     const effectiveNetwork =
@@ -359,7 +401,7 @@ export class ConversationEngine {
         `⏳ *Validade:* ${validMinutes} minutos (vence às *${timeStr}* - Brasília)\n\n` +
         actionInstruction;
 
-      await this.whatsapp.sendPixCharge({
+      await this.safeSendPixCharge({
         phone: params.phone,
         preferredJid: params.customerJid,
         summaryText,
@@ -371,8 +413,16 @@ export class ConversationEngine {
       const msg = err instanceof Error ? err.message : String(err);
       console.error('[ConversationEngine] Erro ao gerar Pix:', msg);
 
+      // Mantém AWAITING_AMOUNT para que nova tentativa sem repetir "pix" seja atendida!
+      this.repository.saveSession({
+        phone: params.phone,
+        customerJid: params.customerJid,
+        stage: 'AWAITING_AMOUNT',
+        updatedAt: new Date().toISOString(),
+      });
+
       if (msg.includes('API_KEY_MISSING') || msg.includes('WALLET_MISSING')) {
-        await this.whatsapp.sendText(
+        await this.safeSendText(
           params.phone,
           `⚠️ A conta recebedora ainda está sendo configurada no painel. Tente novamente em instantes.`,
           params.customerJid
@@ -380,7 +430,7 @@ export class ConversationEngine {
         return;
       }
 
-      await this.whatsapp.sendText(
+      await this.safeSendText(
         params.phone,
         `⚠️ Não foi possível gerar a cobrança agora. Por favor, envie o valor novamente em alguns instantes.`,
         params.customerJid
@@ -402,7 +452,7 @@ export class ConversationEngine {
       `⏳ *Tempo restante:* ${remainingMin} min (vence às *${timeStr}* - Brasília)\n\n` +
       (isPaymentLink ? `👇 Toque no link seguro abaixo:` : `👇 Copie o código Pix abaixo:`);
 
-    await this.whatsapp.sendPixCharge({
+    await this.safeSendPixCharge({
       phone: order.customerPhone,
       preferredJid: order.customerJid,
       summaryText,
@@ -417,7 +467,7 @@ export class ConversationEngine {
     changed: boolean;
     order?: PixCryptoOrder;
   }> {
-    if (event.eventId && !this.repository.tryRecordWebhookEvent(event.eventId)) {
+    if (event.eventId && this.repository.hasWebhookEvent(event.eventId)) {
       return { matched: true, changed: false };
     }
 
@@ -433,6 +483,7 @@ export class ConversationEngine {
 
     const { changed, updatedOrder } = this.repository.applySettlementUpdate({
       orderId: existing.id,
+      eventId: event.eventId,
       newStatus: event.newStatus,
       txHash: event.txHash,
       endToEndId: event.endToEndId,
@@ -444,7 +495,7 @@ export class ConversationEngine {
     }
 
     if (updatedOrder.status === 'PIX_CONFIRMED') {
-      await this.whatsapp.sendText(
+      await this.safeSendText(
         updatedOrder.customerPhone,
         `🎉 *Pagamento Pix de ${formatBrl(updatedOrder.amountBrl)} recebido!*\n\n` +
           `🧾 *Protocolo:* \`${updatedOrder.externalId}\`\n` +
@@ -456,14 +507,14 @@ export class ConversationEngine {
         this.config.adminWhatsappPhone &&
         this.config.adminWhatsappPhone !== updatedOrder.customerPhone
       ) {
-        await this.whatsapp.sendText(
+        await this.safeSendText(
           this.config.adminWhatsappPhone,
           `💰 *Pix Pago pelo Cliente!* (${formatBrl(updatedOrder.amountBrl)})\n` +
             `Protocolo: \`${updatedOrder.externalId}\` — Aguardando liquidação on-chain (${updatedOrder.cryptoAsset}/${updatedOrder.cryptoNetwork}).`
         );
       }
     } else if (updatedOrder.status === 'SETTLED_CRYPTO') {
-      await this.whatsapp.sendText(
+      await this.safeSendText(
         updatedOrder.customerPhone,
         `✅ *Pagamento de ${formatBrl(updatedOrder.amountBrl)} Confirmado!*\n\n` +
           `🧾 *Protocolo:* \`${updatedOrder.externalId}\`\n` +
@@ -480,7 +531,7 @@ export class ConversationEngine {
           : updatedOrder.cryptoAsset;
         const hashLine = updatedOrder.txHash ? `\n🔗 *TxHash:* \`${updatedOrder.txHash}\`` : '';
 
-        await this.whatsapp.sendText(
+        await this.safeSendText(
           this.config.adminWhatsappPhone,
           `🚀 *Cripto Liquidada Direto na Carteira!*\n\n` +
             `💵 *Pix Pago:* ${formatBrl(updatedOrder.amountBrl)}\n` +
@@ -489,13 +540,47 @@ export class ConversationEngine {
         );
       }
     } else if (updatedOrder.status === 'FAILED') {
-      await this.whatsapp.sendText(
+      await this.safeSendText(
         updatedOrder.customerPhone,
         `⚠️ O pagamento da cobrança *${updatedOrder.externalId}* foi cancelado ou estornado pela processadora. Para gerar uma nova cobrança, envie o valor desejado.`,
         updatedOrder.customerJid
       );
+
+      if (
+        this.config.adminWhatsappPhone &&
+        this.config.adminWhatsappPhone !== updatedOrder.customerPhone
+      ) {
+        await this.safeSendText(
+          this.config.adminWhatsappPhone,
+          `❌ *Atenção: Pagamento Estornado/Cancelado!* (${formatBrl(updatedOrder.amountBrl)})\n` +
+            `Protocolo: \`${updatedOrder.externalId}\` — A processadora recusou/estornou o pagamento.`
+        );
+      }
     }
 
     return { matched: true, changed: true, order: updatedOrder };
+  }
+
+  private async safeSendText(phone: string, text: string, preferredJid?: string): Promise<void> {
+    try {
+      await this.whatsapp.sendText(phone, text, preferredJid);
+    } catch (err) {
+      console.error('[ConversationEngine] Falha ao enviar texto WhatsApp:', err);
+    }
+  }
+
+  private async safeSendPixCharge(params: {
+    phone: string;
+    preferredJid?: string;
+    summaryText: string;
+    pixCopyPaste: string;
+    qrCodeBase64?: string;
+    qrCodeUrl?: string;
+  }): Promise<void> {
+    try {
+      await this.whatsapp.sendPixCharge(params);
+    } catch (err) {
+      console.error('[ConversationEngine] Falha ao enviar cobrança WhatsApp:', err);
+    }
   }
 }

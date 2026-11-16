@@ -1,6 +1,6 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
-import { SUPPORTED_PROVIDERS } from '../config/env.ts';
+import { clampInt, SUPPORTED_PROVIDERS } from '../config/env.ts';
 import type { AppConfig } from '../config/env.ts';
 import { OrderRepository } from '../database/orderRepository.ts';
 import { createCryptoProvider } from '../providers/providerFactory.ts';
@@ -13,40 +13,88 @@ import type {
 import type { BaileysDirectManager } from '../whatsapp/baileysManager.ts';
 import { renderDashboardHtml } from './dashboardHtml.ts';
 
-const MAX_BODY_BYTES = 256 * 1024; // 256 KB contra DoS de memória
+const MAX_BODY_BYTES = 256 * 1024;
 const SESSION_COOKIE_NAME = 'robo_admin_sess';
-const SESSION_TTL_SECONDS = 12 * 60 * 60; // 12 horas
+const SESSION_TTL_SECONDS = 12 * 60 * 60;
 const LOGIN_WINDOW_MS = 5 * 60 * 1000;
-const MAX_LOGIN_ATTEMPTS = 5;
+const MAX_LOGIN_ATTEMPTS_PER_IP = 5;
+const MAX_GLOBAL_LOGIN_FAILURES = 30;
+const MAX_TRACKED_LOGIN_IPS = 2_000;
 
 class PayloadTooLargeError extends Error {}
 class BadJsonError extends Error {}
 
-function hashPassword(password: string): string {
-  const salt = crypto.randomBytes(16).toString('hex');
-  const derived = crypto.scryptSync(password, salt, 64).toString('hex');
-  return `${salt}:${derived}`;
+function scryptAsync(password: string, salt: string): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    crypto.scrypt(password, salt, 64, (err, derivedKey) => {
+      if (err) reject(err);
+      else resolve(derivedKey);
+    });
+  });
 }
 
-function verifyPasswordHash(password: string, storedHash: string): boolean {
+async function hashPasswordAsync(password: string): Promise<string> {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const derived = await scryptAsync(password, salt);
+  return `${salt}:${derived.toString('hex')}`;
+}
+
+async function verifyPasswordHashAsync(password: string, storedHash: string): Promise<boolean> {
   const [salt, keyHex] = storedHash.split(':');
-  if (!salt || !keyHex) return false;
-  const derived = crypto.scryptSync(password, salt, 64);
+  if (!salt || !keyHex || !/^[0-9a-f]{128}$/i.test(keyHex)) return false;
+  const derived = await scryptAsync(password, salt);
   const keyBuf = Buffer.from(keyHex, 'hex');
   if (derived.length !== keyBuf.length) return false;
   return crypto.timingSafeEqual(derived, keyBuf);
 }
 
+/**
+ * Comparação em tempo constante via SHA-256 (não vaza tamanho da string por timing).
+ */
 function safeEqualStrings(a: string, b: string): boolean {
-  const bufA = Buffer.from(a, 'utf8');
-  const bufB = Buffer.from(b, 'utf8');
-  if (bufA.length !== bufB.length) return false;
-  return crypto.timingSafeEqual(bufA, bufB);
+  const hashA = crypto.createHash('sha256').update(a, 'utf8').digest();
+  const hashB = crypto.createHash('sha256').update(b, 'utf8').digest();
+  return crypto.timingSafeEqual(hashA, hashB);
 }
 
 function maskPhoneForUi(phone: string): string {
   if (phone.length <= 6) return phone;
   return `${phone.slice(0, 4)}****${phone.slice(-4)}`;
+}
+
+function extractClientIp(req: http.IncomingMessage): string {
+  // No Render/Cloudflare, o ÚLTIMO IP em X-Forwarded-For é o anexado pelo proxy reverso confiável
+  const xff = req.headers['x-forwarded-for'];
+  if (typeof xff === 'string' && xff.trim()) {
+    const parts = xff
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (parts.length > 0) {
+      return parts[parts.length - 1];
+    }
+  }
+  return req.socket.remoteAddress || 'unknown';
+}
+
+function isCrossSiteRequest(req: http.IncomingMessage): boolean {
+  const secFetchSite = req.headers['sec-fetch-site'];
+  if (secFetchSite === 'cross-site') {
+    return true;
+  }
+  const origin = req.headers.origin;
+  const host = req.headers.host;
+  if (typeof origin === 'string' && origin && typeof host === 'string' && host) {
+    try {
+      const originHost = new URL(origin).host.toLowerCase();
+      if (originHost !== host.toLowerCase()) {
+        return true;
+      }
+    } catch {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function createAppHttpServer(params: {
@@ -58,6 +106,20 @@ export function createAppHttpServer(params: {
   const { config, repository, engine, baileys } = params;
   const sessionSigningSecret = crypto.randomBytes(32).toString('hex');
   const loginAttempts = new Map<string, { count: number; resetAt: number }>();
+  let globalLoginFailWindow = { count: 0, resetAt: 0 };
+
+  const pruneLoginAttempts = (now: number): void => {
+    for (const [ip, entry] of loginAttempts) {
+      if (now >= entry.resetAt) {
+        loginAttempts.delete(ip);
+      }
+    }
+    while (loginAttempts.size >= MAX_TRACKED_LOGIN_IPS) {
+      const oldestIp = loginAttempts.keys().next().value;
+      if (oldestIp === undefined) break;
+      loginAttempts.delete(oldestIp);
+    }
+  };
 
   const getDefaultWebhookSecret = (prov: SupportedProviderName): string => {
     if (prov === 'depixapp') return config.depixapp.webhookSecret;
@@ -93,14 +155,14 @@ export function createAppHttpServer(params: {
     return Boolean(acc.adminPinHash);
   };
 
-  const verifyAdminPassword = (candidate: string): boolean => {
+  const verifyAdminPasswordAsync = async (candidate: string): Promise<boolean> => {
     if (!candidate) return false;
     if (config.adminPassword) {
       return safeEqualStrings(candidate, config.adminPassword);
     }
     const acc = getEffectiveAccount();
     if (!acc.adminPinHash) return false;
-    return verifyPasswordHash(candidate, acc.adminPinHash);
+    return verifyPasswordHashAsync(candidate, acc.adminPinHash);
   };
 
   const createSessionToken = (): string => {
@@ -129,13 +191,17 @@ export function createAppHttpServer(params: {
     return safeEqualStrings(sig, expectedSig);
   };
 
+  /**
+   * Aceita APENAS tokens de sessão assinados (cookie ou Bearer), exigindo que
+   * qualquer tentativa de senha passe obrigatoriamente pelo rate-limit de `/api/auth/login`!
+   */
   const isRequestAuthenticated = (req: http.IncomingMessage): boolean => {
     if (!isPasswordConfigured()) return false;
 
     const authHeader = req.headers.authorization;
     if (authHeader && authHeader.startsWith('Bearer ')) {
       const bearer = authHeader.slice(7).trim();
-      if (verifyAdminPassword(bearer) || verifySessionToken(bearer)) {
+      if (verifySessionToken(bearer)) {
         return true;
       }
     }
@@ -144,8 +210,12 @@ export function createAppHttpServer(params: {
     const cookies = cookieHeader.split(';').map((c) => c.trim());
     for (const c of cookies) {
       if (c.startsWith(`${SESSION_COOKIE_NAME}=`)) {
-        const val = decodeURIComponent(c.slice(SESSION_COOKIE_NAME.length + 1));
-        if (verifySessionToken(val)) return true;
+        try {
+          const val = decodeURIComponent(c.slice(SESSION_COOKIE_NAME.length + 1));
+          if (verifySessionToken(val)) return true;
+        } catch {
+          return false;
+        }
       }
     }
     return false;
@@ -171,7 +241,6 @@ export function createAppHttpServer(params: {
       const pathname = urlObj.pathname;
       const method = req.method || 'GET';
 
-      // Cabeçalhos básicos de segurança em todas as respostas
       res.setHeader('X-Content-Type-Options', 'nosniff');
       res.setHeader('X-Frame-Options', 'DENY');
       res.setHeader('Referrer-Policy', 'no-referrer');
@@ -186,9 +255,14 @@ export function createAppHttpServer(params: {
         return;
       }
 
-      // Healthcheck público enxuto (sem expor estado interno sensível)
       if (method === 'GET' && pathname === '/health') {
         sendJson(res, 200, { status: 'ok' });
+        return;
+      }
+
+      // Proteção CSRF em todas as mutações POST sob `/api/*`
+      if (method === 'POST' && pathname.startsWith('/api/') && isCrossSiteRequest(req)) {
+        sendJson(res, 403, { error: 'Requisição cross-origin bloqueada (CSRF).' });
         return;
       }
 
@@ -216,26 +290,33 @@ export function createAppHttpServer(params: {
           return;
         }
 
+        const pinHash = await hashPasswordAsync(newPassword);
         const current = getEffectiveAccount();
         repository.saveRuntimeSettings({
           ...current,
-          adminPinHash: hashPassword(newPassword),
+          adminPinHash: pinHash,
         });
 
         const token = createSessionToken();
         res.setHeader('Set-Cookie', buildSessionCookie(req, token, SESSION_TTL_SECONDS));
-        sendJson(res, 200, { ok: true });
+        sendJson(res, 200, { ok: true, token });
         return;
       }
 
       if (method === 'POST' && pathname === '/api/auth/login') {
-        const clientIp =
-          String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown')
-            .split(',')[0]
-            .trim();
         const now = Date.now();
+        pruneLoginAttempts(now);
+
+        if (now >= globalLoginFailWindow.resetAt) {
+          globalLoginFailWindow = { count: 0, resetAt: now + LOGIN_WINDOW_MS };
+        }
+        const clientIp = extractClientIp(req);
         const attempt = loginAttempts.get(clientIp);
-        if (attempt && now < attempt.resetAt && attempt.count >= MAX_LOGIN_ATTEMPTS) {
+
+        if (
+          globalLoginFailWindow.count >= MAX_GLOBAL_LOGIN_FAILURES ||
+          (attempt && now < attempt.resetAt && attempt.count >= MAX_LOGIN_ATTEMPTS_PER_IP)
+        ) {
           sendJson(res, 429, {
             error: 'Muitas tentativas incorretas. Aguarde 5 minutos e tente novamente.',
           });
@@ -244,7 +325,9 @@ export function createAppHttpServer(params: {
 
         const body = parseJsonObject(await readRawBody(req));
         const password = String(body.password || '').trim();
-        if (!verifyAdminPassword(password)) {
+        const valid = await verifyAdminPasswordAsync(password);
+        if (!valid) {
+          globalLoginFailWindow.count += 1;
           const prevCount = attempt && now < attempt.resetAt ? attempt.count : 0;
           loginAttempts.set(clientIp, {
             count: prevCount + 1,
@@ -257,7 +340,7 @@ export function createAppHttpServer(params: {
         loginAttempts.delete(clientIp);
         const token = createSessionToken();
         res.setHeader('Set-Cookie', buildSessionCookie(req, token, SESSION_TTL_SECONDS));
-        sendJson(res, 200, { ok: true });
+        sendJson(res, 200, { ok: true, token });
         return;
       }
 
@@ -267,7 +350,7 @@ export function createAppHttpServer(params: {
         return;
       }
 
-      // ==================== WEBHOOKS DOS GATEWAYS CRIPTO (AUTENTICADOS POR HMAC) ====================
+      // ==================== WEBHOOKS DOS GATEWAYS CRIPTO ====================
 
       if (method === 'POST' && pathname.startsWith('/webhooks/')) {
         const activeProvider = engine.getCryptoProvider();
@@ -288,7 +371,7 @@ export function createAppHttpServer(params: {
           typeof req.headers['x-depix-event-id'] === 'string'
             ? req.headers['x-depix-event-id'].trim()
             : undefined;
-        if (headerEventId && !repository.tryRecordWebhookEvent(headerEventId)) {
+        if (headerEventId && repository.hasWebhookEvent(headerEventId)) {
           sendJson(res, 200, { ok: true, duplicate: true });
           return;
         }
@@ -299,20 +382,21 @@ export function createAppHttpServer(params: {
           sendJson(res, 200, { ignored: true });
           return;
         }
+        if (headerEventId && !settlementEvent.eventId) {
+          settlementEvent.eventId = headerEventId;
+        }
 
         const result = await engine.handleSettlementWebhook(settlementEvent);
         sendJson(res, 200, { ok: true, matched: result.matched, changed: result.changed });
         return;
       }
 
-      // ==================== DEMAIS ROTAS /api/* EXIGEM SESSÃO AUTENTICADA ====================
+      // ==================== ROTAS AUTENTICADAS ====================
 
       if (pathname.startsWith('/api/') && !isRequestAuthenticated(req)) {
         sendJson(res, 401, { error: 'Acesso não autorizado. Faça login no painel.' });
         return;
       }
-
-      // ==================== PASSO 1: CONFIGURAÇÃO DA CONTA & CARTEIRA ====================
 
       if (method === 'GET' && pathname === '/api/account') {
         const acc = getEffectiveAccount();
@@ -364,7 +448,6 @@ export function createAppHttpServer(params: {
               ? getDefaultWebhookSecret(provider)
               : current.webhookSecret;
 
-        // Na DePix App a moeda e rede são fixas em DEPIX / LIQUID
         const walletAsset =
           provider === 'depixapp'
             ? 'DEPIX'
@@ -386,6 +469,13 @@ export function createAppHttpServer(params: {
               ? String(body.walletAddress).trim()
               : current.walletAddress;
 
+        const safeExpMinutes = clampInt(
+          body.pixExpirationMinutes,
+          clampInt(current.pixExpirationMinutes, 15, 5, 20),
+          5,
+          20
+        );
+
         const saved = repository.saveRuntimeSettings({
           ...current,
           provider,
@@ -394,10 +484,7 @@ export function createAppHttpServer(params: {
           walletAddress,
           walletAsset,
           walletNetwork,
-          pixExpirationMinutes: Math.min(
-            20,
-            Math.max(5, Number(body.pixExpirationMinutes || current.pixExpirationMinutes || 15))
-          ),
+          pixExpirationMinutes: safeExpMinutes,
           adminWhatsappPhone:
             body.adminWhatsappPhone !== undefined
               ? String(body.adminWhatsappPhone).replace(/\D/g, '')
@@ -420,8 +507,6 @@ export function createAppHttpServer(params: {
         sendJson(res, 200, { ok: true, provider: saved.provider });
         return;
       }
-
-      // ==================== PASSO 2: WHATSAPP QR CODE ====================
 
       if (method === 'GET' && pathname === '/api/whatsapp/status') {
         sendJson(
@@ -496,8 +581,6 @@ export function createAppHttpServer(params: {
         sendJson(res, 200, status);
         return;
       }
-
-      // ==================== PASSO 3: PEDIDOS (MASCARADOS) & SIMULADOR ====================
 
       if (method === 'GET' && pathname === '/api/orders') {
         const orders = repository.listRecentOrders(50).map((o) => ({

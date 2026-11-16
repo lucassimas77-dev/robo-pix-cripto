@@ -103,25 +103,29 @@ export class UnifiedWhatsAppGateway implements IWhatsAppGateway {
     const { token, phoneNumberId } = this.config.metaWhatsapp;
     if (!token || !phoneNumberId) return;
 
-    const res = await fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        messaging_product: 'whatsapp',
-        recipient_type: 'individual',
-        to: phone,
-        type: 'text',
-        text: { preview_url: false, body },
-      }),
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    });
+    try {
+      const res = await fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          messaging_product: 'whatsapp',
+          recipient_type: 'individual',
+          to: phone,
+          type: 'text',
+          text: { preview_url: false, body },
+        }),
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      });
 
-    if (!res.ok) {
-      const err = await res.text();
-      console.error(`[WhatsApp Meta] Erro HTTP ${res.status}: ${err}`);
+      if (!res.ok) {
+        const err = await res.text();
+        console.error(`[WhatsApp Meta] Erro HTTP ${res.status}: ${err}`);
+      }
+    } catch (err) {
+      console.error('[WhatsApp Meta] Falha de transporte:', err);
     }
   }
 
@@ -129,40 +133,48 @@ export class UnifiedWhatsAppGateway implements IWhatsAppGateway {
     const { token, phoneNumberId } = this.config.metaWhatsapp;
     if (!token || !phoneNumberId) return;
 
-    await fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        messaging_product: 'whatsapp',
-        recipient_type: 'individual',
-        to: phone,
-        type: 'image',
-        image: { link: imageUrl, caption },
-      }),
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    });
+    try {
+      await fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          messaging_product: 'whatsapp',
+          recipient_type: 'individual',
+          to: phone,
+          type: 'image',
+          image: { link: imageUrl, caption },
+        }),
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      });
+    } catch (err) {
+      console.error('[WhatsApp Meta] Falha de transporte imagem:', err);
+    }
   }
 
   private async sendViaEvolutionText(phone: string, text: string): Promise<void> {
     const { apiUrl, apiKey, instanceName } = this.config.evolutionWhatsapp;
     if (!apiKey) return;
 
-    const res = await fetch(`${apiUrl}/message/sendText/${encodeURIComponent(instanceName)}`, {
-      method: 'POST',
-      headers: {
-        apikey: apiKey,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ number: phone, text }),
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    });
+    try {
+      const res = await fetch(`${apiUrl}/message/sendText/${encodeURIComponent(instanceName)}`, {
+        method: 'POST',
+        headers: {
+          apikey: apiKey,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ number: phone, text }),
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      });
 
-    if (!res.ok) {
-      const err = await res.text();
-      console.error(`[WhatsApp Evolution] Erro HTTP ${res.status}: ${err}`);
+      if (!res.ok) {
+        const err = await res.text();
+        console.error(`[WhatsApp Evolution] Erro HTTP ${res.status}: ${err}`);
+      }
+    } catch (err) {
+      console.error('[WhatsApp Evolution] Falha de transporte texto:', err);
     }
   }
 
@@ -176,21 +188,25 @@ export class UnifiedWhatsAppGateway implements IWhatsAppGateway {
 
     const cleanBase64 = dataUriBase64.replace(/^data:image\/\w+;base64,/, '');
 
-    await fetch(`${apiUrl}/message/sendMedia/${encodeURIComponent(instanceName)}`, {
-      method: 'POST',
-      headers: {
-        apikey: apiKey,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        number: phone,
-        mediatype: 'image',
-        mimetype: 'image/png',
-        caption,
-        media: cleanBase64,
-        fileName: 'qrcode-pix.png',
-      }),
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    });
+    try {
+      await fetch(`${apiUrl}/message/sendMedia/${encodeURIComponent(instanceName)}`, {
+        method: 'POST',
+        headers: {
+          apikey: apiKey,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          number: phone,
+          mediatype: 'image',
+          mimetype: 'image/png',
+          caption,
+          media: cleanBase64,
+          fileName: 'qrcode-pix.png',
+        }),
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      });
+    } catch (err) {
+      console.error('[WhatsApp Evolution] Falha de transporte mídia:', err);
+    }
   }
 }

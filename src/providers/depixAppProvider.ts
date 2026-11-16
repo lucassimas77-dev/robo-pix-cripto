@@ -12,15 +12,6 @@ import type {
 const FETCH_TIMEOUT_MS = 15_000;
 const WEBHOOK_TOLERANCE_SECONDS = 300; // 5 minutos contra replay attacks
 
-/**
- * Integração homologada com a documentação oficial da DePix App API (https://depixapp.com/docs.md).
- *
- * Opera SEMPRE no Modo Privado Sem Perguntar CPF no WhatsApp:
- * - Cria cobrança privada única (`POST /api/products` com `kind: "charge"` e `slug` único).
- * - Entrega `https://pay.depixapp.com/c/prd_...` + QR Code imediato no WhatsApp.
- * - Nota: na DePix App, a liquidação de charges/checkouts vai sempre em DEPIX (Liquid Network)
- *   para o endereço Liquid configurado pelo titular diretamente em `depixapp.com/#merchant`.
- */
 export class DePixAppProvider implements IPixCryptoProvider {
   public readonly name = 'depixapp' as const;
   public readonly minAmountBrl = 5;
@@ -47,12 +38,17 @@ export class DePixAppProvider implements IPixCryptoProvider {
     };
   }
 
-  public isLiveKey(): boolean {
-    return this.config.apiKey.startsWith('sk_live_');
-  }
-
   public isTestKey(): boolean {
     return this.config.apiKey.startsWith('sk_test_');
+  }
+
+  /**
+   * Fail-closed conforme `depix_docs.md:1715`: bloqueia eventos `is_live: false | 0`
+   * sempre que a chave NÃO for explicitamente uma chave sandbox `sk_test_`.
+   */
+  private shouldRejectSandboxItem(isLiveField: unknown): boolean {
+    if (this.isTestKey()) return false;
+    return isLiveField === false || isLiveField === 0;
   }
 
   public async createCharge(input: CreateChargeInput): Promise<CreateChargeOutput> {
@@ -70,20 +66,19 @@ export class DePixAppProvider implements IPixCryptoProvider {
       throw new Error('MAX_AMOUNT: O valor máximo por cobrança na DePix App é de R$ 6.000,00.');
     }
 
-    const expiresInSeconds = Math.min(1200, Math.max(300, Math.round(input.expirationMinutes * 60)));
+    const expMinutes = Number.isFinite(input.expirationMinutes) ? input.expirationMinutes : 15;
+    const expiresInSeconds = Math.min(1200, Math.max(300, Math.round(expMinutes * 60)));
     const publicHttpsCallback =
       input.webhookUrl.startsWith('https://') && !input.webhookUrl.includes('localhost')
         ? input.webhookUrl
         : undefined;
 
-    // Taxa documentada da DePix App: 2% + R$ 0,99
     const estimatedNet = Math.max(0, Math.round((input.amountBrl * 0.98 - 0.99) * 100) / 100);
 
     const saoPauloToday = new Intl.DateTimeFormat('en-CA', {
       timeZone: 'America/Sao_Paulo',
     }).format(new Date());
 
-    // Slug único (2-60 chars, minúsculas/números/hifens) evita 409 conflict: duplicate slug!
     const uniqueSlug = `chg-${Date.now().toString(36)}-${crypto.randomBytes(5).toString('hex')}`;
 
     const chargePayload: Record<string, unknown> = {
@@ -145,10 +140,6 @@ export class DePixAppProvider implements IPixCryptoProvider {
     };
   }
 
-  /**
-   * Validação estrita do formato oficial `X-DePix-Signature: t=1717257600,v1=<hmac_hex>`
-   * com proteção contra replay attack na janela de timestamp `t`.
-   */
   public verifyWebhookSignature(
     rawBody: string,
     headers: Record<string, string | string[] | undefined>
@@ -199,8 +190,7 @@ export class DePixAppProvider implements IPixCryptoProvider {
       unknown
     >;
 
-    // Regra crítica da documentação oficial: jamais liberar pedido real se `is_live` for falso!
-    if (this.isLiveKey() && (data.is_live === false || data.is_live === 0)) {
+    if (this.shouldRejectSandboxItem(data.is_live)) {
       return null;
     }
 
@@ -279,17 +269,13 @@ export class DePixAppProvider implements IPixCryptoProvider {
     };
   }
 
-  /**
-   * Consulta ativa do pagamento na DePix App priorizando corretamente:
-   * `completed` (buscando `blockchain_tx_id` em GET /checkouts/:id) > `approved`/`processing` > `pending` ativo.
-   */
   public async checkChargeStatus(providerChargeId: string): Promise<ChargePollResult | null> {
     if (!this.config.apiKey || !providerChargeId) return null;
 
     try {
       if (providerChargeId.startsWith('prd_')) {
         const res = await fetch(
-          `${this.config.apiUrl}/products/${encodeURIComponent(providerChargeId)}/checkouts?limit=20`,
+          `${this.config.apiUrl}/products/${encodeURIComponent(providerChargeId)}/checkouts?limit=100`,
           {
             headers: {
               Authorization: `Bearer ${this.config.apiKey}`,
@@ -304,12 +290,10 @@ export class DePixAppProvider implements IPixCryptoProvider {
           ? (root.checkouts as Array<Record<string, unknown>>)
           : [];
 
-        const validItems = rawList.filter(
-          (item) => !(this.isLiveKey() && (item.is_live === false || item.is_live === 0))
-        );
+        const validItems = rawList.filter((item) => !this.shouldRejectSandboxItem(item.is_live));
         if (validItems.length === 0) return null;
 
-        // 1ª prioridade: algum checkout já `completed` -> busca `blockchain_tx_id` no detalhe
+        // 1ª prioridade: `completed`
         const completedItem = validItems.find(
           (item) => String(item.status ?? '').toLowerCase() === 'completed'
         );
@@ -323,7 +307,7 @@ export class DePixAppProvider implements IPixCryptoProvider {
           return { status: 'SETTLED_CRYPTO', txHash };
         }
 
-        // 2ª prioridade: algum checkout já pago em processamento/aprovação (`processing` | `approved`)
+        // 2ª prioridade: `processing` | `approved`
         const processingItem = validItems.find((item) => {
           const st = String(item.status ?? '').toLowerCase();
           return st === 'processing' || st === 'approved';
@@ -332,7 +316,7 @@ export class DePixAppProvider implements IPixCryptoProvider {
           return { status: 'PIX_CONFIRMED' };
         }
 
-        // 3ª prioridade: algum checkout `pending` ainda dentro do prazo na DePix (cliente acabou de abrir o link!)
+        // 3ª prioridade: `pending` ainda válido
         const nowMs = Date.now();
         const activePending = validItems.find((item) => {
           if (String(item.status ?? '').toLowerCase() !== 'pending') return false;
@@ -346,10 +330,21 @@ export class DePixAppProvider implements IPixCryptoProvider {
           };
         }
 
+        // 4ª prioridade: checkout estornado/cancelado (ex: PAYER_MISMATCH após ter passado por processing!)
+        const cancelledItem = validItems.find((item) => {
+          const st = String(item.status ?? '').toLowerCase();
+          return st === 'cancelled' || st === 'canceled' || st === 'refunded' || st === 'failed';
+        });
+        if (cancelledItem) {
+          const reasons = Array.isArray(cancelledItem.rejection_reasons)
+            ? cancelledItem.rejection_reasons.map(String)
+            : undefined;
+          return { status: 'FAILED', rejectionReasons: reasons };
+        }
+
         return null;
       }
 
-      // Consulta direta de checkout (`chk_...`) — embrulhado em `{ checkout: { ... } }`
       const res = await fetch(
         `${this.config.apiUrl}/checkouts/${encodeURIComponent(providerChargeId)}`,
         {
@@ -367,7 +362,7 @@ export class DePixAppProvider implements IPixCryptoProvider {
           ? (root.checkout as Record<string, unknown>)
           : root;
 
-      if (this.isLiveKey() && (chk.is_live === false || chk.is_live === 0)) {
+      if (this.shouldRejectSandboxItem(chk.is_live)) {
         return null;
       }
 

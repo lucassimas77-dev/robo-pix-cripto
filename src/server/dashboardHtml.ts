@@ -302,35 +302,39 @@ export function renderDashboardHtml(): string {
     providerEl.addEventListener('change', updateProviderVisibility);
 
     async function checkAuth() {
-      const res = await fetch('/api/auth/status');
-      const data = await res.json();
-      if (data.authenticated) {
-        authCard.classList.add('hidden');
-        mainApp.classList.remove('hidden');
-        await loadAccount();
-        await pollStatus();
-        if (!pollTimer) {
-          pollTimer = setInterval(pollStatus, 4000);
+      try {
+        const res = await fetch('/api/auth/status');
+        const data = await res.json();
+        if (data.authenticated) {
+          authCard.classList.add('hidden');
+          mainApp.classList.remove('hidden');
+          await loadAccount();
+          await pollStatus();
+          if (!pollTimer) {
+            pollTimer = setInterval(pollStatus, 4000);
+          }
+          return;
         }
-        return;
-      }
 
-      if (pollTimer) {
-        clearInterval(pollTimer);
-        pollTimer = null;
-      }
-      mainApp.classList.add('hidden');
-      authCard.classList.remove('hidden');
-      needsSetupMode = Boolean(data.needsSetup);
+        if (pollTimer) {
+          clearInterval(pollTimer);
+          pollTimer = null;
+        }
+        mainApp.classList.add('hidden');
+        authCard.classList.remove('hidden');
+        needsSetupMode = Boolean(data.needsSetup);
 
-      if (needsSetupMode) {
-        authTitle.textContent = '🔐 Crie uma Senha Rápida para o Painel';
-        authDesc.textContent = 'Como este link é público na nuvem, defina uma senha curta agora para que somente você (ou seu amigo) possa mexer na carteira e no WhatsApp.';
-        authBtn.textContent = 'Salvar Senha e Abrir Painel';
-      } else {
-        authTitle.textContent = '🔒 Painel Protegido';
-        authDesc.textContent = 'Digite a senha definida no primeiro acesso para abrir o painel.';
-        authBtn.textContent = 'Entrar no Painel';
+        if (needsSetupMode) {
+          authTitle.textContent = '🔐 Crie uma Senha Rápida para o Painel';
+          authDesc.textContent = 'Como este link é público na nuvem, defina uma senha curta agora para que somente você (ou seu amigo) possa mexer na carteira e no WhatsApp.';
+          authBtn.textContent = 'Salvar Senha e Abrir Painel';
+        } else {
+          authTitle.textContent = '🔒 Painel Protegido';
+          authDesc.textContent = 'Digite a senha definida no primeiro acesso para abrir o painel.';
+          authBtn.textContent = 'Entrar no Painel';
+        }
+      } catch {
+        authErr.textContent = 'Conexão temporariamente indisponível. Tentando novamente...';
       }
     }
 
@@ -341,19 +345,26 @@ export function renderDashboardHtml(): string {
         authErr.textContent = 'Digite uma senha.';
         return;
       }
-      const endpoint = needsSetupMode ? '/api/auth/setup' : '/api/auth/login';
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password: pwd })
-      });
-      const out = await res.json();
-      if (!res.ok) {
-        authErr.textContent = out.error || 'Falha ao autenticar.';
-        return;
+      authBtn.disabled = true;
+      try {
+        const endpoint = needsSetupMode ? '/api/auth/setup' : '/api/auth/login';
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: pwd })
+        });
+        const out = await res.json();
+        if (!res.ok) {
+          authErr.textContent = out.error || 'Falha ao autenticar.';
+          return;
+        }
+        authPassword.value = '';
+        await checkAuth();
+      } catch {
+        authErr.textContent = 'Falha de rede ao autenticar. Tente novamente.';
+      } finally {
+        authBtn.disabled = false;
       }
-      authPassword.value = '';
-      await checkAuth();
     }
 
     authBtn.addEventListener('click', submitAuth);
@@ -362,79 +373,98 @@ export function renderDashboardHtml(): string {
     });
 
     logoutBtn.addEventListener('click', async () => {
-      await fetch('/api/auth/logout', { method: 'POST' });
+      try {
+        await fetch('/api/auth/logout', { method: 'POST' });
+      } catch {
+        // Ignora
+      }
       await checkAuth();
     });
 
     async function loadAccount() {
-      const res = await fetch('/api/account');
-      if (res.status === 401) {
-        await checkAuth();
-        return;
+      try {
+        const res = await fetch('/api/account');
+        if (res.status === 401) {
+          await checkAuth();
+          return;
+        }
+        const acc = await res.json();
+        providerEl.value = acc.provider;
+        walletAddressEl.value = acc.walletAddress || '';
+        walletAssetEl.value = acc.walletAsset || 'USDT';
+        walletNetworkEl.value = acc.walletNetwork || 'POLYGON';
+        adminPhoneEl.value = acc.adminWhatsappPhone || '';
+
+        apiKeyEl.placeholder = acc.apiKeyPreview
+          ? 'Salva (' + acc.apiKeyPreview + ') - digite p/ trocar'
+          : 'Cole aqui a chave da sua conta...';
+
+        webhookSecretEl.placeholder = acc.hasWebhookSecret
+          ? 'Segredo salvo - digite p/ trocar'
+          : 'Opcional (whsec_...)';
+
+        if (acc.provider === 'mock') {
+          accBadge.textContent = 'MODO TESTE INTERNO (SEM DINHEIRO REAL)';
+        } else if (!acc.hasApiKey) {
+          accBadge.textContent = 'AGUARDANDO COLAR CHAVE DE API';
+        } else if (acc.isTestKey) {
+          accBadge.textContent = '🧪 CHAVE DE TESTE ATIVA (' + acc.provider.toUpperCase() + ')';
+        } else {
+          accBadge.textContent = '✅ CONTA REAL ATIVA (' + acc.provider.toUpperCase() + ')';
+        }
+
+        updateProviderVisibility();
+      } catch {
+        // Ignora oscilação momentânea
       }
-      const acc = await res.json();
-      providerEl.value = acc.provider;
-      walletAddressEl.value = acc.walletAddress || '';
-      walletAssetEl.value = acc.walletAsset || 'USDT';
-      walletNetworkEl.value = acc.walletNetwork || 'POLYGON';
-      adminPhoneEl.value = acc.adminWhatsappPhone || '';
-
-      apiKeyEl.placeholder = acc.apiKeyPreview
-        ? 'Salva (' + acc.apiKeyPreview + ') - digite p/ trocar'
-        : 'Cole aqui a chave da sua conta...';
-
-      webhookSecretEl.placeholder = acc.hasWebhookSecret
-        ? 'Segredo salvo - digite p/ trocar'
-        : 'Opcional (whsec_...)';
-
-      if (acc.provider === 'mock') {
-        accBadge.textContent = 'MODO TESTE INTERNO (SEM DINHEIRO REAL)';
-      } else if (!acc.hasApiKey) {
-        accBadge.textContent = 'AGUARDANDO COLAR CHAVE DE API';
-      } else if (acc.isTestKey) {
-        accBadge.textContent = '🧪 CHAVE DE TESTE ATIVA (' + acc.provider.toUpperCase() + ')';
-      } else {
-        accBadge.textContent = '✅ CONTA REAL ATIVA (' + acc.provider.toUpperCase() + ')';
-      }
-
-      updateProviderVisibility();
     }
 
     saveAccBtn.addEventListener('click', async () => {
       saveMsg.textContent = 'Salvando...';
-      const res = await fetch('/api/account', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          provider: providerEl.value,
-          apiKey: apiKeyEl.value,
-          webhookSecret: webhookSecretEl.value,
-          walletAddress: walletAddressEl.value,
-          walletAsset: walletAssetEl.value,
-          walletNetwork: walletNetworkEl.value,
-          adminWhatsappPhone: adminPhoneEl.value
-        })
-      });
-      if (res.status === 401) {
-        await checkAuth();
-        return;
+      saveAccBtn.disabled = true;
+      try {
+        const res = await fetch('/api/account', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            provider: providerEl.value,
+            apiKey: apiKeyEl.value,
+            webhookSecret: webhookSecretEl.value,
+            walletAddress: walletAddressEl.value,
+            walletAsset: walletAssetEl.value,
+            walletNetwork: walletNetworkEl.value,
+            adminWhatsappPhone: adminPhoneEl.value
+          })
+        });
+        if (res.status === 401) {
+          await checkAuth();
+          return;
+        }
+        apiKeyEl.value = '';
+        webhookSecretEl.value = '';
+        saveMsg.textContent = res.ok ? '✅ Configuração salva e ativa!' : '⚠️ Erro ao salvar.';
+        setTimeout(() => { saveMsg.textContent = ''; }, 3500);
+        await loadAccount();
+      } catch {
+        saveMsg.textContent = '⚠️ Falha de conexão ao salvar.';
+      } finally {
+        saveAccBtn.disabled = false;
       }
-      apiKeyEl.value = '';
-      webhookSecretEl.value = '';
-      saveMsg.textContent = res.ok ? '✅ Configuração salva e ativa!' : '⚠️ Erro ao salvar.';
-      setTimeout(() => { saveMsg.textContent = ''; }, 3500);
-      await loadAccount();
     });
 
     async function saveWaFilter() {
-      await fetch('/api/whatsapp/settings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          filterMode: filterModeEl.value,
-          allowedTestPhone: allowedPhoneEl.value
-        })
-      });
+      try {
+        await fetch('/api/whatsapp/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            filterMode: filterModeEl.value,
+            allowedTestPhone: allowedPhoneEl.value
+          })
+        });
+      } catch {
+        // Ignora
+      }
     }
 
     filterModeEl.addEventListener('change', saveWaFilter);
@@ -442,25 +472,37 @@ export function renderDashboardHtml(): string {
 
     connectWaBtn.addEventListener('click', async () => {
       qrBox.textContent = 'Gerando QR Code...';
-      await fetch('/api/whatsapp/connect', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          filterMode: filterModeEl.value,
-          allowedTestPhone: allowedPhoneEl.value
-        })
-      });
-      await pollStatus();
+      try {
+        await fetch('/api/whatsapp/connect', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            filterMode: filterModeEl.value,
+            allowedTestPhone: allowedPhoneEl.value
+          })
+        });
+        await pollStatus();
+      } catch {
+        qrBox.textContent = 'Erro de conexão. Tente novamente.';
+      }
     });
 
     disconnectWaBtn.addEventListener('click', async () => {
-      await fetch('/api/whatsapp/disconnect', { method: 'POST' });
-      await pollStatus();
+      try {
+        await fetch('/api/whatsapp/disconnect', { method: 'POST' });
+        await pollStatus();
+      } catch {
+        // Ignora
+      }
     });
 
     async function simulatePay(orderId) {
-      await fetch('/api/simulator/pay/' + encodeURIComponent(orderId), { method: 'POST' });
-      await pollStatus();
+      try {
+        await fetch('/api/simulator/pay/' + encodeURIComponent(orderId), { method: 'POST' });
+        await pollStatus();
+      } catch {
+        // Ignora
+      }
     }
 
     function renderQrBoxSafe(wa) {
@@ -546,30 +588,34 @@ export function renderDashboardHtml(): string {
     }
 
     async function pollStatus() {
-      const [waRes, ordRes] = await Promise.all([
-        fetch('/api/whatsapp/status'),
-        fetch('/api/orders')
-      ]);
-      if (waRes.status === 401 || ordRes.status === 401) {
-        await checkAuth();
-        return;
-      }
-      const wa = await waRes.json();
-      const orders = await ordRes.json();
-
-      if (!waSettingsLoadedOnce) {
-        if (wa.filterMode === 'all' || wa.filterMode === 'keyword_only') {
-          filterModeEl.value = wa.filterMode;
+      try {
+        const [waRes, ordRes] = await Promise.all([
+          fetch('/api/whatsapp/status'),
+          fetch('/api/orders')
+        ]);
+        if (waRes.status === 401 || ordRes.status === 401) {
+          await checkAuth();
+          return;
         }
-        if (typeof wa.allowedTestPhone === 'string' && document.activeElement !== allowedPhoneEl) {
-          allowedPhoneEl.value = wa.allowedTestPhone;
-        }
-        waSettingsLoadedOnce = true;
-      }
+        const wa = await waRes.json();
+        const orders = await ordRes.json();
 
-      waBadge.textContent = wa.state === 'CONNECTED' ? '🟢 WHATSAPP CONECTADO' : String(wa.state || 'DESCONECTADO');
-      renderQrBoxSafe(wa);
-      renderOrdersSafe(orders);
+        if (!waSettingsLoadedOnce) {
+          if (wa.filterMode === 'all' || wa.filterMode === 'keyword_only') {
+            filterModeEl.value = wa.filterMode;
+          }
+          if (typeof wa.allowedTestPhone === 'string' && document.activeElement !== allowedPhoneEl) {
+            allowedPhoneEl.value = wa.allowedTestPhone;
+          }
+          waSettingsLoadedOnce = true;
+        }
+
+        waBadge.textContent = wa.state === 'CONNECTED' ? '🟢 WHATSAPP CONECTADO' : String(wa.state || 'DESCONECTADO');
+        renderQrBoxSafe(wa);
+        renderOrdersSafe(orders);
+      } catch {
+        // Ignora oscilação momentânea de rede sem estourar Promise rejeitada
+      }
     }
 
     checkAuth();

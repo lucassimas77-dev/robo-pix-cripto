@@ -53,6 +53,12 @@ export const SUPPORTED_PROVIDERS: SupportedProviderName[] = [
   'noxpay',
 ];
 
+export function clampInt(raw: unknown, fallback: number, min: number, max: number): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(n)));
+}
+
 export function loadConfig(): AppConfig {
   const providerRaw = (process.env.CRYPTO_PROVIDER || 'depixapp').toLowerCase();
   const cryptoProvider: SupportedProviderName = SUPPORTED_PROVIDERS.includes(
@@ -78,7 +84,7 @@ export function loadConfig(): AppConfig {
     : path.resolve(process.cwd(), 'data');
 
   return {
-    port: Number(process.env.PORT || 3000),
+    port: clampInt(process.env.PORT, 3000, 1, 65535),
     dataDir,
     publicBaseUrl: autoBaseUrl.replace(/\/+$/, ''),
     adminPassword: (process.env.ADMIN_PASSWORD || '').trim(),
@@ -86,11 +92,10 @@ export function loadConfig(): AppConfig {
     walletAddress: (process.env.WALLET_ADDRESS || '').trim(),
     walletAsset: (process.env.WALLET_ASSET || 'DEPIX').trim().toUpperCase(),
     walletNetwork: (process.env.WALLET_NETWORK || 'LIQUID').trim().toUpperCase(),
-    pixExpirationMinutes: Math.min(20, Math.max(5, Number(process.env.PIX_EXPIRATION_MINUTES || 15))),
-    pixWarningBeforeMinutes: Math.max(1, Number(process.env.PIX_WARNING_BEFORE_MINUTES || 3)),
+    pixExpirationMinutes: clampInt(process.env.PIX_EXPIRATION_MINUTES, 15, 5, 20),
+    pixWarningBeforeMinutes: clampInt(process.env.PIX_WARNING_BEFORE_MINUTES, 3, 1, 15),
     whatsappMode,
     adminWhatsappPhone: (process.env.ADMIN_WHATSAPP_PHONE || '').replace(/\D/g, ''),
-    // NUNCA usa segredo de webhook hardcoded! String vazia rejeita webhooks sem segredo configurado.
     depixapp: {
       apiUrl: (process.env.DEPIXAPP_API_URL || 'https://api.depixapp.com/api').replace(/\/+$/, ''),
       apiKey: (process.env.DEPIXAPP_API_KEY || '').trim(),

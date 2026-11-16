@@ -1,11 +1,16 @@
 import { OrderRepository } from '../database/orderRepository.ts';
-import type { IWhatsAppGateway } from '../types/domain.ts';
+import type { IWhatsAppGateway, PixCryptoOrder } from '../types/domain.ts';
 import { formatBrl } from '../utils/cpfCnpjValidator.ts';
 import type { ConversationEngine } from './conversationEngine.ts';
+
+const MAX_API_POLLS_PER_SWEEP = 4; // Máx 16 req/min em ciclos de 15s (abaixo do teto de 30 req/min da DePix)
+const PENDING_POLL_COOLDOWN_MS = 14_000;
+const CONFIRMED_POLL_COOLDOWN_MS = 120_000; // Pedidos no Cofre consultados a cada 2 minutos
 
 export class ExpirationWatcher {
   private timer: NodeJS.Timeout | null = null;
   private isSweeping = false;
+  private readonly lastPolledAt = new Map<string, number>();
   private readonly repository: OrderRepository;
   private readonly whatsapp: IWhatsAppGateway;
   private readonly warningBeforeMinutes: number;
@@ -26,7 +31,9 @@ export class ExpirationWatcher {
   public start(intervalMs = 15_000): void {
     if (this.timer) return;
     this.timer = setInterval(() => {
-      void this.sweepPendingOrders();
+      this.sweepPendingOrders().catch((err) => {
+        console.error('[ExpirationWatcher] Erro na varredura periódica:', err);
+      });
     }, intervalMs);
   }
 
@@ -48,13 +55,44 @@ export class ExpirationWatcher {
     this.isSweeping = true;
     try {
       const activeOrders = this.repository.listActiveUnsettledOrders();
+      const nowMs = now.getTime();
       let expiredCount = 0;
       let warnedCount = 0;
       const provider = this.engine?.getCryptoProvider();
 
+      // Poda IDs antigos do mapa de rate-limit para zero vazamento de memória
+      const activeIds = new Set(activeOrders.map((o) => o.id));
+      for (const cachedId of this.lastPolledAt.keys()) {
+        if (!activeIds.has(cachedId)) {
+          this.lastPolledAt.delete(cachedId);
+        }
+      }
+
+      // Seleciona em round-robin até MAX_API_POLLS_PER_SWEEP pedidos elegíveis para consulta externa
+      const eligibleForPoll: PixCryptoOrder[] = [];
+      if (provider) {
+        for (const order of activeOrders) {
+          if (order.provider !== provider.name) continue;
+          const lastMs = this.lastPolledAt.get(order.id) ?? 0;
+          const cooldown =
+            order.status === 'PENDING' ? PENDING_POLL_COOLDOWN_MS : CONFIRMED_POLL_COOLDOWN_MS;
+          if (nowMs - lastMs >= cooldown) {
+            eligibleForPoll.push(order);
+          }
+        }
+        eligibleForPoll.sort(
+          (a, b) => (this.lastPolledAt.get(a.id) ?? 0) - (this.lastPolledAt.get(b.id) ?? 0)
+        );
+      }
+
+      const pollIdsThisCycle = new Set(
+        eligibleForPoll.slice(0, MAX_API_POLLS_PER_SWEEP).map((o) => o.id)
+      );
+
       for (const order of activeOrders) {
-        // 1. Consulta ativa na API (confirma pagamentos e estende validade se houver QR recém-gerado no link)
-        if (provider && provider.name === order.provider) {
+        // 1. Consulta ativa controlada por orçamento de rate-limit
+        if (provider && pollIdsThisCycle.has(order.id)) {
+          this.lastPolledAt.set(order.id, nowMs);
           const remote = await provider.checkChargeStatus(order.providerChargeId);
           if (remote) {
             if (
@@ -77,46 +115,84 @@ export class ExpirationWatcher {
 
             if (remote.status === 'PENDING' && remote.activePendingExpiresAt) {
               this.repository.extendOrderExpiration(order.id, remote.activePendingExpiresAt);
-              order.expiresAt =
-                remote.activePendingExpiresAt > order.expiresAt
-                  ? remote.activePendingExpiresAt
-                  : order.expiresAt;
+              if (remote.activePendingExpiresAt > order.expiresAt) {
+                order.expiresAt = remote.activePendingExpiresAt;
+              }
             }
           }
         }
 
-        // 2. Pedidos já pagos (`PIX_CONFIRMED`) aguardando liquidação on-chain jamais expiram!
+        // 2. Pedidos já pagos (`PIX_CONFIRMED`) no Cofre nunca expiram localmente
         if (order.status !== 'PENDING') {
           continue;
         }
 
-        // 3. Verifica prazo de expiração
+        // 3. Expiração local pontual para TODOS os pedidos `PENDING`
         const expiresMs = new Date(order.expiresAt).getTime();
-        const diffMs = expiresMs - now.getTime();
+        const diffMs = expiresMs - nowMs;
 
         if (diffMs <= 0) {
+          // Antes de expirar um `prd_...` que não coube no lote de poll acima, faz 1 checagem final se possível
+          if (provider && order.provider === provider.name && !pollIdsThisCycle.has(order.id)) {
+            this.lastPolledAt.set(order.id, nowMs);
+            const lastChance = await provider.checkChargeStatus(order.providerChargeId);
+            if (lastChance) {
+              if (
+                this.engine &&
+                (lastChance.status === 'SETTLED_CRYPTO' || lastChance.status === 'PIX_CONFIRMED')
+              ) {
+                await this.engine.handleSettlementWebhook({
+                  provider: order.provider,
+                  providerChargeId: order.providerChargeId,
+                  externalId: order.externalId,
+                  newStatus: lastChance.status,
+                  txHash: lastChance.txHash,
+                  cryptoAmount: lastChance.cryptoAmount,
+                  rawEventName: 'AUTO_POLL_BEFORE_EXPIRE',
+                });
+                continue;
+              }
+              if (
+                lastChance.status === 'PENDING' &&
+                lastChance.activePendingExpiresAt &&
+                new Date(lastChance.activePendingExpiresAt).getTime() > nowMs
+              ) {
+                this.repository.extendOrderExpiration(order.id, lastChance.activePendingExpiresAt);
+                continue;
+              }
+            }
+          }
+
           const updated = this.repository.updateOrderStatus(order.id, 'EXPIRED');
           if (updated) {
             expiredCount++;
             if (provider && provider.name === order.provider && provider.expireCharge) {
               void provider.expireCharge(order.providerChargeId);
             }
-            await this.whatsapp.sendText(
-              order.customerPhone,
-              `⏰ *Atenção: A cobrança Pix de ${formatBrl(order.amountBrl)} expirou.*\n\n` +
-                `Não realize o pagamento em link/código vencido. Se quiser pagar agora, basta enviar o valor (*${order.amountBrl.toFixed(2).replace('.', ',')}*) que gero uma nova na hora!`,
-              order.customerJid
-            );
+            try {
+              await this.whatsapp.sendText(
+                order.customerPhone,
+                `⏰ *Atenção: A cobrança Pix de ${formatBrl(order.amountBrl)} expirou.*\n\n` +
+                  `Não realize o pagamento em link/código vencido. Se quiser pagar agora, basta enviar o valor (*${order.amountBrl.toFixed(2).replace('.', ',')}*) que gero uma nova na hora!`,
+                order.customerJid
+              );
+            } catch (err) {
+              console.error('[ExpirationWatcher] Erro ao notificar expiração:', err);
+            }
           }
         } else if (!order.warningSent && diffMs <= this.warningBeforeMinutes * 60_000) {
           this.repository.markWarningSent(order.id);
           warnedCount++;
           const minsLeft = Math.max(1, Math.ceil(diffMs / 60_000));
-          await this.whatsapp.sendText(
-            order.customerPhone,
-            `⏳ *Lembrete:* Sua cobrança Pix de *${formatBrl(order.amountBrl)}* vence em *${minsLeft} min*.`,
-            order.customerJid
-          );
+          try {
+            await this.whatsapp.sendText(
+              order.customerPhone,
+              `⏳ *Lembrete:* Sua cobrança Pix de *${formatBrl(order.amountBrl)}* vence em *${minsLeft} min*.`,
+              order.customerJid
+            );
+          } catch (err) {
+            console.error('[ExpirationWatcher] Erro ao notificar aviso prévio:', err);
+          }
         }
       }
 

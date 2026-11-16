@@ -86,7 +86,6 @@ export class OrderRepository {
       );
     `);
 
-    // Migrações seguras para bancos SQLite já criados anteriormente
     const safeAlter = [
       `ALTER TABLE orders ADD COLUMN customer_jid TEXT`,
       `ALTER TABLE orders ADD COLUMN payment_url TEXT`,
@@ -96,23 +95,17 @@ export class OrderRepository {
       try {
         this.db.exec(sql);
       } catch {
-        // Coluna já existe
+        // Coluna já existente
       }
     }
   }
 
-  public tryRecordWebhookEvent(eventId?: string): boolean {
-    if (!eventId) return true;
-    try {
-      const res = this.db
-        .prepare(
-          `INSERT OR IGNORE INTO processed_webhook_events (event_id, created_at) VALUES (?, ?)`
-        )
-        .run(eventId, new Date().toISOString());
-      return Number(res.changes) > 0;
-    } catch {
-      return true;
-    }
+  public hasWebhookEvent(eventId?: string): boolean {
+    if (!eventId) return false;
+    const row = this.db
+      .prepare(`SELECT 1 FROM processed_webhook_events WHERE event_id = ?`)
+      .get(eventId);
+    return Boolean(row);
   }
 
   public getRuntimeSettings(defaults: RuntimeAccountSettings): RuntimeAccountSettings {
@@ -187,6 +180,13 @@ export class OrderRepository {
     const row = this.db.prepare(`SELECT * FROM orders WHERE id = ?`).get(id) as
       | Record<string, unknown>
       | undefined;
+    return row ? this.mapRowToOrder(row) : null;
+  }
+
+  public findMostRecentOrderByPhone(phone: string): PixCryptoOrder | null {
+    const row = this.db
+      .prepare(`SELECT * FROM orders WHERE customer_phone = ? ORDER BY created_at DESC LIMIT 1`)
+      .get(phone) as Record<string, unknown> | undefined;
     return row ? this.mapRowToOrder(row) : null;
   }
 
@@ -267,56 +267,88 @@ export class OrderRepository {
     return Number(result.changes) > 0;
   }
 
+  /**
+   * Transação SQLite atômica: atualiza o status do pedido E grava o `event_id` do webhook juntos!
+   */
   public applySettlementUpdate(params: {
     orderId: string;
+    eventId?: string;
     newStatus: OrderStatus;
     txHash?: string;
     endToEndId?: string;
     cryptoAmount?: number;
   }): { changed: boolean; updatedOrder: PixCryptoOrder | null } {
-    const current = this.getOrderById(params.orderId);
-    if (!current) return { changed: false, updatedOrder: null };
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      if (params.eventId) {
+        const dup = this.db
+          .prepare(`SELECT 1 FROM processed_webhook_events WHERE event_id = ?`)
+          .get(params.eventId);
+        if (dup) {
+          this.db.exec('COMMIT');
+          return { changed: false, updatedOrder: this.getOrderById(params.orderId) };
+        }
+      }
 
-    // Estados terminais definitivos nunca retrocedem
-    if (current.status === 'SETTLED_CRYPTO') {
-      return { changed: false, updatedOrder: current };
+      const current = this.getOrderById(params.orderId);
+      if (!current) {
+        this.db.exec('COMMIT');
+        return { changed: false, updatedOrder: null };
+      }
+
+      if (params.eventId) {
+        this.db
+          .prepare(
+            `INSERT INTO processed_webhook_events (event_id, created_at) VALUES (?, ?)`
+          )
+          .run(params.eventId, new Date().toISOString());
+      }
+
+      // SETTLED_CRYPTO é imutável; EXPIRED só aplica se ainda estiver PENDING
+      if (
+        current.status === 'SETTLED_CRYPTO' ||
+        current.status === params.newStatus ||
+        (params.newStatus === 'EXPIRED' && current.status !== 'PENDING')
+      ) {
+        this.db.exec('COMMIT');
+        return { changed: false, updatedOrder: current };
+      }
+
+      const paidAt =
+        params.newStatus === 'PIX_CONFIRMED' || params.newStatus === 'SETTLED_CRYPTO'
+          ? current.paidAt || new Date().toISOString()
+          : (current.paidAt ?? null);
+
+      this.db
+        .prepare(`
+          UPDATE orders
+          SET status = ?,
+              tx_hash = COALESCE(?, tx_hash),
+              end_to_end_id = COALESCE(?, end_to_end_id),
+              estimated_crypto_amount = COALESCE(?, estimated_crypto_amount),
+              paid_at = ?
+          WHERE id = ?
+        `)
+        .run(
+          params.newStatus,
+          params.txHash ?? null,
+          params.endToEndId ?? null,
+          params.cryptoAmount ?? null,
+          paidAt,
+          params.orderId
+        );
+
+      this.db.exec('COMMIT');
+      return { changed: true, updatedOrder: this.getOrderById(params.orderId) };
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        // Ignora
+      }
+      throw err;
     }
-    if (current.status === params.newStatus) {
-      return { changed: false, updatedOrder: current };
-    }
-    // Se já confirmou o pagamento do Pix, nunca volta para EXPIRED
-    if (current.status === 'PIX_CONFIRMED' && params.newStatus === 'EXPIRED') {
-      return { changed: false, updatedOrder: current };
-    }
-
-    const paidAt =
-      params.newStatus === 'PIX_CONFIRMED' || params.newStatus === 'SETTLED_CRYPTO'
-        ? current.paidAt || new Date().toISOString()
-        : (current.paidAt ?? null);
-
-    this.db
-      .prepare(`
-        UPDATE orders
-        SET status = ?,
-            tx_hash = COALESCE(?, tx_hash),
-            end_to_end_id = COALESCE(?, end_to_end_id),
-            estimated_crypto_amount = COALESCE(?, estimated_crypto_amount),
-            paid_at = ?
-        WHERE id = ?
-      `)
-      .run(
-        params.newStatus,
-        params.txHash ?? null,
-        params.endToEndId ?? null,
-        params.cryptoAmount ?? null,
-        paidAt,
-        params.orderId
-      );
-
-    return { changed: true, updatedOrder: this.getOrderById(params.orderId) };
   }
-
-  // ==================== SESSÕES DE CONVERSA ====================
 
   public getSession(phone: string): ChatSession {
     const row = this.db
@@ -369,8 +401,6 @@ export class OrderRepository {
       );
   }
 
-  // ==================== HISTÓRICO DE MENSAGENS ====================
-
   public logMessage(msg: OutgoingWhatsAppMessage): void {
     this.db
       .prepare(`
@@ -388,9 +418,6 @@ export class OrderRepository {
       );
   }
 
-  /**
-   * Retorna as `limit` mensagens MAIS RECENTES em ordem cronológica (ASC).
-   */
   public listMessages(phone?: string, limit = 100): OutgoingWhatsAppMessage[] {
     const rows = phone
       ? (this.db

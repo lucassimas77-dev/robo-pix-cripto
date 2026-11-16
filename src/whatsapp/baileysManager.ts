@@ -6,6 +6,7 @@ import {
   DisconnectReason,
   fetchLatestBaileysVersion,
   makeWASocket,
+  normalizeMessageContent,
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
 import type { WASocket } from '@whiskeysockets/baileys';
@@ -25,6 +26,7 @@ export interface BaileysStatusSnapshot {
 }
 
 const MAX_UNSCANNED_QR_CYCLES = 3;
+const MAX_JID_MAP_ENTRIES = 5_000;
 
 export class BaileysDirectManager {
   private sock: WASocket | null = null;
@@ -108,6 +110,18 @@ export class BaileysDirectManager {
     }
   }
 
+  private rememberJid(phoneDigits: string, jid: string): void {
+    if (this.jidMap.has(phoneDigits)) {
+      this.jidMap.delete(phoneDigits);
+    } else if (this.jidMap.size >= MAX_JID_MAP_ENTRIES) {
+      const oldestKey = this.jidMap.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.jidMap.delete(oldestKey);
+      }
+    }
+    this.jidMap.set(phoneDigits, jid);
+  }
+
   public async startConnection(resetQrAttempts = true): Promise<BaileysStatusSnapshot> {
     if (this.state === 'CONNECTING' || this.state === 'QR_READY' || this.state === 'CONNECTED') {
       return this.getStatus();
@@ -130,7 +144,7 @@ export class BaileysDirectManager {
         const latest = await fetchLatestBaileysVersion();
         version = latest.version;
       } catch {
-        // Fallback embutido caso a consulta de versão oscile
+        // Fallback embutido
       }
 
       const logger = pino({ level: 'silent' });
@@ -145,70 +159,79 @@ export class BaileysDirectManager {
 
       this.sock = sock;
 
-      sock.ev.on('creds.update', saveCreds);
+      sock.ev.on('creds.update', () => {
+        Promise.resolve(saveCreds()).catch((err) => {
+          console.error('[WhatsApp QR] Erro ao salvar credenciais:', err);
+        });
+      });
 
       sock.ev.on('connection.update', async (update) => {
-        // Ignora eventos atrasados de um socket antigo substituído!
-        if (this.sock !== sock) return;
+        try {
+          if (this.sock !== sock) return;
 
-        const { connection, lastDisconnect, qr } = update;
+          const { connection, lastDisconnect, qr } = update;
 
-        if (qr) {
-          this.unscannedQrCount++;
-          if (!this.hadOpenSession && this.unscannedQrCount > MAX_UNSCANNED_QR_CYCLES) {
-            this.intentionalStop = true;
-            try {
-              sock.end(undefined);
-            } catch {
-              // Ignora
+          if (qr) {
+            this.unscannedQrCount++;
+            if (!this.hadOpenSession && this.unscannedQrCount > MAX_UNSCANNED_QR_CYCLES) {
+              this.intentionalStop = true;
+              try {
+                sock.end(undefined);
+              } catch {
+                // Ignora
+              }
+              this.sock = null;
+              this.qrCodeDataUrl = undefined;
+              this.state = 'DISCONNECTED';
+              this.lastError =
+                'QR Code expirou por falta de leitura. Clique em "Gerar QR Code" para tentar novamente.';
+              return;
             }
+            this.qrCodeDataUrl = await QRCode.toDataURL(qr, { width: 280, margin: 2 });
+            this.state = 'QR_READY';
+          }
+
+          if (connection === 'open') {
+            this.hadOpenSession = true;
+            this.unscannedQrCount = 0;
+            this.state = 'CONNECTED';
+            this.qrCodeDataUrl = undefined;
+            this.lastError = undefined;
+            const rawId = sock.user?.id || '';
+            this.connectedPhone = onlyDigits(
+              rawId.split('@')[0]?.split(':')[0]?.split('_')[0] || ''
+            );
+            console.log(`[WhatsApp QR] Conectado com sucesso! Número: +${this.connectedPhone}`);
+          }
+
+          if (connection === 'close') {
             this.sock = null;
             this.qrCodeDataUrl = undefined;
-            this.state = 'DISCONNECTED';
-            this.lastError =
-              'QR Code expirou por falta de leitura. Clique em "Gerar QR Code" para tentar novamente.';
-            return;
+            const statusCode = (
+              lastDisconnect?.error as { output?: { statusCode?: number } } | undefined
+            )?.output?.statusCode;
+
+            if (statusCode === DisconnectReason.loggedOut) {
+              this.clearAuthFolder();
+              this.hadOpenSession = false;
+              this.state = 'DISCONNECTED';
+              this.connectedPhone = undefined;
+              this.lastError = 'Sessão desconectada pelo celular. Gere um novo QR Code.';
+            } else if (!this.intentionalStop) {
+              this.state = 'DISCONNECTED';
+              this.clearReconnectTimer();
+              this.reconnectTimer = setTimeout(() => {
+                this.reconnectTimer = null;
+                if (!this.intentionalStop) {
+                  void this.startConnection(false);
+                }
+              }, 3000);
+            } else {
+              this.state = 'DISCONNECTED';
+            }
           }
-          this.qrCodeDataUrl = await QRCode.toDataURL(qr, { width: 280, margin: 2 });
-          this.state = 'QR_READY';
-        }
-
-        if (connection === 'open') {
-          this.hadOpenSession = true;
-          this.unscannedQrCount = 0;
-          this.state = 'CONNECTED';
-          this.qrCodeDataUrl = undefined;
-          this.lastError = undefined;
-          const rawId = sock.user?.id || '';
-          this.connectedPhone = onlyDigits(rawId.split(':')[0] || rawId.split('@')[0] || '');
-          console.log(`[WhatsApp QR] Conectado com sucesso! Número: +${this.connectedPhone}`);
-        }
-
-        if (connection === 'close') {
-          this.sock = null;
-          this.qrCodeDataUrl = undefined;
-          const statusCode = (
-            lastDisconnect?.error as { output?: { statusCode?: number } } | undefined
-          )?.output?.statusCode;
-
-          if (statusCode === DisconnectReason.loggedOut) {
-            this.clearAuthFolder();
-            this.hadOpenSession = false;
-            this.state = 'DISCONNECTED';
-            this.connectedPhone = undefined;
-            this.lastError = 'Sessão desconectada pelo celular. Gere um novo QR Code.';
-          } else if (!this.intentionalStop) {
-            this.state = 'DISCONNECTED';
-            this.clearReconnectTimer();
-            this.reconnectTimer = setTimeout(() => {
-              this.reconnectTimer = null;
-              if (!this.intentionalStop) {
-                void this.startConnection(false);
-              }
-            }, 3000);
-          } else {
-            this.state = 'DISCONNECTED';
-          }
+        } catch (err) {
+          console.error('[WhatsApp QR] Erro em connection.update:', err);
         }
       });
 
@@ -217,60 +240,75 @@ export class BaileysDirectManager {
         if (type !== 'notify') return;
 
         for (const msg of messages) {
-          if (!msg.message || msg.key.fromMe) continue;
-          const remoteJid = msg.key.remoteJid || '';
-          if (!remoteJid || remoteJid.endsWith('@g.us') || remoteJid === 'status@broadcast') {
-            continue;
-          }
-
-          const text = (
-            msg.message.conversation ||
-            msg.message.extendedTextMessage?.text ||
-            ''
-          ).trim();
-
-          if (!text) continue;
-
-          const altJid = (msg.key as Record<string, unknown>).remoteJidAlt
-            ? String((msg.key as Record<string, unknown>).remoteJidAlt)
-            : '';
-          const bestJidForDigits = remoteJid.endsWith('@s.whatsapp.net')
-            ? remoteJid
-            : altJid || remoteJid;
-          const senderDigits = onlyDigits(bestJidForDigits.split('@')[0] || '');
-          if (!senderDigits) continue;
-
-          this.jidMap.set(senderDigits, remoteJid);
-
-          // 1. Trava opcional de Telefone de Teste
-          if (this.allowedTestPhone) {
-            const last8Allowed = this.allowedTestPhone.slice(-8);
-            const last8Sender = senderDigits.slice(-8);
-            if (last8Allowed.length >= 8 && last8Allowed !== last8Sender) {
+          try {
+            if (!msg.message || msg.key.fromMe) continue;
+            const remoteJid = msg.key.remoteJid || '';
+            if (
+              !remoteJid ||
+              remoteJid.endsWith('@g.us') ||
+              remoteJid.endsWith('@broadcast') ||
+              remoteJid.endsWith('@newsletter') ||
+              remoteJid.endsWith('@bot')
+            ) {
               continue;
             }
-          }
 
-          // 2. Trava de Palavra-Chave Inteligente
-          if (this.filterMode === 'keyword_only') {
-            const session = this.repository.getSession(senderDigits);
-            const activeOrder = this.repository.findActivePendingOrderByPhone(senderDigits);
-            const isAlreadyInFlow = session.stage !== 'IDLE' || activeOrder !== null;
-            const hasPixKeyword =
-              /\bpix\b|pagar|pagamento|chave\s*pix|gerar\s*pix|mand[ae]\s*o?\s*pix/i.test(text);
+            // Desembrulha mensagens temporárias (`ephemeralMessage`), `viewOnce`, etc.
+            const normalized = normalizeMessageContent(msg.message);
+            if (!normalized) continue;
 
-            if (!isAlreadyInFlow && !hasPixKeyword) {
-              continue;
+            const text = (
+              normalized.conversation ||
+              normalized.extendedTextMessage?.text ||
+              ''
+            ).trim();
+
+            if (!text) continue;
+
+            const altJid = (msg.key as Record<string, unknown>).remoteJidAlt
+              ? String((msg.key as Record<string, unknown>).remoteJidAlt)
+              : '';
+            const bestJidForDigits = remoteJid.endsWith('@s.whatsapp.net')
+              ? remoteJid
+              : altJid || remoteJid;
+            const userPart = bestJidForDigits.split('@')[0]?.split(':')[0]?.split('_')[0] || '';
+            const senderDigits = onlyDigits(userPart);
+            if (senderDigits.length < 8) continue; // Ignora 0@s.whatsapp.net / JIDs inválidos
+
+            this.rememberJid(senderDigits, remoteJid);
+
+            if (this.allowedTestPhone) {
+              const last8Allowed = this.allowedTestPhone.slice(-8);
+              const last8Sender = senderDigits.slice(-8);
+              if (last8Allowed.length >= 8 && last8Allowed !== last8Sender) {
+                continue;
+              }
             }
-          }
 
-          if (this.onIncomingTextCallback) {
-            await this.onIncomingTextCallback({
-              phone: senderDigits,
-              customerJid: remoteJid,
-              text,
-              customerName: msg.pushName || undefined,
-            });
+            if (this.filterMode === 'keyword_only') {
+              const session = this.repository.getSession(senderDigits);
+              const activeOrder = this.repository.findActivePendingOrderByPhone(senderDigits);
+              const isAlreadyInFlow = session.stage !== 'IDLE' || activeOrder !== null;
+              const hasPixKeyword =
+                /\bpix\b|pagar|pagamento|chave\s*pix|gerar\s*pix|mand[ae]\s*o?\s*pix|comprovante/i.test(
+                  text
+                );
+
+              if (!isAlreadyInFlow && !hasPixKeyword) {
+                continue;
+              }
+            }
+
+            if (this.onIncomingTextCallback) {
+              await this.onIncomingTextCallback({
+                phone: senderDigits,
+                customerJid: remoteJid,
+                text,
+                customerName: msg.pushName || undefined,
+              });
+            }
+          } catch (err) {
+            console.error('[WhatsApp QR] Erro ao processar mensagem recebida:', err);
           }
         }
       });
@@ -296,7 +334,7 @@ export class BaileysDirectManager {
           currentSock.end(undefined);
         }
       } catch {
-        // Ignora erro de fechamento de socket
+        // Ignora
       }
     }
     if (wipeSession) {
@@ -315,9 +353,14 @@ export class BaileysDirectManager {
     preferredJid?: string
   ): Promise<boolean> {
     if (!this.sock || this.state !== 'CONNECTED') return false;
-    const targetJid = this.resolveJid(phoneDigits, preferredJid);
-    await this.sock.sendMessage(targetJid, { text });
-    return true;
+    try {
+      const targetJid = this.resolveJid(phoneDigits, preferredJid);
+      await this.sock.sendMessage(targetJid, { text });
+      return true;
+    } catch (err) {
+      console.error('[WhatsApp QR] Erro ao enviar mensagem de texto:', err);
+      return false;
+    }
   }
 
   public async sendImageWithCaption(
@@ -327,14 +370,20 @@ export class BaileysDirectManager {
     preferredJid?: string
   ): Promise<boolean> {
     if (!this.sock || this.state !== 'CONNECTED') return false;
-    const targetJid = this.resolveJid(phoneDigits, preferredJid);
-    const cleanBase64 = dataUriBase64.replace(/^data:image\/\w+;base64,/, '');
-    const buffer = Buffer.from(cleanBase64, 'base64');
-    await this.sock.sendMessage(targetJid, {
-      image: buffer,
-      caption,
-    });
-    return true;
+    try {
+      const targetJid = this.resolveJid(phoneDigits, preferredJid);
+      const cleanBase64 = dataUriBase64.replace(/^data:image\/\w+;base64,/, '');
+      const buffer = Buffer.from(cleanBase64, 'base64');
+      await this.sock.sendMessage(targetJid, {
+        image: buffer,
+        mimetype: 'image/png',
+        caption,
+      });
+      return true;
+    } catch (err) {
+      console.error('[WhatsApp QR] Erro ao enviar imagem QR:', err);
+      return false;
+    }
   }
 
   private resolveJid(phoneDigits: string, preferredJid?: string): string {

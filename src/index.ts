@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import { loadConfig } from './config/env.ts';
 import { OrderRepository } from './database/orderRepository.ts';
@@ -50,6 +51,11 @@ async function bootstrap(): Promise<void> {
     await engine.handleIncomingMessage({ phone, customerJid, text, customerName });
   });
 
+  // Se já houver sessão salva do WhatsApp em disco, reconecta automaticamente no boot!
+  if (fs.existsSync(path.join(waAuthDir, 'creds.json'))) {
+    void baileysManager.startConnection(false);
+  }
+
   const expirationWatcher = new ExpirationWatcher(
     repository,
     whatsappGateway,
@@ -57,7 +63,6 @@ async function bootstrap(): Promise<void> {
     engine
   );
 
-  // Intervalo de 15s respeita folgadamente o rate limit de 30 req/min por conta da DePix App
   expirationWatcher.start(15_000);
 
   const server = createAppHttpServer({
