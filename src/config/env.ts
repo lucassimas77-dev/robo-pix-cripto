@@ -1,3 +1,4 @@
+import path from 'node:path';
 import dotenv from 'dotenv';
 import type { SupportedProviderName } from '../types/domain.ts';
 
@@ -7,14 +8,15 @@ export type WhatsAppMode = 'simulator' | 'meta' | 'evolution';
 
 export interface AppConfig {
   port: number;
+  dataDir: string;
   publicBaseUrl: string;
+  adminPassword: string;
   cryptoProvider: SupportedProviderName;
   walletAddress: string;
   walletAsset: string;
   walletNetwork: string;
   pixExpirationMinutes: number;
   pixWarningBeforeMinutes: number;
-  requirePayerDocument: boolean;
   whatsappMode: WhatsAppMode;
   adminWhatsappPhone: string;
   depixapp: {
@@ -23,11 +25,6 @@ export interface AppConfig {
     webhookSecret: string;
   };
   hodle: {
-    apiUrl: string;
-    apiKey: string;
-    webhookSecret: string;
-  };
-  pixgo: {
     apiUrl: string;
     apiKey: string;
     webhookSecret: string;
@@ -49,10 +46,18 @@ export interface AppConfig {
   };
 }
 
+export const SUPPORTED_PROVIDERS: SupportedProviderName[] = [
+  'mock',
+  'depixapp',
+  'hodle',
+  'noxpay',
+];
+
 export function loadConfig(): AppConfig {
   const providerRaw = (process.env.CRYPTO_PROVIDER || 'depixapp').toLowerCase();
-  const validProviders: SupportedProviderName[] = ['mock', 'depixapp', 'hodle', 'pixgo', 'noxpay'];
-  const cryptoProvider: SupportedProviderName = validProviders.includes(providerRaw as SupportedProviderName)
+  const cryptoProvider: SupportedProviderName = SUPPORTED_PROVIDERS.includes(
+    providerRaw as SupportedProviderName
+  )
     ? (providerRaw as SupportedProviderName)
     : 'depixapp';
 
@@ -68,48 +73,48 @@ export function loadConfig(): AppConfig {
     (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : '') ||
     'http://localhost:3000';
 
+  const dataDir = process.env.DATA_DIR
+    ? path.resolve(process.env.DATA_DIR)
+    : path.resolve(process.cwd(), 'data');
+
   return {
     port: Number(process.env.PORT || 3000),
+    dataDir,
     publicBaseUrl: autoBaseUrl.replace(/\/+$/, ''),
+    adminPassword: (process.env.ADMIN_PASSWORD || '').trim(),
     cryptoProvider,
-    walletAddress: process.env.WALLET_ADDRESS || 'lq1qq_sua_carteira_liquid_autocustodia',
-    walletAsset: process.env.WALLET_ASSET || 'DEPIX',
-    walletNetwork: process.env.WALLET_NETWORK || 'LIQUID',
-    pixExpirationMinutes: Math.max(5, Number(process.env.PIX_EXPIRATION_MINUTES || 15)),
+    walletAddress: (process.env.WALLET_ADDRESS || '').trim(),
+    walletAsset: (process.env.WALLET_ASSET || 'DEPIX').trim().toUpperCase(),
+    walletNetwork: (process.env.WALLET_NETWORK || 'LIQUID').trim().toUpperCase(),
+    pixExpirationMinutes: Math.min(20, Math.max(5, Number(process.env.PIX_EXPIRATION_MINUTES || 15))),
     pixWarningBeforeMinutes: Math.max(1, Number(process.env.PIX_WARNING_BEFORE_MINUTES || 3)),
-    // Por padrão FALSE: gera o Pix direto sem pedir CPF nem identificar ninguém no WhatsApp!
-    requirePayerDocument: (process.env.REQUIRE_PAYER_DOCUMENT || 'false').toLowerCase() === 'true',
     whatsappMode,
     adminWhatsappPhone: (process.env.ADMIN_WHATSAPP_PHONE || '').replace(/\D/g, ''),
+    // NUNCA usa segredo de webhook hardcoded! String vazia rejeita webhooks sem segredo configurado.
     depixapp: {
       apiUrl: (process.env.DEPIXAPP_API_URL || 'https://api.depixapp.com/api').replace(/\/+$/, ''),
-      apiKey: process.env.DEPIXAPP_API_KEY || '',
-      webhookSecret: process.env.DEPIXAPP_WEBHOOK_SECRET || 'dev_depixapp_secret',
+      apiKey: (process.env.DEPIXAPP_API_KEY || '').trim(),
+      webhookSecret: (process.env.DEPIXAPP_WEBHOOK_SECRET || '').trim(),
     },
     hodle: {
       apiUrl: (process.env.HODLE_API_URL || 'https://api.hodle.com.br').replace(/\/+$/, ''),
-      apiKey: process.env.HODLE_API_KEY || '',
-      webhookSecret: process.env.HODLE_WEBHOOK_SECRET || 'dev_hodle_secret',
-    },
-    pixgo: {
-      apiUrl: (process.env.PIXGO_API_URL || 'https://pixgo.org/api/v1').replace(/\/+$/, ''),
-      apiKey: process.env.PIXGO_API_KEY || '',
-      webhookSecret: process.env.PIXGO_WEBHOOK_SECRET || 'dev_pixgo_secret',
+      apiKey: (process.env.HODLE_API_KEY || '').trim(),
+      webhookSecret: (process.env.HODLE_WEBHOOK_SECRET || '').trim(),
     },
     noxpay: {
       apiUrl: (process.env.NOXPAY_API_URL || 'https://api.noxpay.io/v2').replace(/\/+$/, ''),
-      apiKey: process.env.NOXPAY_API_KEY || '',
-      webhookSecret: process.env.NOXPAY_WEBHOOK_SECRET || 'dev_noxpay_secret',
+      apiKey: (process.env.NOXPAY_API_KEY || '').trim(),
+      webhookSecret: (process.env.NOXPAY_WEBHOOK_SECRET || '').trim(),
     },
     metaWhatsapp: {
-      token: process.env.META_WA_TOKEN || '',
-      phoneNumberId: process.env.META_WA_PHONE_NUMBER_ID || '',
-      verifyToken: process.env.META_WA_VERIFY_TOKEN || 'meu_token_secreto_webhook',
+      token: (process.env.META_WA_TOKEN || '').trim(),
+      phoneNumberId: (process.env.META_WA_PHONE_NUMBER_ID || '').trim(),
+      verifyToken: (process.env.META_WA_VERIFY_TOKEN || '').trim(),
     },
     evolutionWhatsapp: {
       apiUrl: (process.env.EVOLUTION_API_URL || 'http://localhost:8080').replace(/\/+$/, ''),
-      apiKey: process.env.EVOLUTION_API_KEY || '',
-      instanceName: process.env.EVOLUTION_INSTANCE_NAME || 'pix_crypto_bot',
+      apiKey: (process.env.EVOLUTION_API_KEY || '').trim(),
+      instanceName: (process.env.EVOLUTION_INSTANCE_NAME || 'pix_crypto_bot').trim(),
     },
   };
 }

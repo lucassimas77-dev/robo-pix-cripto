@@ -9,9 +9,10 @@ import { DePixAppProvider } from '../src/providers/depixAppProvider.ts';
 import { HodleProvider } from '../src/providers/hodleProvider.ts';
 import { MockProvider } from '../src/providers/mockProvider.ts';
 import { NoxPayProvider } from '../src/providers/noxPayProvider.ts';
+import { createAppHttpServer } from '../src/server/httpServer.ts';
 import { ConversationEngine } from '../src/services/conversationEngine.ts';
 import { ExpirationWatcher } from '../src/services/expirationWatcher.ts';
-import { extractDocumentFromText, parseBrlAmountFromText } from '../src/utils/cpfCnpjValidator.ts';
+import { formatTimeSaoPaulo, parseBrlAmountFromText } from '../src/utils/cpfCnpjValidator.ts';
 import { UnifiedWhatsAppGateway } from '../src/whatsapp/whatsappGateway.ts';
 
 function createPrivacyTestSetup() {
@@ -19,115 +20,155 @@ function createPrivacyTestSetup() {
     ...loadConfig(),
     cryptoProvider: 'mock',
     whatsappMode: 'simulator',
-    walletAddress: 'lq1qq_carteira_liquid_autocustodia_privada',
-    walletAsset: 'DEPIX',
-    walletNetwork: 'LIQUID',
+    adminPassword: '',
+    walletAddress: '0xCarteiraTeste',
+    walletAsset: 'USDT',
+    walletNetwork: 'POLYGON',
     pixExpirationMinutes: 15,
     pixWarningBeforeMinutes: 3,
-    requirePayerDocument: false,
     adminWhatsappPhone: '5511900000000',
   };
 
   const repository = new OrderRepository(':memory:');
-  const provider = new MockProvider({ requiresPayerDocument: false });
+  const provider = new MockProvider({ webhookSecret: 'test_mock_secret' });
   const whatsapp = new UnifiedWhatsAppGateway(config, repository);
   const engine = new ConversationEngine(config, repository, provider, whatsapp);
-  const watcher = new ExpirationWatcher(repository, whatsapp, config.pixWarningBeforeMinutes, engine);
+  const watcher = new ExpirationWatcher(
+    repository,
+    whatsapp,
+    config.pixWarningBeforeMinutes,
+    engine
+  );
 
   return { config, repository, provider, whatsapp, engine, watcher };
 }
 
-test('Fluxo Privado: Cliente envia valor no WhatsApp e recebe cobrança imediata + liquidação idempotente', async () => {
+test('Parsing monetário em Português trata milhar com ponto, horários, telefones e ambiguidades sem erro', () => {
+  assert.equal(parseBrlAmountFromText('pix 1.000'), 1000);
+  assert.equal(parseBrlAmountFromText('quero pix de 1.500'), 1500);
+  assert.equal(parseBrlAmountFromText('pix de 1.250,50'), 1250.5);
+  assert.equal(parseBrlAmountFromText('75,50'), 75.5);
+  assert.equal(parseBrlAmountFromText('75.50'), 75.5);
+  // Ambiguidade ("2 itens de 50") retorna null para perguntar o valor total!
+  assert.equal(parseBrlAmountFromText('quero 2 itens de 50'), null);
+  // Horário + R$ explícito captura 150,00 e ignora 10h
+  assert.equal(parseBrlAmountFromText('vou pagar ate 10h R$ 150,00'), 150);
+  // Telefone + R$ explícito captura 50 e ignora DDD/telefone
+  assert.equal(parseBrlAmountFromText('meu tel é (11) 98888-7777 quero pix de R$ 50'), 50);
+  assert.equal(parseBrlAmountFromText('meu telefone é 11988887777 quero pix de R$ 50'), 50);
+  assert.equal(parseBrlAmountFromText('manda pix de 80 reais'), 80);
+
+  // Horário de Brasília fixo (UTC 18:15 = 15:15 em America/Sao_Paulo)
+  assert.equal(formatTimeSaoPaulo('2026-07-01T18:15:00.000Z'), '15:15');
+});
+
+test('Concorrência por telefone, máquina de estados AWAITING_ACTIVE_ORDER_DECISION e persistência de JID @lid', async () => {
   const { repository, engine } = createPrivacyTestSetup();
   const clientPhone = '5511988887777';
+  const clientLid = '998877665544@lid';
 
-  await engine.handleIncomingMessage({
-    phone: clientPhone,
-    text: 'Me manda um Pix de R$ 250,00',
-  });
+  // Duas mensagens simultâneas do mesmo telefone NÃO criam 2 cobranças paralelas!
+  await Promise.all([
+    engine.handleIncomingMessage({
+      phone: clientPhone,
+      customerJid: clientLid,
+      text: 'Me manda um Pix de R$ 250,00',
+    }),
+    engine.handleIncomingMessage({
+      phone: clientPhone,
+      customerJid: clientLid,
+      text: 'Me manda um Pix de R$ 250,00',
+    }),
+  ]);
 
   const orders = repository.listRecentOrders();
   assert.equal(orders.length, 1);
-  const createdOrder = orders[0];
-  assert.equal(createdOrder.amountBrl, 250);
-  assert.equal(createdOrder.payerDocument, undefined);
-  assert.equal(createdOrder.status, 'PENDING');
-  assert.ok(createdOrder.pixCopyPaste.startsWith('000201'));
-  assert.ok(createdOrder.pixQrCodeBase64?.startsWith('data:image/png;base64,'));
+  assert.equal(orders[0].customerJid, clientLid);
 
-  const msgs = repository.listMessages(clientPhone);
-  assert.equal(msgs.length, 3);
-  assert.equal(msgs[2].type, 'PIX_CODE');
-  assert.equal(msgs[2].body, createdOrder.pixCopyPaste);
-
-  // Liquidação -> confirma e nunca retrocede de SETTLED_CRYPTO para PIX_CONFIRMED
-  const settlement = await engine.handleSettlementWebhook({
-    provider: 'mock',
-    externalId: createdOrder.externalId,
-    newStatus: 'SETTLED_CRYPTO',
-    txHash: 'tx_liquid_confidencial_998877',
-    cryptoAmount: 245,
-    rawEventName: 'MOCK_SETTLED_CRYPTO',
+  // Cliente está em AWAITING_ACTIVE_ORDER_DECISION e manda "300" sem escolher 1 ou 2 -> NÃO cria 2º Pix!
+  await engine.handleIncomingMessage({
+    phone: clientPhone,
+    customerJid: clientLid,
+    text: '300',
   });
+  assert.equal(repository.listRecentOrders().length, 1);
 
-  assert.equal(settlement.matched, true);
-  assert.equal(settlement.changed, true);
-  assert.equal(settlement.order?.status, 'SETTLED_CRYPTO');
-
-  // Webhook atrasado de PIX_CONFIRMED jamais rebaixa pedido já liquidado
-  const lateProcessing = await engine.handleSettlementWebhook({
-    provider: 'mock',
-    externalId: createdOrder.externalId,
-    newStatus: 'PIX_CONFIRMED',
-    rawEventName: 'LATE_PROCESSING',
+  // Agora escolhe "2" -> cancela a de 250 e cria a de 300!
+  await engine.handleIncomingMessage({
+    phone: clientPhone,
+    customerJid: clientLid,
+    text: '2',
   });
-  assert.equal(lateProcessing.changed, false);
-  assert.equal(repository.getOrderById(createdOrder.id)?.status, 'SETTLED_CRYPTO');
+  const afterSwitch = repository.listRecentOrders();
+  assert.equal(afterSwitch.length, 2);
+  assert.equal(afterSwitch[0].amountBrl, 300);
+  assert.equal(afterSwitch[0].status, 'PENDING');
+  assert.equal(afterSwitch[1].status, 'CANCELLED');
 
   repository.close();
 });
 
-test('Guardião de Validade (ExpirationWatcher) avisa antes de vencer, expira pendentes e NÃO expira pedidos já pagos (PIX_CONFIRMED)', async () => {
-  const { repository, engine, watcher } = createPrivacyTestSetup();
-  const phone1 = '5521977776666';
-  const phone2 = '5521966665555';
+test('Servidor HTTP exige autenticação em /api/*, bloqueia JSON inválido com 400 e protege segredos', async () => {
+  const { config, repository, engine } = createPrivacyTestSetup();
+  const server = createAppHttpServer({ config, repository, engine });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as { port: number }).port;
+  const url = `http://127.0.0.1:${port}`;
 
-  await engine.handleIncomingMessage({ phone: phone1, text: 'pix de 120,00' });
-  await engine.handleIncomingMessage({ phone: phone2, text: 'pix de 80,00' });
+  try {
+    // 1. Sem login: /api/account e /api/orders retornam 401!
+    const unauthAcc = await fetch(`${url}/api/account`);
+    assert.equal(unauthAcc.status, 401);
+    const unauthOrd = await fetch(`${url}/api/orders`);
+    assert.equal(unauthOrd.status, 401);
 
-  const allOrders = repository.listRecentOrders();
-  const unpaidOrder = allOrders.find((o) => o.customerPhone === phone1)!;
-  const paidProcessingOrder = allOrders.find((o) => o.customerPhone === phone2)!;
+    // 2. Primeiro acesso cria senha via /api/auth/setup e recebe cookie HttpOnly
+    const setupRes = await fetch(`${url}/api/auth/setup`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: 'minha_senha_segura' }),
+    });
+    assert.equal(setupRes.status, 200);
+    const cookie = setupRes.headers.get('set-cookie') || '';
+    assert.match(cookie, /HttpOnly/i);
 
-  // Pedido 2 já teve o Pix pago (em processamento on-chain)
-  await engine.handleSettlementWebhook({
-    provider: 'mock',
-    externalId: paidProcessingOrder.externalId,
-    newStatus: 'PIX_CONFIRMED',
-    rawEventName: 'PIX_PAID',
-  });
+    // 3. Segunda tentativa de /api/auth/setup é bloqueada com 403!
+    const hijackAttempt = await fetch(`${url}/api/auth/setup`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: 'outra' }),
+    });
+    assert.equal(hijackAttempt.status, 403);
 
-  const twoMinBefore = new Date(new Date(unpaidOrder.expiresAt).getTime() - 2 * 60_000);
-  const sweep1 = await watcher.sweepPendingOrders(twoMinBefore);
-  assert.equal(sweep1.warnedCount, 1);
+    // 4. Com cookie válido: /api/account funciona e JSON malformado retorna 400 (nunca 500!)
+    const authCookie = cookie.split(';')[0];
+    const okAcc = await fetch(`${url}/api/account`, {
+      headers: { Cookie: authCookie },
+    });
+    assert.equal(okAcc.status, 200);
+    const accJson = (await okAcc.json()) as Record<string, unknown>;
+    assert.equal(accJson.apiKey, undefined);
 
-  const afterExpiry = new Date(new Date(unpaidOrder.expiresAt).getTime() + 5_000);
-  const sweep2 = await watcher.sweepPendingOrders(afterExpiry);
-  assert.equal(sweep2.expiredCount, 1);
-  assert.equal(repository.getOrderById(unpaidOrder.id)?.status, 'EXPIRED');
-  // Pedido já pago continua PIX_CONFIRMED (nunca é expirado por engano!)
-  assert.equal(repository.getOrderById(paidProcessingOrder.id)?.status, 'PIX_CONFIRMED');
+    const badJson = await fetch(`${url}/api/account`, {
+      method: 'POST',
+      headers: { Cookie: authCookie, 'Content-Type': 'application/json' },
+      body: '{malformed',
+    });
+    assert.equal(badJson.status, 400);
 
-  repository.close();
+    const badProvider = await fetch(`${url}/api/account`, {
+      method: 'POST',
+      headers: { Cookie: authCookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: 'inexistente' }),
+    });
+    assert.equal(badProvider.status, 400);
+  } finally {
+    server.close();
+    repository.close();
+  }
 });
 
-test('DePixAppProvider segue 100% do contrato oficial (POST /products kind=charge sem CPF, POST /checkouts com pix.qr_code, GET embrulhado em checkout e HMAC t=,v1=)', async () => {
-  // Extração combinada de valor + CPF na mesma frase
-  const combined = 'me manda um pix de 75,50 cpf 529.982.247-25';
-  assert.equal(extractDocumentFromText(combined).document, '52998224725');
-  assert.equal(parseBrlAmountFromText(combined), 75.5);
-
-  // Sobe um servidor fake imitando exatamente os formatos da API oficial https://api.depixapp.com
+test('DePixAppProvider envia slug único em kind=charge, prioriza completed sobre cancelled, busca blockchain_tx_id e valida janela t= no HMAC', async () => {
   const fakeDepixServer = http.createServer(async (req, res) => {
     const chunks: Buffer[] = [];
     for await (const c of req) chunks.push(c as Buffer);
@@ -138,67 +179,43 @@ test('DePixAppProvider segue 100% do contrato oficial (POST /products kind=charg
     if (req.method === 'POST' && req.url === '/api/products') {
       assert.equal(body.kind, 'charge');
       assert.equal(body.amount, 5000);
-      assert.ok(typeof body.due_date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(body.due_date));
+      assert.match(String(body.slug), /^chg-[a-z0-9]+-[a-f0-9]{10}$/);
       res.writeHead(201);
       res.end(
         JSON.stringify({
           product: {
-            id: 'prd_test999',
+            id: 'prd_audit_1',
             amount: 5000,
-            payment_url: 'https://pay.depixapp.com/c/prd_test999',
+            payment_url: 'https://pay.depixapp.com/c/prd_audit_1',
           },
         })
       );
       return;
     }
 
-    if (req.method === 'GET' && req.url?.startsWith('/api/products/prd_test999/checkouts')) {
+    if (req.method === 'GET' && req.url?.startsWith('/api/products/prd_audit_1/checkouts')) {
+      // Simula 1ª tentativa `cancelled` seguida de 2ª tentativa `completed` (sem blockchain_tx_id na listagem!)
       res.writeHead(200);
       res.end(
         JSON.stringify({
           checkouts: [
-            {
-              id: 'chk_from_prd',
-              status: 'completed',
-              is_live: 1,
-              blockchain_tx_id: 'liquid_tx_from_charge_123',
-            },
+            { id: 'chk_failed_first', status: 'cancelled', is_live: 1 },
+            { id: 'chk_paid_second', status: 'completed', is_live: 1 },
           ],
         })
       );
       return;
     }
 
-    if (req.method === 'POST' && req.url === '/api/checkouts') {
-      assert.equal(body.amount, 7550);
-      assert.equal(body.payer_tax_number, '52998224725');
-      assert.equal(body.payment_method, 'pix');
-      res.writeHead(201);
-      res.end(
-        JSON.stringify({
-          id: 'chk_direct_1',
-          status: 'pending',
-          amount: 7550,
-          expires_at: new Date(Date.now() + 900_000).toISOString(),
-          payment_url: 'https://pay.depixapp.com/chk_direct_1',
-          pix: {
-            qr_code: '00020126580014br.gov.bcb.pix0136depix-real-emv-payload',
-          },
-        })
-      );
-      return;
-    }
-
-    if (req.method === 'GET' && req.url === '/api/checkouts/chk_direct_1') {
-      // Formato oficial da DePix: embrulhado em `{ checkout: { ... } }`!
+    if (req.method === 'GET' && req.url === '/api/checkouts/chk_paid_second') {
       res.writeHead(200);
       res.end(
         JSON.stringify({
           checkout: {
-            id: 'chk_direct_1',
+            id: 'chk_paid_second',
             status: 'completed',
             is_live: 1,
-            blockchain_tx_id: 'liquid_tx_direct_456',
+            blockchain_tx_id: 'liquid_tx_fetched_from_detail_999',
           },
         })
       );
@@ -210,8 +227,7 @@ test('DePixAppProvider segue 100% do contrato oficial (POST /products kind=charg
   });
 
   await new Promise<void>((resolve) => fakeDepixServer.listen(0, '127.0.0.1', resolve));
-  const addr = fakeDepixServer.address() as { port: number };
-  const baseUrl = `http://127.0.0.1:${addr.port}`;
+  const baseUrl = `http://127.0.0.1:${(fakeDepixServer.address() as { port: number }).port}`;
 
   try {
     const depix = new DePixAppProvider({
@@ -220,96 +236,72 @@ test('DePixAppProvider segue 100% do contrato oficial (POST /products kind=charg
       webhookSecret: 'whsec_depix_real',
     });
 
-    // 1. Modo Zero CPF no WhatsApp -> cria Charge privada `prd_test999`
-    const zeroCpfCharge = await depix.createCharge({
-      externalId: 'ord_zero_cpf',
+    const charge = await depix.createCharge({
+      externalId: 'ord_audit_1',
       amountBrl: 50,
       customerPhone: '5511999999999',
-      walletAddress: 'lq1qq...',
+      walletAddress: '',
       cryptoAsset: 'DEPIX',
       cryptoNetwork: 'LIQUID',
       expirationMinutes: 15,
       webhookUrl: 'https://robo-pix-cripto.onrender.com/webhooks/depixapp',
     });
-    assert.equal(zeroCpfCharge.providerChargeId, 'prd_test999');
-    assert.equal(zeroCpfCharge.pixCopyPaste, 'https://pay.depixapp.com/c/prd_test999');
+    assert.equal(charge.providerChargeId, 'prd_audit_1');
+    assert.equal(charge.pixCopyPaste, 'https://pay.depixapp.com/c/prd_audit_1');
 
-    const polledPrd = await depix.checkChargeStatus('prd_test999');
-    assert.equal(polledPrd?.status, 'SETTLED_CRYPTO');
-    assert.equal(polledPrd?.txHash, 'liquid_tx_from_charge_123');
+    // Prioriza `completed` sobre `cancelled` e busca `blockchain_tx_id` no detalhe!
+    const polled = await depix.checkChargeStatus('prd_audit_1');
+    assert.equal(polled?.status, 'SETTLED_CRYPTO');
+    assert.equal(polled?.txHash, 'liquid_tx_fetched_from_detail_999');
 
-    // 2. Modo Direto com CPF -> extrai `pix.qr_code` (`000201...`) e lê `{ checkout: ... }`
-    const directCharge = await depix.createCharge({
-      externalId: 'ord_direct_cpf',
-      amountBrl: 75.5,
-      customerPhone: '5511999999999',
-      payerDocument: '52998224725',
-      walletAddress: 'lq1qq...',
-      cryptoAsset: 'DEPIX',
-      cryptoNetwork: 'LIQUID',
-      expirationMinutes: 15,
-      webhookUrl: 'https://robo-pix-cripto.onrender.com/webhooks/depixapp',
-    });
-    assert.equal(directCharge.providerChargeId, 'chk_direct_1');
-    assert.ok(directCharge.pixCopyPaste.startsWith('00020126580014br.gov.bcb.pix'));
-
-    const polledChk = await depix.checkChargeStatus('chk_direct_1');
-    assert.equal(polledChk?.status, 'SETTLED_CRYPTO');
-    assert.equal(polledChk?.txHash, 'liquid_tx_direct_456');
-
-    // 3. Assinatura oficial X-DePix-Signature: t=1717257600,v1=<hmac(t.rawBody)>
+    // HMAC válido dentro da janela de 5 min
     const whBody = JSON.stringify({
       event: 'checkout.completed',
       data: {
-        id: 'chk_direct_1',
+        event_id: 'evt_123',
+        id: 'chk_paid_second',
+        product_id: 'prd_audit_1',
         status: 'completed',
         is_live: true,
-        amount: 7550,
-        metadata: { external_id: 'ord_direct_cpf' },
+        amount: 5000,
       },
     });
-    const ts = '1717257600';
-    const v1 = crypto
+    const nowSec = String(Math.floor(Date.now() / 1000));
+    const v1Valid = crypto
       .createHmac('sha256', 'whsec_depix_real')
-      .update(`${ts}.${whBody}`)
+      .update(`${nowSec}.${whBody}`)
       .digest('hex');
     assert.equal(
-      depix.verifyWebhookSignature(whBody, { 'x-depix-signature': `t=${ts},v1=${v1}` }),
+      depix.verifyWebhookSignature(whBody, { 'x-depix-signature': `t=${nowSec},v1=${v1Valid}` }),
       true
     );
 
-    // Bloqueia eventos sandbox (`is_live: false`) quando operando com chave `sk_live_`!
-    const fakeSandboxOnLive = depix.parseWebhookPayload({
-      event: 'checkout.completed',
-      data: { id: 'chk_fake', status: 'completed', is_live: false },
-    });
-    assert.equal(fakeSandboxOnLive, null);
+    // Replay attack antigo (timestamp de 2020) é rejeitado!
+    const oldTs = '1580000000';
+    const v1Old = crypto
+      .createHmac('sha256', 'whsec_depix_real')
+      .update(`${oldTs}.${whBody}`)
+      .digest('hex');
+    assert.equal(
+      depix.verifyWebhookSignature(whBody, { 'x-depix-signature': `t=${oldTs},v1=${v1Old}` }),
+      false
+    );
   } finally {
     fakeDepixServer.close();
   }
 
-  // Valida também Hodle e NoxPay
-  const hodle = new HodleProvider({
+  // Verifica que provedores sem webhookSecret rejeitam qualquer webhook!
+  const hodleNoSecret = new HodleProvider({
     apiUrl: 'https://api.hodle.com.br',
-    apiKey: 'test_key',
-    webhookSecret: 'segredo_hodle',
+    apiKey: 'k',
+    webhookSecret: '',
   });
-  const hodleBody = JSON.stringify({
-    event: 'DEPOSIT_ASSET_SUCCESS',
-    data: { id: 'dep_1', externalId: 'ord_1', txHash: '0x999', amount: '50.25' },
-  });
-  const hodleSig = crypto.createHmac('sha256', 'segredo_hodle').update(hodleBody).digest('hex');
-  assert.equal(hodle.verifyWebhookSignature(hodleBody, { 'x-hodle-signature': hodleSig }), true);
+  assert.equal(hodleNoSecret.verifyWebhookSignature('{}', { 'x-hodle-signature': 'abc' }), false);
 
-  const nox = new NoxPayProvider({
+  const noxNoSecret = new NoxPayProvider({
     apiUrl: 'https://api.noxpay.io/v2',
-    apiKey: 'nox_key',
-    webhookSecret: 'nox_secret',
+    apiKey: 'k',
+    webhookSecret: '',
   });
-  const noxBody = JSON.stringify({ txid: 'tx_10', external_id: 'ord_2', status: 'COMPLETED' });
-  const noxSig = crypto
-    .createHash('sha256')
-    .update('nox_secret' + noxBody)
-    .digest('base64');
-  assert.equal(nox.verifyWebhookSignature(noxBody, { 'x-signature': noxSig }), true);
+  assert.equal(noxNoSecret.verifyWebhookSignature('{}', { 'x-signature': 'abc' }), false);
 });

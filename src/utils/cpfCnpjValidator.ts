@@ -1,5 +1,5 @@
 /**
- * Utilitários de validação matemática de CPF/CNPJ e extração de valores em Reais (BRL).
+ * Utilitários de extração segura de valores monetários em Reais (BRL) e formatação.
  */
 
 export function onlyDigits(value: string): string {
@@ -7,150 +7,111 @@ export function onlyDigits(value: string): string {
 }
 
 /**
- * Valida matematicamente os dígitos verificadores de um CPF brasileiro (11 dígitos).
+ * Converte uma string numérica em formato brasileiro ou decimal simples para número BRL.
+ * Trata corretamente:
+ * - Milhar com centavos: "1.250,50" -> 1250.5
+ * - Milhar inteiro com ponto: "1.000" ou "1.500" -> 1000 / 1500
+ * - Decimal com vírgula: "75,50" ou "75,5" -> 75.5
+ * - Decimal com ponto (1 ou 2 casas): "75.50" ou "75.5" -> 75.5
+ * - Inteiro simples: "150" -> 150
  */
-export function isValidCpf(rawCpf: string): boolean {
-  const cpf = onlyDigits(rawCpf);
-  if (cpf.length !== 11) return false;
-  if (/^(\d)\1{10}$/.test(cpf)) return false;
+function parseNumericToken(token: string): number | null {
+  const t = token.trim();
+  if (!t) return null;
 
-  let sum = 0;
-  for (let i = 0; i < 9; i++) {
-    sum += Number(cpf[i]) * (10 - i);
-  }
-  let remainder = (sum * 10) % 11;
-  if (remainder === 10) remainder = 0;
-  if (remainder !== Number(cpf[9])) return false;
-
-  sum = 0;
-  for (let i = 0; i < 10; i++) {
-    sum += Number(cpf[i]) * (11 - i);
-  }
-  remainder = (sum * 10) % 11;
-  if (remainder === 10) remainder = 0;
-  return remainder === Number(cpf[10]);
-}
-
-/**
- * Valida matematicamente os dígitos verificadores de um CNPJ brasileiro (14 dígitos).
- */
-export function isValidCnpj(rawCnpj: string): boolean {
-  const cnpj = onlyDigits(rawCnpj);
-  if (cnpj.length !== 14) return false;
-  if (/^(\d)\1{13}$/.test(cnpj)) return false;
-
-  const calcDigit = (base: string, weights: number[]): number => {
-    let sum = 0;
-    for (let i = 0; i < weights.length; i++) {
-      sum += Number(base[i]) * weights[i];
-    }
-    const mod = sum % 11;
-    return mod < 2 ? 0 : 11 - mod;
-  };
-
-  const weights1 = [5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2];
-  const weights2 = [6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2];
-
-  const d1 = calcDigit(cnpj.slice(0, 12), weights1);
-  if (d1 !== Number(cnpj[12])) return false;
-
-  const d2 = calcDigit(cnpj.slice(0, 13), weights2);
-  return d2 === Number(cnpj[13]);
-}
-
-/**
- * Valida CPF ou CNPJ e retorna os dígitos limpos ou valid=false.
- */
-export function validateAndCleanDocument(input: string): {
-  valid: boolean;
-  digits: string;
-  type?: 'CPF' | 'CNPJ';
-} {
-  const digits = onlyDigits(input);
-  if (digits.length === 11 && isValidCpf(digits)) {
-    return { valid: true, digits, type: 'CPF' };
-  }
-  if (digits.length === 14 && isValidCnpj(digits)) {
-    return { valid: true, digits, type: 'CNPJ' };
-  }
-  return { valid: false, digits };
-}
-
-/**
- * Procura um CPF (11 dígitos) ou CNPJ (14 dígitos) válido dentro de uma frase livre
- * (ex: "me manda um pix de 50 cpf 529.982.247-25") e devolve também o texto sem o documento.
- */
-export function extractDocumentFromText(text: string): {
-  document?: string;
-  textWithoutDocument: string;
-} {
-  const docPatterns = [
-    /\b\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}\b/g,
-    /\b\d{14}\b/g,
-    /\b\d{3}\.\d{3}\.\d{3}-\d{2}\b/g,
-    /\b\d{11}\b/g,
-  ];
-
-  for (const pattern of docPatterns) {
-    const matches = text.match(pattern);
-    if (!matches) continue;
-    for (const candidate of matches) {
-      const check = validateAndCleanDocument(candidate);
-      if (check.valid) {
-        return {
-          document: check.digits,
-          textWithoutDocument: text.replace(candidate, ' ').trim(),
-        };
-      }
-    }
-  }
-
-  return { textWithoutDocument: text };
-}
-
-export function maskDocument(digits: string): string {
-  if (digits.length === 11) {
-    return `${digits.slice(0, 3)}.***.***-${digits.slice(9)}`;
-  }
-  if (digits.length === 14) {
-    return `${digits.slice(0, 2)}.***.***/****-${digits.slice(12)}`;
-  }
-  return digits;
-}
-
-/**
- * Extrai um valor monetário em Reais de uma mensagem de texto do WhatsApp.
- * Exemplos aceitos: "150", "R$ 150,50", "pix de 1.250,00", "pix de 50 cpf 529.982.247-25"
- */
-export function parseBrlAmountFromText(text: string): number | null {
-  const { textWithoutDocument } = extractDocumentFromText(text);
-  const cleaned = textWithoutDocument.trim();
-  if (!cleaned) return null;
-
-  // Evita confundir um CPF inválido de 11+ dígitos puros com valor em Reais
-  const pureDigits = onlyDigits(cleaned);
-  if (pureDigits.length >= 11 && !cleaned.includes(',') && !cleaned.toLowerCase().includes('r$')) {
+  let normalized: string;
+  if (/^\d{1,3}(?:\.\d{3})+,\d{1,2}$/.test(t)) {
+    // Ex: "1.250,50"
+    normalized = t.replace(/\./g, '').replace(',', '.');
+  } else if (/^\d{1,3}(?:\.\d{3})+$/.test(t)) {
+    // Ex: "1.000", "1.500", "10.000" -> milhar brasileiro sem centavos!
+    normalized = t.replace(/\./g, '');
+  } else if (/^\d+,\d{1,2}$/.test(t)) {
+    // Ex: "150,50"
+    normalized = t.replace(',', '.');
+  } else if (/^\d+\.\d{1,2}$/.test(t)) {
+    // Ex: "150.50" (exatamente 1 ou 2 casas decimais)
+    normalized = t;
+  } else if (/^\d+$/.test(t)) {
+    // Inteiro puro; ignora números de 8+ dígitos (telefones/CPFs)
+    if (t.length >= 8) return null;
+    normalized = t;
+  } else {
     return null;
   }
 
-  const regex = /(?:r\$\s*)?(\d{1,3}(?:\.\d{3})+,\d{1,2}|\d+,\d{1,2}|\d+\.\d{1,2}|\d+)/i;
-  const match = cleaned.match(regex);
-  if (!match) return null;
-
-  let rawNumber = match[1];
-  if (rawNumber.includes(',') && rawNumber.includes('.')) {
-    rawNumber = rawNumber.replace(/\./g, '').replace(',', '.');
-  } else if (rawNumber.includes(',')) {
-    rawNumber = rawNumber.replace(',', '.');
-  }
-
-  const amount = Number(rawNumber);
+  const amount = Number(normalized);
   if (!Number.isFinite(amount) || amount <= 0 || amount > 500_000) {
     return null;
   }
   return Math.round(amount * 100) / 100;
 }
 
+const NUMBER_TOKEN_PATTERN =
+  '(?:\\d{1,3}(?:\\.\\d{3})+,\\d{1,2}|\\d{1,3}(?:\\.\\d{3})+(?![\\d.,])|\\d+,\\d{1,2}(?!\\d)|\\d+\\.\\d{1,2}(?![\\d.])|\\d+)';
+
+/**
+ * Extrai com precisão um valor monetário em Reais de uma mensagem livre do WhatsApp,
+ * evitando confundir telefones, horários ("10h"), quantidades ("2 itens de 50") ou opções de menu.
+ */
+export function parseBrlAmountFromText(text: string): number | null {
+  const cleaned = text.trim();
+  if (!cleaned) return null;
+
+  // Remove telefones formatados tipo (11) 98888-7777 ou +55 11 98888-7777 e sequências longas de 8+ dígitos (tel/CPF)
+  const sanitized = cleaned
+    .replace(/\+?\d{0,3}\s*\(\d{2}\)\s*\d{4,5}[-\s]?\d{4}/g, ' ')
+    .replace(/\b\d{4,5}-\d{4}\b/g, ' ')
+    .replace(/\b\d{3}\.\d{3}\.\d{3}-\d{2}\b/g, ' ')
+    .replace(/\b\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}\b/g, ' ')
+    .replace(/\b\d{8,}\b/g, ' ')
+    // Remove horários explícitos como "10h", "14h30", "10:30"
+    .replace(/\b\d{1,2}:\d{2}\b/g, ' ')
+    .replace(/\b\d{1,2}h(?:\d{2})?\b/gi, ' ');
+
+  // Camada 1 (Alta certeza): precedido por R$ (ex: "R$ 150,00", "r$1.500")
+  const explicitPrefix = new RegExp(`r\\$\\s*(${NUMBER_TOKEN_PATTERN})`, 'i');
+  const mPrefix = sanitized.match(explicitPrefix);
+  if (mPrefix) {
+    return parseNumericToken(mPrefix[1]);
+  }
+
+  // Camada 2 (Alta certeza): seguido por reais / real / brl / conto (ex: "150 reais")
+  const explicitSuffix = new RegExp(
+    `(?<![\\d.,])(${NUMBER_TOKEN_PATTERN})\\s*(?:reais|real|brl|conto|contos)\\b`,
+    'i'
+  );
+  const mSuffix = sanitized.match(explicitSuffix);
+  if (mSuffix) {
+    return parseNumericToken(mSuffix[1]);
+  }
+
+  // Encontra todos os números candidatos restantes na frase
+  const allTokensRegex = new RegExp(`(?<![\\d.,])(${NUMBER_TOKEN_PATTERN})(?![\\d.,])`, 'g');
+  const allMatches = Array.from(sanitized.matchAll(allTokensRegex))
+    .map((m) => parseNumericToken(m[1]))
+    .filter((v): v is number => v !== null);
+
+  if (allMatches.length === 0) return null;
+
+  // Se houver múltiplos números sem "R$" (ex: "quero 2 itens de 50"), é ambíguo -> retorna null para perguntar o total!
+  if (allMatches.length > 1) {
+    return null;
+  }
+
+  // Camada 3: único número claro na frase (ex: "pix de 150", "1.000", "50,00")
+  return allMatches[0];
+}
+
 export function formatBrl(amount: number): string {
   return amount.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+}
+
+export function formatTimeSaoPaulo(isoOrDate: string | Date): string {
+  const d = typeof isoOrDate === 'string' ? new Date(isoOrDate) : isoOrDate;
+  return d.toLocaleTimeString('pt-BR', {
+    hour: '2-digit',
+    minute: '2-digit',
+    timeZone: 'America/Sao_Paulo',
+  });
 }

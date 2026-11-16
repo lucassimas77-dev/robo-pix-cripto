@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import QRCode from 'qrcode';
 import type {
+  ChargePollResult,
   CreateChargeInput,
   CreateChargeOutput,
   IPixCryptoProvider,
@@ -8,29 +9,32 @@ import type {
   WebhookSettlementEvent,
 } from '../types/domain.ts';
 
+const FETCH_TIMEOUT_MS = 15_000;
+
 export class HodleProvider implements IPixCryptoProvider {
   public readonly name = 'hodle' as const;
-  public readonly requiresPayerDocument: boolean;
+  public readonly minAmountBrl = 5;
+  public readonly maxAmountBrl = 50_000;
   private readonly config: {
     apiUrl: string;
     apiKey: string;
     webhookSecret: string;
-    requiresPayerDocument?: boolean;
   };
 
-  constructor(config: {
-    apiUrl: string;
-    apiKey: string;
-    webhookSecret: string;
-    requiresPayerDocument?: boolean;
-  }) {
-    this.config = config;
-    this.requiresPayerDocument = config.requiresPayerDocument ?? false;
+  constructor(config: { apiUrl: string; apiKey: string; webhookSecret: string }) {
+    this.config = {
+      apiUrl: config.apiUrl.replace(/\/+$/, ''),
+      apiKey: config.apiKey.trim(),
+      webhookSecret: config.webhookSecret.trim(),
+    };
   }
 
   public async createCharge(input: CreateChargeInput): Promise<CreateChargeOutput> {
     if (!this.config.apiKey) {
-      throw new Error('HODLE_API_KEY não configurada no arquivo .env.');
+      throw new Error('API_KEY_MISSING: Cole sua Chave de API da Hodle no Passo 1 do painel.');
+    }
+    if (!input.walletAddress) {
+      throw new Error('WALLET_MISSING: Informe o endereço da sua carteira cripto no Passo 1.');
     }
 
     let estimatedCryptoAmount: number | undefined;
@@ -42,6 +46,7 @@ export class HodleProvider implements IPixCryptoProvider {
             Authorization: `Bearer ${this.config.apiKey}`,
             Accept: 'application/json',
           },
+          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
         }
       );
       if (quoteRes.ok) {
@@ -51,7 +56,7 @@ export class HodleProvider implements IPixCryptoProvider {
         }
       }
     } catch {
-      // Prossegue normalmente caso o endpoint indicativo oscile
+      // Cotação prévia opcional
     }
 
     const bodyPayload: Record<string, unknown> = {
@@ -61,13 +66,10 @@ export class HodleProvider implements IPixCryptoProvider {
       network: input.cryptoNetwork.toUpperCase(),
       destinationAddress: input.walletAddress,
       expirationMinutes: input.expirationMinutes,
-      webhookUrl: input.webhookUrl,
     };
-    if (input.payerDocument) {
-      bodyPayload.taxId = input.payerDocument;
-      bodyPayload.payerDocument = input.payerDocument;
+    if (input.webhookUrl.startsWith('https://') && !input.webhookUrl.includes('localhost')) {
+      bodyPayload.webhookUrl = input.webhookUrl;
     }
-    if (input.customerName) bodyPayload.payerName = input.customerName;
 
     const response = await fetch(`${this.config.apiUrl}/api/deposit/asset`, {
       method: 'POST',
@@ -77,11 +79,12 @@ export class HodleProvider implements IPixCryptoProvider {
         Accept: 'application/json',
       },
       body: JSON.stringify(bodyPayload),
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`Falha ao criar cobrança Pix na Hodle (HTTP ${response.status}): ${errorText}`);
+      throw new Error(`Hodle (HTTP ${response.status}): ${errorText}`);
     }
 
     const data = (await response.json()) as Record<string, unknown>;
@@ -122,9 +125,9 @@ export class HodleProvider implements IPixCryptoProvider {
       .update(rawBody)
       .digest('hex');
 
-    const sigClean = signatureHeader.replace(/^sha256=/i, '').trim();
+    const sigClean = signatureHeader.replace(/^sha256=/i, '').trim().toLowerCase();
     const a = Buffer.from(sigClean, 'utf8');
-    const b = Buffer.from(expectedHex, 'utf8');
+    const b = Buffer.from(expectedHex.toLowerCase(), 'utf8');
     if (a.length !== b.length) return false;
     return crypto.timingSafeEqual(a, b);
   }
@@ -150,6 +153,7 @@ export class HodleProvider implements IPixCryptoProvider {
 
     return {
       provider: 'hodle',
+      eventId: root.eventId ? String(root.eventId) : undefined,
       providerChargeId: data.id ? String(data.id) : undefined,
       externalId: data.externalId ? String(data.externalId) : undefined,
       newStatus,
@@ -158,5 +162,43 @@ export class HodleProvider implements IPixCryptoProvider {
       cryptoAmount: data.amount != null ? Number(data.amount) : undefined,
       rawEventName: event,
     };
+  }
+
+  public async checkChargeStatus(providerChargeId: string): Promise<ChargePollResult | null> {
+    if (!this.config.apiKey || !providerChargeId) return null;
+    try {
+      const res = await fetch(
+        `${this.config.apiUrl}/api/deposit/${encodeURIComponent(providerChargeId)}`,
+        {
+          headers: {
+            Authorization: `Bearer ${this.config.apiKey}`,
+            Accept: 'application/json',
+          },
+          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+        }
+      );
+      if (!res.ok) return null;
+      const data = (await res.json()) as Record<string, unknown>;
+      const st = String(data.status ?? '').toUpperCase();
+      if (st === 'COMPLETED' || st === 'ASSET_SUCCESS' || st === 'SETTLED') {
+        return {
+          status: 'SETTLED_CRYPTO',
+          txHash: data.txHash ? String(data.txHash) : undefined,
+          cryptoAmount: data.assetAmount != null ? Number(data.assetAmount) : undefined,
+        };
+      }
+      if (st === 'PIX_CONFIRMED' || st === 'PAID' || st === 'PROCESSING') {
+        return { status: 'PIX_CONFIRMED' };
+      }
+      if (st === 'FAILED' || st === 'REFUNDED') {
+        return { status: 'FAILED' };
+      }
+      if (st === 'EXPIRED') {
+        return { status: 'EXPIRED' };
+      }
+      return null;
+    } catch {
+      return null;
+    }
   }
 }

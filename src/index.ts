@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { loadConfig } from './config/env.ts';
 import { OrderRepository } from './database/orderRepository.ts';
 import { createCryptoProvider } from './providers/providerFactory.ts';
@@ -9,9 +10,11 @@ import { UnifiedWhatsAppGateway } from './whatsapp/whatsappGateway.ts';
 
 async function bootstrap(): Promise<void> {
   const baseConfig = loadConfig();
-  const repository = new OrderRepository();
+  const dbPath = path.join(baseConfig.dataDir, 'automation.sqlite');
+  const waAuthDir = path.join(baseConfig.dataDir, 'wa_auth');
 
-  // Carrega configurações salvas pela tela web (se o usuário ou amigo já tiver salvado a conta dele)
+  const repository = new OrderRepository(dbPath);
+
   const savedAccount = repository.getRuntimeSettings({
     provider: baseConfig.cryptoProvider,
     apiKey: '',
@@ -21,6 +24,8 @@ async function bootstrap(): Promise<void> {
     walletNetwork: baseConfig.walletNetwork,
     pixExpirationMinutes: baseConfig.pixExpirationMinutes,
     adminWhatsappPhone: baseConfig.adminWhatsappPhone,
+    waFilterMode: 'keyword_only',
+    waAllowedTestPhone: '',
   });
 
   const activeConfig = {
@@ -31,16 +36,18 @@ async function bootstrap(): Promise<void> {
     walletNetwork: savedAccount.walletNetwork,
     pixExpirationMinutes: savedAccount.pixExpirationMinutes,
     adminWhatsappPhone: savedAccount.adminWhatsappPhone,
-    requirePayerDocument: savedAccount.requirePayerDocument ?? baseConfig.requirePayerDocument,
   };
 
   const cryptoProvider = createCryptoProvider(activeConfig, savedAccount);
-  const baileysManager = new BaileysDirectManager(repository);
+  const baileysManager = new BaileysDirectManager(repository, waAuthDir, {
+    filterMode: savedAccount.waFilterMode,
+    allowedTestPhone: savedAccount.waAllowedTestPhone,
+  });
   const whatsappGateway = new UnifiedWhatsAppGateway(activeConfig, repository, baileysManager);
   const engine = new ConversationEngine(activeConfig, repository, cryptoProvider, whatsappGateway);
 
-  baileysManager.setIncomingHandler(async ({ phone, text, customerName }) => {
-    await engine.handleIncomingMessage({ phone, text, customerName });
+  baileysManager.setIncomingHandler(async ({ phone, customerJid, text, customerName }) => {
+    await engine.handleIncomingMessage({ phone, customerJid, text, customerName });
   });
 
   const expirationWatcher = new ExpirationWatcher(
@@ -50,7 +57,8 @@ async function bootstrap(): Promise<void> {
     engine
   );
 
-  expirationWatcher.start(8_000);
+  // Intervalo de 15s respeita folgadamente o rate limit de 30 req/min por conta da DePix App
+  expirationWatcher.start(15_000);
 
   const server = createAppHttpServer({
     config: activeConfig,
@@ -66,13 +74,12 @@ async function bootstrap(): Promise<void> {
     console.log('===================================================================');
   });
 
-  // Mantém a instância gratuita acordada 24h fazendo ping externo periódico em /health
   const externalKeepAliveUrl = process.env.RENDER_EXTERNAL_URL;
   let keepAliveTimer: NodeJS.Timeout | undefined;
   if (externalKeepAliveUrl) {
     const cleanUrl = externalKeepAliveUrl.replace(/\/+$/, '');
     keepAliveTimer = setInterval(() => {
-      fetch(`${cleanUrl}/health`).catch(() => {});
+      fetch(`${cleanUrl}/health`, { signal: AbortSignal.timeout(10_000) }).catch(() => {});
     }, 10 * 60 * 1000);
     keepAliveTimer.unref();
   }

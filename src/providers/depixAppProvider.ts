@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import QRCode from 'qrcode';
 import type {
+  ChargePollResult,
   CreateChargeInput,
   CreateChargeOutput,
   IPixCryptoProvider,
@@ -8,35 +9,41 @@ import type {
   WebhookSettlementEvent,
 } from '../types/domain.ts';
 
+const FETCH_TIMEOUT_MS = 15_000;
+const WEBHOOK_TOLERANCE_SECONDS = 300; // 5 minutos contra replay attacks
+
 /**
- * Integração homologada com a documentação oficial da DePix App API (https://depixapp.com/docs.md):
+ * Integração homologada com a documentação oficial da DePix App API (https://depixapp.com/docs.md).
  *
- * Opera em 2 modos automáticos:
- * 1) MODO ZERO CPF NO WHATSAPP (quando `input.payerDocument` não é informado):
- *    Usa `POST /api/products` com `kind: "charge"` (que NÃO exige CPF na API!) e gera um
- *    Link Privado Único (`https://pay.depixapp.com/c/prd_...`) + QR Code. O pagador abre o link
- *    e paga sem enviar documento nenhum na conversa do WhatsApp, e o robô monitora via
- *    `GET /api/products/:id/checkouts` + Webhooks!
- * 2) MODO PIX COPIA E COLA DIRETO NO CHAT (quando `input.payerDocument` é informado):
- *    Usa `POST /api/checkouts` com `payer_tax_number`, extrai `data.pix.qr_code` (`000201...`),
- *    entrega o Pix Copia e Cola puro direto no WhatsApp e monitora `GET /api/checkouts/:id`
- *    desembrulhando `{ checkout: { status, blockchain_tx_id } }`.
+ * Opera SEMPRE no Modo Privado Sem Perguntar CPF no WhatsApp:
+ * - Cria cobrança privada única (`POST /api/products` com `kind: "charge"` e `slug` único).
+ * - Entrega `https://pay.depixapp.com/c/prd_...` + QR Code imediato no WhatsApp.
+ * - Nota: na DePix App, a liquidação de charges/checkouts vai sempre em DEPIX (Liquid Network)
+ *   para o endereço Liquid configurado pelo titular diretamente em `depixapp.com/#merchant`.
  */
 export class DePixAppProvider implements IPixCryptoProvider {
   public readonly name = 'depixapp' as const;
-  public readonly requiresPayerDocument = false;
+  public readonly minAmountBrl = 5;
+  public readonly maxAmountBrl = 6_000;
   private readonly config: {
     apiUrl: string;
     apiKey: string;
     webhookSecret: string;
+    skipTimestampWindowCheck?: boolean;
   };
 
-  constructor(config: { apiUrl: string; apiKey: string; webhookSecret: string }) {
+  constructor(config: {
+    apiUrl: string;
+    apiKey: string;
+    webhookSecret: string;
+    skipTimestampWindowCheck?: boolean;
+  }) {
     const cleanBase = config.apiUrl.replace(/\/+$/, '');
     this.config = {
       apiUrl: cleanBase.endsWith('/api') ? cleanBase : `${cleanBase}/api`,
       apiKey: config.apiKey.trim(),
       webhookSecret: config.webhookSecret.trim(),
+      skipTimestampWindowCheck: config.skipTimestampWindowCheck,
     };
   }
 
@@ -55,93 +62,33 @@ export class DePixAppProvider implements IPixCryptoProvider {
       );
     }
 
-    // Documentação oficial DePix App: mínimo R$ 5,00 (500 centavos) e máximo R$ 6.000,00 (600000 centavos)
     const amountInCents = Math.round(input.amountBrl * 100);
     if (amountInCents < 500) {
-      throw new Error('MIN_AMOUNT_500: O valor mínimo na DePix App é de R$ 5,00.');
+      throw new Error('MIN_AMOUNT: O valor mínimo na DePix App é de R$ 5,00.');
     }
     if (amountInCents > 600_000) {
-      throw new Error('MAX_AMOUNT_600000: O valor máximo por chave Pix é de R$ 6.000,00.');
+      throw new Error('MAX_AMOUNT: O valor máximo por cobrança na DePix App é de R$ 6.000,00.');
     }
 
-    // expires_in no rail Pix: mín 300s (5 min), máx 1200s (20 min)
     const expiresInSeconds = Math.min(1200, Math.max(300, Math.round(input.expirationMinutes * 60)));
-    // DePix exige que callback_url seja HTTPS público (rejeita localhost HTTP)
     const publicHttpsCallback =
       input.webhookUrl.startsWith('https://') && !input.webhookUrl.includes('localhost')
         ? input.webhookUrl
         : undefined;
 
-    // Estimativa líquida oficial da documentação DePix: taxa de 2% + R$ 0,99
+    // Taxa documentada da DePix App: 2% + R$ 0,99
     const estimatedNet = Math.max(0, Math.round((input.amountBrl * 0.98 - 0.99) * 100) / 100);
 
-    // MODO 2: Com CPF/CNPJ informado -> Gera Pix Copia e Cola `000201...` direto via POST /api/checkouts
-    if (input.payerDocument) {
-      const payload: Record<string, unknown> = {
-        amount: amountInCents,
-        payer_tax_number: input.payerDocument,
-        payment_method: 'pix',
-        description: `Pedido #${input.externalId}`,
-        expires_in: expiresInSeconds,
-        metadata: {
-          external_id: input.externalId,
-        },
-      };
-      if (publicHttpsCallback) {
-        payload.callback_url = publicHttpsCallback;
-      }
-
-      const response = await fetch(`${this.config.apiUrl}/checkouts`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${this.config.apiKey}`,
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-          'Idempotency-Key': input.externalId,
-        },
-        body: JSON.stringify(payload),
-      });
-
-      if (!response.ok) {
-        const errBody = await response.text();
-        throw new Error(this.extractHumanError(response.status, errBody));
-      }
-
-      // POST /api/checkouts retorna o objeto flat na raiz com `pix: { qr_code: "000201..." }`
-      const data = (await response.json()) as Record<string, unknown>;
-      const pixBlock =
-        typeof data.pix === 'object' && data.pix ? (data.pix as Record<string, unknown>) : {};
-      const pixCopyPaste = String(
-        pixBlock.qr_code ?? data.pix_payload ?? data.qr_code ?? data.payment_url ?? ''
-      );
-      if (!pixCopyPaste) {
-        throw new Error('Resposta da DePix App não retornou o payload Pix.');
-      }
-
-      const expiresAt = data.expires_at
-        ? String(data.expires_at)
-        : new Date(Date.now() + expiresInSeconds * 1000).toISOString();
-
-      const pixQrCodeBase64 = await QRCode.toDataURL(pixCopyPaste, { width: 320, margin: 2 });
-
-      return {
-        providerChargeId: String(data.id ?? input.externalId),
-        pixCopyPaste,
-        pixQrCodeBase64,
-        pixQrCodeUrl: pixBlock.qr_image_url ? String(pixBlock.qr_image_url) : undefined,
-        paymentUrl: data.payment_url ? String(data.payment_url) : undefined,
-        estimatedCryptoAmount: estimatedNet,
-        expiresAt,
-      };
-    }
-
-    // MODO 1 (Padrão Zero-CPF no WhatsApp): Cria Cobrança Privada Única (`kind: "charge"`) em POST /api/products
     const saoPauloToday = new Intl.DateTimeFormat('en-CA', {
       timeZone: 'America/Sao_Paulo',
     }).format(new Date());
 
+    // Slug único (2-60 chars, minúsculas/números/hifens) evita 409 conflict: duplicate slug!
+    const uniqueSlug = `chg-${Date.now().toString(36)}-${crypto.randomBytes(5).toString('hex')}`;
+
     const chargePayload: Record<string, unknown> = {
-      name: `Pagamento Pix ${input.externalId.slice(-6).toUpperCase()}`,
+      name: `Pix ${uniqueSlug.slice(-8).toUpperCase()}`,
+      slug: uniqueSlug,
       amount: amountInCents,
       kind: 'charge',
       due_date: saoPauloToday,
@@ -163,6 +110,7 @@ export class DePixAppProvider implements IPixCryptoProvider {
         Accept: 'application/json',
       },
       body: JSON.stringify(chargePayload),
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
 
     if (!response.ok) {
@@ -198,46 +146,46 @@ export class DePixAppProvider implements IPixCryptoProvider {
   }
 
   /**
-   * Validação oficial do cabeçalho `X-DePix-Signature: t=1717257600,v1=abc123...`
-   * Assinatura calculada sobre `${timestamp}.${rawBody}` com HMAC-SHA256.
+   * Validação estrita do formato oficial `X-DePix-Signature: t=1717257600,v1=<hmac_hex>`
+   * com proteção contra replay attack na janela de timestamp `t`.
    */
   public verifyWebhookSignature(
     rawBody: string,
     headers: Record<string, string | string[] | undefined>
   ): boolean {
-    const sig =
-      headers['x-depix-signature'] ?? headers['x-webhook-signature'] ?? headers['x-signature'];
+    const sig = headers['x-depix-signature'];
     if (!sig || typeof sig !== 'string' || !this.config.webhookSecret) {
       return false;
     }
 
-    // Formato oficial DePix: t=<timestamp>,v1=<hex>
     const parts = sig.split(',').map((p) => p.trim());
     const tPart = parts.find((p) => p.startsWith('t='));
     const v1Part = parts.find((p) => p.startsWith('v1='));
-
-    if (tPart && v1Part) {
-      const timestamp = tPart.slice(2);
-      const receivedV1 = v1Part.slice(3);
-      const expectedHex = crypto
-        .createHmac('sha256', this.config.webhookSecret)
-        .update(`${timestamp}.${rawBody}`)
-        .digest('hex');
-
-      const a = Buffer.from(receivedV1, 'utf8');
-      const b = Buffer.from(expectedHex, 'utf8');
-      if (a.length !== b.length) return false;
-      return crypto.timingSafeEqual(a, b);
+    if (!tPart || !v1Part) {
+      return false;
     }
 
-    // Fallback compatível caso enviado apenas sha256=<hex>
-    const expectedPlain = crypto
+    const timestamp = tPart.slice(2);
+    const receivedV1 = v1Part.slice(3);
+    if (!/^\d+$/.test(timestamp) || !/^[0-9a-f]{64}$/i.test(receivedV1)) {
+      return false;
+    }
+
+    if (!this.config.skipTimestampWindowCheck) {
+      const tsSeconds = Number(timestamp);
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      if (Math.abs(nowSeconds - tsSeconds) > WEBHOOK_TOLERANCE_SECONDS) {
+        return false;
+      }
+    }
+
+    const expectedHex = crypto
       .createHmac('sha256', this.config.webhookSecret)
-      .update(rawBody)
+      .update(`${timestamp}.${rawBody}`)
       .digest('hex');
-    const cleanSig = sig.replace(/^sha256=/i, '').trim();
-    const a = Buffer.from(cleanSig, 'utf8');
-    const b = Buffer.from(expectedPlain, 'utf8');
+
+    const a = Buffer.from(receivedV1.toLowerCase(), 'utf8');
+    const b = Buffer.from(expectedHex.toLowerCase(), 'utf8');
     if (a.length !== b.length) return false;
     return crypto.timingSafeEqual(a, b);
   }
@@ -251,8 +199,8 @@ export class DePixAppProvider implements IPixCryptoProvider {
       unknown
     >;
 
-    // Regra crítica da doc oficial: NUNCA liberar pedido real se `is_live: false` quando usando chave live!
-    if (this.isLiveKey() && data.is_live === false) {
+    // Regra crítica da documentação oficial: jamais liberar pedido real se `is_live` for falso!
+    if (this.isLiveKey() && (data.is_live === false || data.is_live === 0)) {
       return null;
     }
 
@@ -306,6 +254,7 @@ export class DePixAppProvider implements IPixCryptoProvider {
 
     return {
       provider: 'depixapp',
+      eventId: data.event_id ? String(data.event_id) : undefined,
       providerChargeId: chargeId,
       externalId: metadata.external_id
         ? String(metadata.external_id)
@@ -331,57 +280,76 @@ export class DePixAppProvider implements IPixCryptoProvider {
   }
 
   /**
-   * Consulta ativa do pagamento na DePix App (funciona tanto para `chk_...` quanto para `prd_...`!).
+   * Consulta ativa do pagamento na DePix App priorizando corretamente:
+   * `completed` (buscando `blockchain_tx_id` em GET /checkouts/:id) > `approved`/`processing` > `pending` ativo.
    */
-  public async checkChargeStatus(providerChargeId: string): Promise<{
-    status: OrderStatus;
-    txHash?: string;
-    cryptoAmount?: number;
-    rejectionReasons?: string[];
-  } | null> {
+  public async checkChargeStatus(providerChargeId: string): Promise<ChargePollResult | null> {
     if (!this.config.apiKey || !providerChargeId) return null;
 
     try {
-      // Se foi gerado como Link Privado (`prd_...`), consulta os checkouts vinculados ao produto
       if (providerChargeId.startsWith('prd_')) {
         const res = await fetch(
-          `${this.config.apiUrl}/products/${encodeURIComponent(providerChargeId)}/checkouts?limit=10`,
+          `${this.config.apiUrl}/products/${encodeURIComponent(providerChargeId)}/checkouts?limit=20`,
           {
             headers: {
               Authorization: `Bearer ${this.config.apiKey}`,
               Accept: 'application/json',
             },
+            signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
           }
         );
         if (!res.ok) return null;
         const root = (await res.json()) as Record<string, unknown>;
-        const list = Array.isArray(root.checkouts)
+        const rawList = Array.isArray(root.checkouts)
           ? (root.checkouts as Array<Record<string, unknown>>)
           : [];
 
-        for (const item of list) {
-          if (this.isLiveKey() && (item.is_live === false || item.is_live === 0)) continue;
-          const st = String(item.status ?? '').toLowerCase();
-          if (st === 'completed') {
-            return {
-              status: 'SETTLED_CRYPTO',
-              txHash: item.blockchain_tx_id ? String(item.blockchain_tx_id) : undefined,
-            };
+        const validItems = rawList.filter(
+          (item) => !(this.isLiveKey() && (item.is_live === false || item.is_live === 0))
+        );
+        if (validItems.length === 0) return null;
+
+        // 1ª prioridade: algum checkout já `completed` -> busca `blockchain_tx_id` no detalhe
+        const completedItem = validItems.find(
+          (item) => String(item.status ?? '').toLowerCase() === 'completed'
+        );
+        if (completedItem) {
+          let txHash = completedItem.blockchain_tx_id
+            ? String(completedItem.blockchain_tx_id)
+            : undefined;
+          if (!txHash && completedItem.id) {
+            txHash = await this.fetchCheckoutBlockchainTxId(String(completedItem.id));
           }
-          if (st === 'processing' || st === 'approved') {
-            return { status: 'PIX_CONFIRMED' };
-          }
-          if (st === 'cancelled') {
-            const reasons = Array.isArray(item.rejection_reasons)
-              ? item.rejection_reasons.map(String)
-              : undefined;
-            return { status: 'FAILED', rejectionReasons: reasons };
-          }
+          return { status: 'SETTLED_CRYPTO', txHash };
         }
+
+        // 2ª prioridade: algum checkout já pago em processamento/aprovação (`processing` | `approved`)
+        const processingItem = validItems.find((item) => {
+          const st = String(item.status ?? '').toLowerCase();
+          return st === 'processing' || st === 'approved';
+        });
+        if (processingItem) {
+          return { status: 'PIX_CONFIRMED' };
+        }
+
+        // 3ª prioridade: algum checkout `pending` ainda dentro do prazo na DePix (cliente acabou de abrir o link!)
+        const nowMs = Date.now();
+        const activePending = validItems.find((item) => {
+          if (String(item.status ?? '').toLowerCase() !== 'pending') return false;
+          if (!item.expires_at) return false;
+          return new Date(String(item.expires_at)).getTime() > nowMs;
+        });
+        if (activePending && activePending.expires_at) {
+          return {
+            status: 'PENDING',
+            activePendingExpiresAt: String(activePending.expires_at),
+          };
+        }
+
         return null;
       }
 
-      // Consulta direta de checkout (`chk_...`) — resposta vem embrulhada em `{ checkout: { ... } }`!
+      // Consulta direta de checkout (`chk_...`) — embrulhado em `{ checkout: { ... } }`
       const res = await fetch(
         `${this.config.apiUrl}/checkouts/${encodeURIComponent(providerChargeId)}`,
         {
@@ -389,6 +357,7 @@ export class DePixAppProvider implements IPixCryptoProvider {
             Authorization: `Bearer ${this.config.apiKey}`,
             Accept: 'application/json',
           },
+          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
         }
       );
       if (!res.ok) return null;
@@ -427,9 +396,6 @@ export class DePixAppProvider implements IPixCryptoProvider {
     }
   }
 
-  /**
-   * Desativa automaticamente links privados expirados (`prd_...`) para impedir pagamento fora do prazo.
-   */
   public async expireCharge(providerChargeId: string): Promise<void> {
     if (!this.config.apiKey || !providerChargeId.startsWith('prd_')) return;
     try {
@@ -441,32 +407,35 @@ export class DePixAppProvider implements IPixCryptoProvider {
             Authorization: `Bearer ${this.config.apiKey}`,
             Accept: 'application/json',
           },
+          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
         }
       );
     } catch {
-      // Ignora falha de rede silenciosa ao desativar link expirado
+      // Silencioso
     }
   }
 
-  /**
-   * Simula pagamento em chaves de teste (`sk_test_...`) usando o endpoint oficial da DePix App.
-   */
-  public async simulateSandboxPayment(providerChargeId: string): Promise<boolean> {
-    if (!this.isTestKey() || !providerChargeId.startsWith('chk_')) return false;
+  private async fetchCheckoutBlockchainTxId(checkoutId: string): Promise<string | undefined> {
     try {
       const res = await fetch(
-        `${this.config.apiUrl}/checkouts/${encodeURIComponent(providerChargeId)}/simulate-payment`,
+        `${this.config.apiUrl}/checkouts/${encodeURIComponent(checkoutId)}`,
         {
-          method: 'POST',
           headers: {
             Authorization: `Bearer ${this.config.apiKey}`,
             Accept: 'application/json',
           },
+          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
         }
       );
-      return res.ok;
+      if (!res.ok) return undefined;
+      const root = (await res.json()) as Record<string, unknown>;
+      const chk =
+        typeof root.checkout === 'object' && root.checkout
+          ? (root.checkout as Record<string, unknown>)
+          : root;
+      return chk.blockchain_tx_id ? String(chk.blockchain_tx_id) : undefined;
     } catch {
-      return false;
+      return undefined;
     }
   }
 

@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import QRCode from 'qrcode';
 import type {
+  ChargePollResult,
   CreateChargeInput,
   CreateChargeOutput,
   IPixCryptoProvider,
@@ -8,29 +9,32 @@ import type {
   WebhookSettlementEvent,
 } from '../types/domain.ts';
 
+const FETCH_TIMEOUT_MS = 15_000;
+
 export class NoxPayProvider implements IPixCryptoProvider {
   public readonly name = 'noxpay' as const;
-  public readonly requiresPayerDocument: boolean;
+  public readonly minAmountBrl = 10;
+  public readonly maxAmountBrl = 50_000;
   private readonly config: {
     apiUrl: string;
     apiKey: string;
     webhookSecret: string;
-    requiresPayerDocument?: boolean;
   };
 
-  constructor(config: {
-    apiUrl: string;
-    apiKey: string;
-    webhookSecret: string;
-    requiresPayerDocument?: boolean;
-  }) {
-    this.config = config;
-    this.requiresPayerDocument = config.requiresPayerDocument ?? false;
+  constructor(config: { apiUrl: string; apiKey: string; webhookSecret: string }) {
+    this.config = {
+      apiUrl: config.apiUrl.replace(/\/+$/, ''),
+      apiKey: config.apiKey.trim(),
+      webhookSecret: config.webhookSecret.trim(),
+    };
   }
 
   public async createCharge(input: CreateChargeInput): Promise<CreateChargeOutput> {
     if (!this.config.apiKey) {
-      throw new Error('NOXPAY_API_KEY não configurada no arquivo .env.');
+      throw new Error('API_KEY_MISSING: Cole sua Chave de API da NoxPay no Passo 1 do painel.');
+    }
+    if (!input.walletAddress) {
+      throw new Error('WALLET_MISSING: Informe o endereço da sua carteira cripto no Passo 1.');
     }
 
     const bodyPayload: Record<string, unknown> = {
@@ -40,10 +44,10 @@ export class NoxPayProvider implements IPixCryptoProvider {
       crypto_network: input.cryptoNetwork.toUpperCase(),
       wallet_address: input.walletAddress,
       external_id: input.externalId,
-      webhook: input.webhookUrl,
     };
-    if (input.payerDocument) bodyPayload.payer_document = input.payerDocument;
-    if (input.customerName) bodyPayload.payer_name = input.customerName;
+    if (input.webhookUrl.startsWith('https://') && !input.webhookUrl.includes('localhost')) {
+      bodyPayload.webhook = input.webhookUrl;
+    }
 
     const response = await fetch(`${this.config.apiUrl}/crossramp_checkout`, {
       method: 'POST',
@@ -53,17 +57,20 @@ export class NoxPayProvider implements IPixCryptoProvider {
         Accept: 'application/json',
       },
       body: JSON.stringify(bodyPayload),
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`Falha ao criar cobrança na NoxPay (HTTP ${response.status}): ${errorText}`);
+      throw new Error(`NoxPay (HTTP ${response.status}): ${errorText}`);
     }
 
     const data = (await response.json()) as Record<string, unknown>;
-    const pixCopyPaste = String(data.pix_code ?? data.qr_code_text ?? data.brcode ?? '');
+    const pixCopyPaste = String(
+      data.pix_code ?? data.qr_code_text ?? data.brcode ?? data.checkout_url ?? ''
+    );
     if (!pixCopyPaste) {
-      throw new Error('A resposta da NoxPay não retornou o código Pix Copia e Cola.');
+      throw new Error('A resposta da NoxPay não retornou código Pix nem link de checkout.');
     }
 
     const expiresAt = data.expires_at
@@ -76,6 +83,7 @@ export class NoxPayProvider implements IPixCryptoProvider {
       providerChargeId: String(data.txid ?? data.id ?? input.externalId),
       pixCopyPaste,
       pixQrCodeBase64,
+      paymentUrl: data.checkout_url ? String(data.checkout_url) : undefined,
       estimatedCryptoAmount: data.amount_crypto != null ? Number(data.amount_crypto) : undefined,
       expiresAt,
     };
@@ -113,7 +121,7 @@ export class NoxPayProvider implements IPixCryptoProvider {
       newStatus = 'SETTLED_CRYPTO';
     } else if (statusRaw === 'EXPIRED') {
       newStatus = 'EXPIRED';
-    } else if (statusRaw === 'FAILED' || statusRaw === 'REFUNDED') {
+    } else if (statusRaw === 'FAILED' || statusRaw === 'REFUNDED' || statusRaw === 'CANCELLED') {
       newStatus = 'FAILED';
     }
 
@@ -121,6 +129,7 @@ export class NoxPayProvider implements IPixCryptoProvider {
 
     return {
       provider: 'noxpay',
+      eventId: obj.event_id ? String(obj.event_id) : undefined,
       providerChargeId: obj.txid ? String(obj.txid) : obj.id ? String(obj.id) : undefined,
       externalId: obj.external_id ? String(obj.external_id) : undefined,
       newStatus,
@@ -128,5 +137,43 @@ export class NoxPayProvider implements IPixCryptoProvider {
       cryptoAmount: obj.amount_crypto != null ? Number(obj.amount_crypto) : undefined,
       rawEventName: statusRaw,
     };
+  }
+
+  public async checkChargeStatus(providerChargeId: string): Promise<ChargePollResult | null> {
+    if (!this.config.apiKey || !providerChargeId) return null;
+    try {
+      const res = await fetch(
+        `${this.config.apiUrl}/crossramp_checkout/${encodeURIComponent(providerChargeId)}`,
+        {
+          headers: {
+            'api-key': this.config.apiKey,
+            Accept: 'application/json',
+          },
+          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+        }
+      );
+      if (!res.ok) return null;
+      const obj = (await res.json()) as Record<string, unknown>;
+      const st = String(obj.status ?? '').toUpperCase();
+      if (st === 'COMPLETED' || st === 'SETTLED') {
+        return {
+          status: 'SETTLED_CRYPTO',
+          txHash: obj.tx_hash ? String(obj.tx_hash) : undefined,
+          cryptoAmount: obj.amount_crypto != null ? Number(obj.amount_crypto) : undefined,
+        };
+      }
+      if (st === 'PAID' || st === 'PIX_PAID') {
+        return { status: 'PIX_CONFIRMED' };
+      }
+      if (st === 'FAILED' || st === 'REFUNDED' || st === 'CANCELLED') {
+        return { status: 'FAILED' };
+      }
+      if (st === 'EXPIRED') {
+        return { status: 'EXPIRED' };
+      }
+      return null;
+    } catch {
+      return null;
+    }
   }
 }

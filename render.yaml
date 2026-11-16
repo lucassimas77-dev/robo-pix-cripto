@@ -1,4 +1,4 @@
-# Configuração Node.js Nativo para Plano Gratuito sem Cartão no Render.com
+# Configuração Node.js 24 Nativo para Render.com (Plano Free)
 services:
   - type: web
     name: robo-pix-cripto
@@ -10,5 +10,3 @@ services:
     envVars:
       - key: NODE_VERSION
         value: "24"
-      - key: REQUIRE_PAYER_DOCUMENT
-        value: "false"

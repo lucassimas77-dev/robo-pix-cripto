@@ -10,13 +10,6 @@ import type {
   SupportedProviderName,
 } from '../types/domain.ts';
 
-/**
- * Repositório SQLite nativo (Node 24+) para controle transacional de:
- * - Cobranças Pix -> Cripto e seus tempos exatos de expiração
- * - Idempotência de Webhooks (evitando processar o mesmo pagamento duas vezes)
- * - Sessões de atendimento no WhatsApp
- * - Histórico de mensagens (para auditoria e simulador visual)
- */
 export class OrderRepository {
   private db: DatabaseSync;
 
@@ -36,6 +29,7 @@ export class OrderRepository {
         provider TEXT NOT NULL,
         provider_charge_id TEXT NOT NULL,
         customer_phone TEXT NOT NULL,
+        customer_jid TEXT,
         customer_name TEXT,
         payer_document TEXT,
         amount_brl REAL NOT NULL,
@@ -46,6 +40,7 @@ export class OrderRepository {
         pix_copy_paste TEXT NOT NULL,
         pix_qr_code_base64 TEXT,
         pix_qr_code_url TEXT,
+        payment_url TEXT,
         status TEXT NOT NULL,
         warning_sent INTEGER NOT NULL DEFAULT 0,
         tx_hash TEXT,
@@ -60,6 +55,7 @@ export class OrderRepository {
 
       CREATE TABLE IF NOT EXISTS chat_sessions (
         phone TEXT PRIMARY KEY,
+        customer_jid TEXT,
         stage TEXT NOT NULL,
         draft_amount_brl REAL,
         draft_customer_name TEXT,
@@ -83,7 +79,40 @@ export class OrderRepository {
         json_data TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS processed_webhook_events (
+        event_id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL
+      );
     `);
+
+    // Migrações seguras para bancos SQLite já criados anteriormente
+    const safeAlter = [
+      `ALTER TABLE orders ADD COLUMN customer_jid TEXT`,
+      `ALTER TABLE orders ADD COLUMN payment_url TEXT`,
+      `ALTER TABLE chat_sessions ADD COLUMN customer_jid TEXT`,
+    ];
+    for (const sql of safeAlter) {
+      try {
+        this.db.exec(sql);
+      } catch {
+        // Coluna já existe
+      }
+    }
+  }
+
+  public tryRecordWebhookEvent(eventId?: string): boolean {
+    if (!eventId) return true;
+    try {
+      const res = this.db
+        .prepare(
+          `INSERT OR IGNORE INTO processed_webhook_events (event_id, created_at) VALUES (?, ?)`
+        )
+        .run(eventId, new Date().toISOString());
+      return Number(res.changes) > 0;
+    } catch {
+      return true;
+    }
   }
 
   public getRuntimeSettings(defaults: RuntimeAccountSettings): RuntimeAccountSettings {
@@ -116,13 +145,13 @@ export class OrderRepository {
   public createOrder(order: PixCryptoOrder): void {
     const stmt = this.db.prepare(`
       INSERT INTO orders (
-        id, external_id, provider, provider_charge_id, customer_phone,
+        id, external_id, provider, provider_charge_id, customer_phone, customer_jid,
         customer_name, payer_document, amount_brl, estimated_crypto_amount,
         crypto_asset, crypto_network, wallet_address, pix_copy_paste,
-        pix_qr_code_base64, pix_qr_code_url, status, warning_sent,
+        pix_qr_code_base64, pix_qr_code_url, payment_url, status, warning_sent,
         tx_hash, end_to_end_id, created_at, expires_at, paid_at
       ) VALUES (
-        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
       )
     `);
 
@@ -132,6 +161,7 @@ export class OrderRepository {
       order.provider,
       order.providerChargeId,
       order.customerPhone,
+      order.customerJid ?? null,
       order.customerName ?? null,
       order.payerDocument ?? null,
       order.amountBrl,
@@ -142,6 +172,7 @@ export class OrderRepository {
       order.pixCopyPaste,
       order.pixQrCodeBase64 ?? null,
       order.pixQrCodeUrl ?? null,
+      order.paymentUrl ?? null,
       order.status,
       order.warningSent ? 1 : 0,
       order.txHash ?? null,
@@ -153,7 +184,9 @@ export class OrderRepository {
   }
 
   public getOrderById(id: string): PixCryptoOrder | null {
-    const row = this.db.prepare(`SELECT * FROM orders WHERE id = ?`).get(id) as Record<string, unknown> | undefined;
+    const row = this.db.prepare(`SELECT * FROM orders WHERE id = ?`).get(id) as
+      | Record<string, unknown>
+      | undefined;
     return row ? this.mapRowToOrder(row) : null;
   }
 
@@ -179,10 +212,10 @@ export class OrderRepository {
     return null;
   }
 
-  /**
-   * Busca se o cliente possui uma cobrança Pix pendente ainda dentro do prazo de validade.
-   */
-  public findActivePendingOrderByPhone(phone: string, nowIso = new Date().toISOString()): PixCryptoOrder | null {
+  public findActivePendingOrderByPhone(
+    phone: string,
+    nowIso = new Date().toISOString()
+  ): PixCryptoOrder | null {
     const row = this.db
       .prepare(`
         SELECT * FROM orders
@@ -221,6 +254,12 @@ export class OrderRepository {
     this.db.prepare(`UPDATE orders SET warning_sent = 1 WHERE id = ?`).run(orderId);
   }
 
+  public extendOrderExpiration(orderId: string, newExpiresAtIso: string): void {
+    this.db
+      .prepare(`UPDATE orders SET expires_at = ? WHERE id = ? AND expires_at < ?`)
+      .run(newExpiresAtIso, orderId, newExpiresAtIso);
+  }
+
   public updateOrderStatus(orderId: string, newStatus: OrderStatus): boolean {
     const result = this.db
       .prepare(`UPDATE orders SET status = ? WHERE id = ? AND status != ?`)
@@ -228,10 +267,6 @@ export class OrderRepository {
     return Number(result.changes) > 0;
   }
 
-  /**
-   * Atualização idempotente de liquidação: retorna true apenas se houve transição real de estado,
-   * garantindo que webhooks repetidos não enviem mensagens duplicadas no WhatsApp.
-   */
   public applySettlementUpdate(params: {
     orderId: string;
     newStatus: OrderStatus;
@@ -242,18 +277,22 @@ export class OrderRepository {
     const current = this.getOrderById(params.orderId);
     if (!current) return { changed: false, updatedOrder: null };
 
-    // Estado terminal SETTLED_CRYPTO nunca retrocede para estados intermediários
+    // Estados terminais definitivos nunca retrocedem
     if (current.status === 'SETTLED_CRYPTO') {
       return { changed: false, updatedOrder: current };
     }
     if (current.status === params.newStatus) {
       return { changed: false, updatedOrder: current };
     }
+    // Se já confirmou o pagamento do Pix, nunca volta para EXPIRED
+    if (current.status === 'PIX_CONFIRMED' && params.newStatus === 'EXPIRED') {
+      return { changed: false, updatedOrder: current };
+    }
 
     const paidAt =
       params.newStatus === 'PIX_CONFIRMED' || params.newStatus === 'SETTLED_CRYPTO'
         ? current.paidAt || new Date().toISOString()
-        : current.paidAt ?? null;
+        : (current.paidAt ?? null);
 
     this.db
       .prepare(`
@@ -294,10 +333,13 @@ export class OrderRepository {
 
     return {
       phone: String(row.phone),
+      customerJid: row.customer_jid != null ? String(row.customer_jid) : undefined,
       stage: row.stage as ChatSession['stage'],
       draftAmountBrl: row.draft_amount_brl != null ? Number(row.draft_amount_brl) : undefined,
-      draftCustomerName: row.draft_customer_name != null ? String(row.draft_customer_name) : undefined,
-      pendingNewAmountBrl: row.pending_new_amount_brl != null ? Number(row.pending_new_amount_brl) : undefined,
+      draftCustomerName:
+        row.draft_customer_name != null ? String(row.draft_customer_name) : undefined,
+      pendingNewAmountBrl:
+        row.pending_new_amount_brl != null ? Number(row.pending_new_amount_brl) : undefined,
       updatedAt: String(row.updated_at),
     };
   }
@@ -306,9 +348,10 @@ export class OrderRepository {
     this.db
       .prepare(`
         INSERT INTO chat_sessions (
-          phone, stage, draft_amount_brl, draft_customer_name, pending_new_amount_brl, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?)
+          phone, customer_jid, stage, draft_amount_brl, draft_customer_name, pending_new_amount_brl, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(phone) DO UPDATE SET
+          customer_jid = COALESCE(excluded.customer_jid, chat_sessions.customer_jid),
           stage = excluded.stage,
           draft_amount_brl = excluded.draft_amount_brl,
           draft_customer_name = excluded.draft_customer_name,
@@ -317,6 +360,7 @@ export class OrderRepository {
       `)
       .run(
         session.phone,
+        session.customerJid ?? null,
         session.stage,
         session.draftAmountBrl ?? null,
         session.draftCustomerName ?? null,
@@ -344,13 +388,24 @@ export class OrderRepository {
       );
   }
 
+  /**
+   * Retorna as `limit` mensagens MAIS RECENTES em ordem cronológica (ASC).
+   */
   public listMessages(phone?: string, limit = 100): OutgoingWhatsAppMessage[] {
     const rows = phone
       ? (this.db
-          .prepare(`SELECT * FROM whatsapp_messages WHERE phone = ? ORDER BY id ASC LIMIT ?`)
+          .prepare(`
+            SELECT * FROM (
+              SELECT * FROM whatsapp_messages WHERE phone = ? ORDER BY id DESC LIMIT ?
+            ) ORDER BY id ASC
+          `)
           .all(phone, limit) as Array<Record<string, unknown>>)
       : (this.db
-          .prepare(`SELECT * FROM whatsapp_messages ORDER BY id ASC LIMIT ?`)
+          .prepare(`
+            SELECT * FROM (
+              SELECT * FROM whatsapp_messages ORDER BY id DESC LIMIT ?
+            ) ORDER BY id ASC
+          `)
           .all(limit) as Array<Record<string, unknown>>);
 
     return rows.map((r) => ({
@@ -376,16 +431,20 @@ export class OrderRepository {
       provider: row.provider as SupportedProviderName,
       providerChargeId: String(row.provider_charge_id),
       customerPhone: String(row.customer_phone),
+      customerJid: row.customer_jid != null ? String(row.customer_jid) : undefined,
       customerName: row.customer_name != null ? String(row.customer_name) : undefined,
       payerDocument: row.payer_document != null ? String(row.payer_document) : undefined,
       amountBrl: Number(row.amount_brl),
-      estimatedCryptoAmount: row.estimated_crypto_amount != null ? Number(row.estimated_crypto_amount) : undefined,
+      estimatedCryptoAmount:
+        row.estimated_crypto_amount != null ? Number(row.estimated_crypto_amount) : undefined,
       cryptoAsset: String(row.crypto_asset),
       cryptoNetwork: String(row.crypto_network),
       walletAddress: String(row.wallet_address),
       pixCopyPaste: String(row.pix_copy_paste),
-      pixQrCodeBase64: row.pix_qr_code_base64 != null ? String(row.pix_qr_code_base64) : undefined,
+      pixQrCodeBase64:
+        row.pix_qr_code_base64 != null ? String(row.pix_qr_code_base64) : undefined,
       pixQrCodeUrl: row.pix_qr_code_url != null ? String(row.pix_qr_code_url) : undefined,
+      paymentUrl: row.payment_url != null ? String(row.payment_url) : undefined,
       status: row.status as OrderStatus,
       warningSent: Number(row.warning_sent) === 1,
       txHash: row.tx_hash != null ? String(row.tx_hash) : undefined,

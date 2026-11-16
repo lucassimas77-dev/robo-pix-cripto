@@ -1,17 +1,19 @@
 /**
  * Definições de tipos centrais do domínio de Automação Pix -> Cripto via WhatsApp
- * com foco em Privacidade, Autocustódia e Zero Identificação no Atendimento.
+ * (Modo Fixo: Zero Perguntas de Documento no WhatsApp).
  */
 
 export type OrderStatus =
   | 'PENDING'        // Aguardando pagamento do Pix dentro do prazo de validade
-  | 'PIX_CONFIRMED'  // Pix pago pelo cliente; aguardando envio on-chain da cripto
+  | 'PIX_CONFIRMED'  // Pix pago pelo cliente; em processamento/liquidação para a carteira
   | 'SETTLED_CRYPTO' // Criptomoeda liquidada direto na carteira de autocustódia
-  | 'EXPIRED'        // Prazo de validade do QR Code Pix encerrou sem pagamento
+  | 'EXPIRED'        // Prazo de validade encerrou sem pagamento
   | 'CANCELLED'      // Cancelado pelo usuário antes do pagamento
   | 'FAILED';        // Falha ou estorno na rota de liquidação
 
-export type SupportedProviderName = 'mock' | 'depixapp' | 'hodle' | 'pixgo' | 'noxpay';
+export type SupportedProviderName = 'mock' | 'depixapp' | 'hodle' | 'noxpay';
+
+export type FilterMode = 'keyword_only' | 'all';
 
 export interface PixCryptoOrder {
   id: string;
@@ -19,8 +21,9 @@ export interface PixCryptoOrder {
   provider: SupportedProviderName;
   providerChargeId: string;
   customerPhone: string;
+  customerJid?: string;
   customerName?: string;
-  payerDocument?: string; // Opcional (omitido por padrão para máxima privacidade)
+  payerDocument?: string;
   amountBrl: number;
   estimatedCryptoAmount?: number;
   cryptoAsset: string;
@@ -42,11 +45,11 @@ export interface PixCryptoOrder {
 export type ConversationStage =
   | 'IDLE'
   | 'AWAITING_AMOUNT'
-  | 'AWAITING_DOCUMENT'
   | 'AWAITING_ACTIVE_ORDER_DECISION';
 
 export interface ChatSession {
   phone: string;
+  customerJid?: string;
   stage: ConversationStage;
   draftAmountBrl?: number;
   draftCustomerName?: string;
@@ -59,7 +62,6 @@ export interface CreateChargeInput {
   amountBrl: number;
   customerPhone: string;
   customerName?: string;
-  payerDocument?: string;
   walletAddress: string;
   cryptoAsset: string;
   cryptoNetwork: string;
@@ -79,6 +81,7 @@ export interface CreateChargeOutput {
 
 export interface WebhookSettlementEvent {
   provider: SupportedProviderName;
+  eventId?: string;
   providerChargeId?: string;
   externalId?: string;
   newStatus: OrderStatus;
@@ -88,45 +91,27 @@ export interface WebhookSettlementEvent {
   rawEventName: string;
 }
 
+export interface ChargePollResult {
+  status: OrderStatus;
+  txHash?: string;
+  cryptoAmount?: number;
+  rejectionReasons?: string[];
+  activePendingExpiresAt?: string; // Caso o cliente tenha acabado de abrir um QR no link privado
+}
+
 export interface IPixCryptoProvider {
   readonly name: SupportedProviderName;
-  readonly requiresPayerDocument: boolean;
+  readonly minAmountBrl: number;
+  readonly maxAmountBrl: number;
 
-  /**
-   * Cria uma nova cobrança Pix dinâmica vinculada à conversão automática para a carteira cripto.
-   */
   createCharge(input: CreateChargeInput): Promise<CreateChargeOutput>;
-
-  /**
-   * Verifica a assinatura criptográfica (HMAC/SHA256) do webhook recebido.
-   */
-  verifyWebhookSignature(rawBody: string, headers: Record<string, string | string[] | undefined>): boolean;
-
-  /**
-   * Interpreta o payload JSON do provedor para o formato padronizado do sistema.
-   */
+  verifyWebhookSignature(
+    rawBody: string,
+    headers: Record<string, string | string[] | undefined>
+  ): boolean;
   parseWebhookPayload(payload: unknown): WebhookSettlementEvent | null;
-
-  /**
-   * Consulta ativa de status na API (permite confirmar pagamentos automaticamente
-   * mesmo sem o usuário precisar configurar URL de Webhook manualmente no provedor).
-   */
-  checkChargeStatus?(providerChargeId: string): Promise<{
-    status: OrderStatus;
-    txHash?: string;
-    cryptoAmount?: number;
-    rejectionReasons?: string[];
-  } | null>;
-
-  /**
-   * Cancela/desativa uma cobrança expirada na API remota quando aplicável.
-   */
+  checkChargeStatus(providerChargeId: string): Promise<ChargePollResult | null>;
   expireCharge?(providerChargeId: string): Promise<void>;
-
-  /**
-   * Simula pagamento no sandbox oficial do provedor (ex: chaves sk_test_).
-   */
-  simulateSandboxPayment?(providerChargeId: string): Promise<boolean>;
 }
 
 export interface RuntimeAccountSettings {
@@ -138,7 +123,9 @@ export interface RuntimeAccountSettings {
   walletNetwork: string;
   pixExpirationMinutes: number;
   adminWhatsappPhone: string;
-  requirePayerDocument?: boolean;
+  adminPinHash?: string;
+  waFilterMode?: FilterMode;
+  waAllowedTestPhone?: string;
 }
 
 export interface OutgoingWhatsAppMessage {
@@ -153,9 +140,10 @@ export interface OutgoingWhatsAppMessage {
 }
 
 export interface IWhatsAppGateway {
-  sendText(phone: string, text: string): Promise<void>;
+  sendText(phone: string, text: string, preferredJid?: string): Promise<void>;
   sendPixCharge(params: {
     phone: string;
+    preferredJid?: string;
     summaryText: string;
     pixCopyPaste: string;
     qrCodeBase64?: string;

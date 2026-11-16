@@ -4,6 +4,8 @@ import type { IWhatsAppGateway } from '../types/domain.ts';
 import { onlyDigits } from '../utils/cpfCnpjValidator.ts';
 import type { BaileysDirectManager } from './baileysManager.ts';
 
+const FETCH_TIMEOUT_MS = 15_000;
+
 export class UnifiedWhatsAppGateway implements IWhatsAppGateway {
   private readonly config: AppConfig;
   private readonly repository: OrderRepository;
@@ -15,7 +17,7 @@ export class UnifiedWhatsAppGateway implements IWhatsAppGateway {
     this.baileys = baileys;
   }
 
-  public async sendText(rawPhone: string, text: string): Promise<void> {
+  public async sendText(rawPhone: string, text: string, preferredJid?: string): Promise<void> {
     const phone = onlyDigits(rawPhone);
 
     this.repository.logMessage({
@@ -26,9 +28,8 @@ export class UnifiedWhatsAppGateway implements IWhatsAppGateway {
       createdAt: new Date().toISOString(),
     });
 
-    // Se o WhatsApp Direto via QR Code estiver conectado, envia no WhatsApp real automaticamente!
     if (this.baileys?.isConnected()) {
-      await this.baileys.sendText(phone, text);
+      await this.baileys.sendText(phone, text, preferredJid);
       return;
     }
 
@@ -41,6 +42,7 @@ export class UnifiedWhatsAppGateway implements IWhatsAppGateway {
 
   public async sendPixCharge(params: {
     phone: string;
+    preferredJid?: string;
     summaryText: string;
     pixCopyPaste: string;
     qrCodeBase64?: string;
@@ -66,21 +68,25 @@ export class UnifiedWhatsAppGateway implements IWhatsAppGateway {
       createdAt: new Date().toISOString(),
     });
 
-    // Envio direto no WhatsApp real quando conectado por QR Code!
     if (this.baileys?.isConnected()) {
       if (params.qrCodeBase64) {
-        await this.baileys.sendImageWithCaption(phone, params.qrCodeBase64, params.summaryText);
+        await this.baileys.sendImageWithCaption(
+          phone,
+          params.qrCodeBase64,
+          params.summaryText,
+          params.preferredJid
+        );
       } else {
-        await this.baileys.sendText(phone, params.summaryText);
+        await this.baileys.sendText(phone, params.summaryText, params.preferredJid);
       }
-      await this.baileys.sendText(phone, params.pixCopyPaste);
+      await this.baileys.sendText(phone, params.pixCopyPaste, params.preferredJid);
       return;
     }
 
     if (this.config.whatsappMode === 'meta') {
       await this.sendViaMetaText(phone, params.summaryText);
       if (params.qrCodeUrl) {
-        await this.sendViaMetaImage(phone, params.qrCodeUrl, 'Escaneie o QR Code Pix acima');
+        await this.sendViaMetaImage(phone, params.qrCodeUrl, 'Escaneie o QR Code acima');
       }
       await this.sendViaMetaText(phone, params.pixCopyPaste);
     } else if (this.config.whatsappMode === 'evolution') {
@@ -95,10 +101,7 @@ export class UnifiedWhatsAppGateway implements IWhatsAppGateway {
 
   private async sendViaMetaText(phone: string, body: string): Promise<void> {
     const { token, phoneNumberId } = this.config.metaWhatsapp;
-    if (!token || !phoneNumberId) {
-      console.warn('[WhatsApp Meta] Token ou Phone Number ID ausente no .env.');
-      return;
-    }
+    if (!token || !phoneNumberId) return;
 
     const res = await fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
       method: 'POST',
@@ -113,11 +116,12 @@ export class UnifiedWhatsAppGateway implements IWhatsAppGateway {
         type: 'text',
         text: { preview_url: false, body },
       }),
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
 
     if (!res.ok) {
       const err = await res.text();
-      console.error(`[WhatsApp Meta] Erro ao enviar texto (HTTP ${res.status}): ${err}`);
+      console.error(`[WhatsApp Meta] Erro HTTP ${res.status}: ${err}`);
     }
   }
 
@@ -138,15 +142,13 @@ export class UnifiedWhatsAppGateway implements IWhatsAppGateway {
         type: 'image',
         image: { link: imageUrl, caption },
       }),
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
   }
 
   private async sendViaEvolutionText(phone: string, text: string): Promise<void> {
     const { apiUrl, apiKey, instanceName } = this.config.evolutionWhatsapp;
-    if (!apiKey) {
-      console.warn('[WhatsApp Evolution] EVOLUTION_API_KEY ausente no .env.');
-      return;
-    }
+    if (!apiKey) return;
 
     const res = await fetch(`${apiUrl}/message/sendText/${encodeURIComponent(instanceName)}`, {
       method: 'POST',
@@ -154,15 +156,13 @@ export class UnifiedWhatsAppGateway implements IWhatsAppGateway {
         apikey: apiKey,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        number: phone,
-        text,
-      }),
+      body: JSON.stringify({ number: phone, text }),
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
 
     if (!res.ok) {
       const err = await res.text();
-      console.error(`[WhatsApp Evolution] Erro ao enviar texto (HTTP ${res.status}): ${err}`);
+      console.error(`[WhatsApp Evolution] Erro HTTP ${res.status}: ${err}`);
     }
   }
 
@@ -190,6 +190,7 @@ export class UnifiedWhatsAppGateway implements IWhatsAppGateway {
         media: cleanBase64,
         fileName: 'qrcode-pix.png',
       }),
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
   }
 }
