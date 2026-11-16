@@ -205,7 +205,13 @@ export function renderDashboardHtml(): string {
       if (acc.apiKeyPreview) {
         apiKeyEl.placeholder = 'Salva (' + acc.apiKeyPreview + ') - digite p/ trocar';
       }
-      accBadge.textContent = acc.provider === 'mock' ? 'MODO DEMONSTRAÇÃO' : ('CONTA ATIVA: ' + acc.provider.toUpperCase());
+      if (acc.provider === 'mock') {
+        accBadge.textContent = 'MODO TESTE (SEM CARTEIRA)';
+      } else if (!acc.hasApiKey) {
+        accBadge.textContent = 'AGUARDANDO COLAR CHAVE API';
+      } else {
+        accBadge.textContent = '✅ CONTA REAL ATIVA (' + acc.provider.toUpperCase() + ')';
+      }
     }
 
     async function saveAccount() {

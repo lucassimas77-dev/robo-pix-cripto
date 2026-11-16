@@ -50,11 +50,11 @@ export interface AppConfig {
 }
 
 export function loadConfig(): AppConfig {
-  const providerRaw = (process.env.CRYPTO_PROVIDER || 'mock').toLowerCase();
+  const providerRaw = (process.env.CRYPTO_PROVIDER || 'depixapp').toLowerCase();
   const validProviders: SupportedProviderName[] = ['mock', 'depixapp', 'hodle', 'pixgo', 'noxpay'];
   const cryptoProvider: SupportedProviderName = validProviders.includes(providerRaw as SupportedProviderName)
     ? (providerRaw as SupportedProviderName)
-    : 'mock';
+    : 'depixapp';
 
   const waModeRaw = (process.env.WHATSAPP_MODE || 'simulator').toLowerCase();
   const validWaModes: WhatsAppMode[] = ['simulator', 'meta', 'evolution'];
