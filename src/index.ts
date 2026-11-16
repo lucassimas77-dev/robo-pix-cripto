@@ -65,7 +65,19 @@ async function bootstrap(): Promise<void> {
     console.log('===================================================================');
   });
 
+  // Mantém a instância gratuita acordada 24h fazendo ping externo periódico em /health
+  const externalKeepAliveUrl = process.env.RENDER_EXTERNAL_URL;
+  let keepAliveTimer: NodeJS.Timeout | undefined;
+  if (externalKeepAliveUrl) {
+    const cleanUrl = externalKeepAliveUrl.replace(/\/+$/, '');
+    keepAliveTimer = setInterval(() => {
+      fetch(`${cleanUrl}/health`).catch(() => {});
+    }, 10 * 60 * 1000);
+    keepAliveTimer.unref();
+  }
+
   const shutdown = () => {
+    if (keepAliveTimer) clearInterval(keepAliveTimer);
     expirationWatcher.stop();
     void baileysManager.disconnect(false);
     server.close(() => {
