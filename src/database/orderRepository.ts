@@ -474,7 +474,12 @@ export class OrderRepository {
     };
   }
 
-  public saveSession(session: ChatSession): void {
+  public saveSession(session: ChatSession, preserveProvidedUpdatedAt = false): void {
+    const effectiveUpdatedAt =
+      preserveProvidedUpdatedAt && session.updatedAt
+        ? (normalizeUtcIsoTimestamp(session.updatedAt) ?? new Date().toISOString())
+        : new Date().toISOString();
+
     this.db
       .prepare(`
         INSERT INTO chat_sessions (
@@ -495,7 +500,7 @@ export class OrderRepository {
         session.draftAmountBrl ?? null,
         session.draftCustomerName ?? null,
         session.pendingNewAmountBrl ?? null,
-        new Date().toISOString()
+        effectiveUpdatedAt
       );
   }
 

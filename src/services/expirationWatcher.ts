@@ -7,6 +7,7 @@ const MAX_API_POLLS_PER_SWEEP = 2;
 const MAX_TOTAL_API_CALLS_PER_SWEEP = 5; // Teto global estrito (máx 20 req/min < 30 req/min da DePix App)
 const PENDING_POLL_COOLDOWN_MS = 14_000;
 const CONFIRMED_POLL_COOLDOWN_MS = 120_000;
+const DECISION_MENU_TTL_MS = 5 * 60_000;
 
 export class ExpirationWatcher {
   private timer: NodeJS.Timeout | null = null;
@@ -224,11 +225,15 @@ export class ExpirationWatcher {
             }
           }
 
-          const effectiveNowIso = new Date(
-            nowMs + Math.max(0, Date.now() - sweepStartedMs)
-          ).toISOString();
-          const updated = this.repository.updateOrderStatus(order.id, 'EXPIRED', effectiveNowIso);
-          if (updated) {
+          const runForPhone = <T>(fn: () => Promise<T>): Promise<T> =>
+            this.engine ? this.engine.runWithPhoneLock(order.customerPhone, fn) : fn();
+
+          await runForPhone(async () => {
+            const effectiveNowMs = nowMs + Math.max(0, Date.now() - sweepStartedMs);
+            const effectiveNowIso = new Date(effectiveNowMs).toISOString();
+            const updated = this.repository.updateOrderStatus(order.id, 'EXPIRED', effectiveNowIso);
+            if (!updated) return;
+
             expiredCount++;
             if (needsRemoteDeactivate && provider?.expireCharge) {
               if (apiCallsUsed < MAX_TOTAL_API_CALLS_PER_SWEEP) {
@@ -240,7 +245,7 @@ export class ExpirationWatcher {
               }
             }
 
-            // Se o cliente já gerou outra cobrança mais recente (ativa ou já paga), não sobrescreve sessão nem manda falso aviso de expiração!
+            // Se o cliente já gerou outra cobrança mais recente (inclusive se acabou de finalizar no phoneLock!), suprime o aviso antigo!
             const otherActive = this.repository.findActivePendingOrderByPhone(
               order.customerPhone,
               effectiveNowIso
@@ -256,15 +261,23 @@ export class ExpirationWatcher {
 
             if (!hasNewerOrder) {
               const sess = this.repository.getSession(order.customerPhone);
-              const hadDecisionMenu = sess.stage === 'AWAITING_ACTIVE_ORDER_DECISION';
-              this.repository.saveSession({
-                phone: order.customerPhone,
-                customerJid: order.customerJid ?? sess.customerJid,
-                stage: 'AWAITING_AMOUNT',
-                draftAmountBrl: hadDecisionMenu ? -1 : undefined,
-                pendingNewAmountBrl: hadDecisionMenu ? sess.pendingNewAmountBrl : undefined,
-                updatedAt: effectiveNowIso,
-              });
+              const menuAgeMs = effectiveNowMs - new Date(sess.updatedAt).getTime();
+              const menuFresh =
+                sess.stage === 'AWAITING_ACTIVE_ORDER_DECISION' &&
+                Number.isFinite(menuAgeMs) &&
+                menuAgeMs <= DECISION_MENU_TTL_MS;
+
+              this.repository.saveSession(
+                {
+                  phone: order.customerPhone,
+                  customerJid: order.customerJid ?? sess.customerJid,
+                  stage: 'AWAITING_AMOUNT',
+                  draftAmountBrl: menuFresh ? -1 : undefined,
+                  pendingNewAmountBrl: menuFresh ? sess.pendingNewAmountBrl : undefined,
+                  updatedAt: menuFresh ? sess.updatedAt : effectiveNowIso,
+                },
+                true
+              );
 
               try {
                 await this.whatsapp.sendText(
@@ -277,21 +290,26 @@ export class ExpirationWatcher {
                 console.error('[ExpirationWatcher] Erro ao notificar expiração:', err);
               }
             }
-          }
+          });
         } else if (!order.warningSent && diffMs <= this.warningBeforeMinutes * 60_000) {
-          if (this.repository.markWarningSent(order.id)) {
-            warnedCount++;
-            const minsLeft = Math.max(1, Math.ceil(diffMs / 60_000));
-            try {
-              await this.whatsapp.sendText(
-                order.customerPhone,
-                `⏳ *Lembrete:* Sua cobrança Pix de *${formatBrl(order.amountBrl)}* vence em *${minsLeft} min*.`,
-                order.customerJid
-              );
-            } catch (err) {
-              console.error('[ExpirationWatcher] Erro ao notificar aviso prévio:', err);
+          const runWarn = <T>(fn: () => Promise<T>): Promise<T> =>
+            this.engine ? this.engine.runWithPhoneLock(order.customerPhone, fn) : fn();
+
+          await runWarn(async () => {
+            if (this.repository.markWarningSent(order.id)) {
+              warnedCount++;
+              const minsLeft = Math.max(1, Math.ceil(diffMs / 60_000));
+              try {
+                await this.whatsapp.sendText(
+                  order.customerPhone,
+                  `⏳ *Lembrete:* Sua cobrança Pix de *${formatBrl(order.amountBrl)}* vence em *${minsLeft} min*.`,
+                  order.customerJid
+                );
+              } catch (err) {
+                console.error('[ExpirationWatcher] Erro ao notificar aviso prévio:', err);
+              }
             }
-          }
+          });
         }
       }
 

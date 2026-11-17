@@ -20,12 +20,15 @@ import {
   parseBrlAmountFromText,
 } from '../utils/cpfCnpjValidator.ts';
 
+const SESSION_TTL_MS = 2 * 60 * 60_000; // 2 horas para sessão geral
+const DECISION_MENU_TTL_MS = 5 * 60_000; // 5 minutos para decisão do menu 1 / 2
+
 export class ConversationEngine {
   private config: AppConfig;
   private readonly repository: OrderRepository;
   private cryptoProvider: IPixCryptoProvider;
   private readonly whatsapp: IWhatsAppGateway;
-  private readonly phoneLocks = new Map<string, Promise<void>>();
+  private readonly phoneLocks = new Map<string, Promise<unknown>>();
 
   constructor(
     config: AppConfig,
@@ -73,6 +76,26 @@ export class ConversationEngine {
       });
   }
 
+  /**
+   * Serializa operações concorrentes (mensagens recebidas, webhooks e expiração) por telefone do cliente.
+   */
+  public async runWithPhoneLock<T>(rawPhone: string, taskFn: () => Promise<T>): Promise<T> {
+    const phone = onlyDigits(rawPhone);
+    if (!phone) return taskFn();
+
+    const prevLock = this.phoneLocks.get(phone) ?? Promise.resolve();
+    const currentTask = prevLock.catch(() => {}).then(taskFn);
+
+    this.phoneLocks.set(phone, currentTask);
+    try {
+      return await currentTask;
+    } finally {
+      if (this.phoneLocks.get(phone) === currentTask) {
+        this.phoneLocks.delete(phone);
+      }
+    }
+  }
+
   public async handleIncomingMessage(params: {
     phone: string;
     customerJid?: string;
@@ -82,19 +105,9 @@ export class ConversationEngine {
     const phone = onlyDigits(params.phone);
     if (!phone || !params.text.trim()) return;
 
-    const prevLock = this.phoneLocks.get(phone) ?? Promise.resolve();
-    const currentTask = prevLock
-      .catch(() => {})
-      .then(() => this.processSerializedMessage(phone, params.text.trim(), params.customerJid));
-
-    this.phoneLocks.set(phone, currentTask);
-    try {
-      await currentTask;
-    } finally {
-      if (this.phoneLocks.get(phone) === currentTask) {
-        this.phoneLocks.delete(phone);
-      }
-    }
+    await this.runWithPhoneLock(phone, () =>
+      this.processSerializedMessage(phone, params.text.trim(), params.customerJid)
+    );
   }
 
   private async processSerializedMessage(
@@ -113,6 +126,26 @@ export class ConversationEngine {
     const session = this.repository.getSession(phone);
     if (customerJid) {
       session.customerJid = customerJid;
+    }
+
+    // Expira estados residuais de sessão / menu 1-2 por TTL para não resgatar valores antigos horas depois!
+    const sessionAgeMs = Date.now() - new Date(session.updatedAt).getTime();
+    if (!Number.isFinite(sessionAgeMs) || sessionAgeMs > SESSION_TTL_MS) {
+      session.stage = 'IDLE';
+      session.pendingNewAmountBrl = undefined;
+      session.draftAmountBrl = undefined;
+    } else if (
+      sessionAgeMs > DECISION_MENU_TTL_MS &&
+      (session.stage === 'AWAITING_ACTIVE_ORDER_DECISION' ||
+        session.draftAmountBrl === -1 ||
+        session.pendingNewAmountBrl !== undefined)
+    ) {
+      if (session.stage === 'AWAITING_ACTIVE_ORDER_DECISION') {
+        session.stage = 'AWAITING_AMOUNT';
+      }
+      session.pendingNewAmountBrl = undefined;
+      session.draftAmountBrl = undefined;
+      this.repository.saveSession(session);
     }
 
     // 1. Comando de encerrar atendimento (volta para IDLE)
@@ -270,29 +303,31 @@ export class ConversationEngine {
           await this.proceedWithAmount(phone, menuReply.inlineNewAmountBrl, session.customerJid);
           return;
         }
-        if (menuReply.choice === 'new' && prevPendingAmt) {
+        // Só reaproveita valor anterior se o cliente respondeu explicitamente à opção 2 do menu ("2", "2)", "opção 2")
+        if (menuReply.explicitOptionDigit === '2' && prevPendingAmt) {
           await this.proceedWithAmount(phone, prevPendingAmt, session.customerJid);
           return;
         }
-
-        await this.safeSendText(
-          phone,
-          '⏰ A cobrança anterior já expirou! Qual o *valor em Reais* que deseja gerar agora? _(Ex: 50,00)_',
-          session.customerJid
-        );
-        return;
-      }
-
-      if (menuReply.choice === 'resend') {
+        if (
+          menuReply.explicitOptionDigit === '1' ||
+          menuReply.explicitOptionDigit === '2' ||
+          menuReply.choice === 'resend'
+        ) {
+          await this.safeSendText(
+            phone,
+            '⏰ A cobrança anterior já expirou! Qual o *valor em Reais* que deseja gerar agora? _(Ex: 50,00)_',
+            session.customerJid
+          );
+          return;
+        }
+      } else if (menuReply.choice === 'resend') {
         session.stage = 'IDLE';
         session.pendingNewAmountBrl = undefined;
         session.draftAmountBrl = undefined;
         this.repository.saveSession(session);
         await this.resendActiveOrder(active);
         return;
-      }
-
-      if (menuReply.choice === 'new') {
+      } else if (menuReply.choice === 'new') {
         this.repository.updateOrderStatus(active.id, 'CANCELLED');
         this.deactivateOrderRemotely(active);
 
@@ -314,24 +349,24 @@ export class ConversationEngine {
           session.customerJid
         );
         return;
+      } else {
+        const newCandidateAmount = menuReply.inlineNewAmountBrl;
+        if (newCandidateAmount !== null) {
+          session.pendingNewAmountBrl = newCandidateAmount;
+          this.repository.saveSession(session);
+        }
+        const effectiveCandidate = newCandidateAmount ?? session.pendingNewAmountBrl;
+        const remainingMin = Math.max(
+          1,
+          Math.ceil((new Date(active.expiresAt).getTime() - Date.now()) / 60_000)
+        );
+        await this.safeSendText(
+          phone,
+          `⚠️ Você já tem uma cobrança Pix ativa de *${formatBrl(active.amountBrl)}* (vence em ${remainingMin} min).\n\nResponda apenas:\n*1* - Reenviar a cobrança atual\n*2* - Cancelar a atual e gerar ${effectiveCandidate ? formatBrl(effectiveCandidate) : 'um novo valor'}`,
+          session.customerJid
+        );
+        return;
       }
-
-      const newCandidateAmount = menuReply.inlineNewAmountBrl;
-      if (newCandidateAmount !== null) {
-        session.pendingNewAmountBrl = newCandidateAmount;
-        this.repository.saveSession(session);
-      }
-      const effectiveCandidate = newCandidateAmount ?? session.pendingNewAmountBrl;
-      const remainingMin = Math.max(
-        1,
-        Math.ceil((new Date(active.expiresAt).getTime() - Date.now()) / 60_000)
-      );
-      await this.safeSendText(
-        phone,
-        `⚠️ Você já tem uma cobrança Pix ativa de *${formatBrl(active.amountBrl)}* (vence em ${remainingMin} min).\n\nResponda apenas:\n*1* - Reenviar a cobrança atual\n*2* - Cancelar a atual e gerar ${effectiveCandidate ? formatBrl(effectiveCandidate) : 'um novo valor'}`,
-        session.customerJid
-      );
-      return;
     }
 
     const activeOrder = this.repository.findActivePendingOrderByPhone(phone);
@@ -367,7 +402,8 @@ export class ConversationEngine {
       session.pendingNewAmountBrl = undefined;
       this.repository.saveSession(session);
 
-      if (menuAfterExp.choice === 'new') {
+      // Somente consome `savedPendingAmt` se o cliente clicou/digitou explicitamente a opção numérica `2` (ou informou valor inline)
+      if (menuAfterExp.explicitOptionDigit === '2') {
         const targetAmt = menuAfterExp.inlineNewAmountBrl ?? savedPendingAmt;
         if (targetAmt) {
           await this.proceedWithAmount(phone, targetAmt, session.customerJid);
@@ -381,7 +417,10 @@ export class ConversationEngine {
         return;
       }
 
-      if (menuAfterExp.choice === 'resend' && hadExpiredMenu) {
+      if (
+        hadExpiredMenu &&
+        (menuAfterExp.explicitOptionDigit === '1' || menuAfterExp.choice === 'resend')
+      ) {
         await this.safeSendText(
           phone,
           '⏰ A cobrança anterior já expirou! Qual o *valor em Reais* que deseja gerar agora? _(Ex: 50,00)_',
@@ -628,147 +667,168 @@ export class ConversationEngine {
       return { matched: false, changed: false };
     }
 
-    const { changed, updatedOrder } = this.repository.applySettlementUpdate({
-      orderId: existing.id,
-      eventId: event.eventId,
-      newStatus: event.newStatus,
-      txHash: event.txHash,
-      endToEndId: event.endToEndId,
-      cryptoAmount: event.cryptoAmount,
-    });
+    return this.runWithPhoneLock(existing.customerPhone, async () => {
+      const { changed, updatedOrder } = this.repository.applySettlementUpdate({
+        orderId: existing.id,
+        eventId: event.eventId,
+        newStatus: event.newStatus,
+        txHash: event.txHash,
+        endToEndId: event.endToEndId,
+        cryptoAmount: event.cryptoAmount,
+      });
 
-    if (!changed || !updatedOrder) {
-      return { matched: true, changed: false, order: existing };
-    }
+      if (!changed || !updatedOrder) {
+        return { matched: true, changed: false, order: existing };
+      }
 
-    if (updatedOrder.status === 'PIX_CONFIRMED' || updatedOrder.status === 'SETTLED_CRYPTO') {
-      const otherActive = this.repository.findActivePendingOrderByPhone(updatedOrder.customerPhone);
-      if (!otherActive) {
-        const sess = this.repository.getSession(updatedOrder.customerPhone);
-        if (sess.stage === 'AWAITING_ACTIVE_ORDER_DECISION' || sess.pendingNewAmountBrl !== undefined) {
-          this.repository.saveSession({
-            phone: updatedOrder.customerPhone,
-            customerJid: updatedOrder.customerJid ?? sess.customerJid,
-            stage: 'IDLE',
-            updatedAt: new Date().toISOString(),
-          });
+      if (updatedOrder.status === 'PIX_CONFIRMED' || updatedOrder.status === 'SETTLED_CRYPTO') {
+        const otherActive = this.repository.findActivePendingOrderByPhone(
+          updatedOrder.customerPhone
+        );
+        if (!otherActive) {
+          const sess = this.repository.getSession(updatedOrder.customerPhone);
+          if (
+            sess.stage === 'AWAITING_ACTIVE_ORDER_DECISION' ||
+            sess.pendingNewAmountBrl !== undefined
+          ) {
+            this.repository.saveSession({
+              phone: updatedOrder.customerPhone,
+              customerJid: updatedOrder.customerJid ?? sess.customerJid,
+              stage: 'IDLE',
+              updatedAt: new Date().toISOString(),
+            });
+          }
         }
       }
-    }
 
-    if (updatedOrder.status === 'PIX_CONFIRMED') {
-      await this.safeSendText(
-        updatedOrder.customerPhone,
-        `🎉 *Pagamento Pix de ${formatBrl(updatedOrder.amountBrl)} recebido!*\n\n` +
-          `🧾 *Protocolo:* \`${updatedOrder.externalId}\`\n` +
-          `Seu pagamento já foi registrado pela processadora e está em liquidação para a carteira.`,
-        updatedOrder.customerJid
-      );
-
-      if (
-        this.config.adminWhatsappPhone &&
-        this.config.adminWhatsappPhone !== updatedOrder.customerPhone
-      ) {
+      if (updatedOrder.status === 'PIX_CONFIRMED') {
         await this.safeSendText(
-          this.config.adminWhatsappPhone,
-          `💰 *Pix Pago pelo Cliente!* (${formatBrl(updatedOrder.amountBrl)})\n` +
-            `Protocolo: \`${updatedOrder.externalId}\` — Aguardando liquidação on-chain (${updatedOrder.cryptoAsset}/${updatedOrder.cryptoNetwork}).`
+          updatedOrder.customerPhone,
+          `🎉 *Pagamento Pix de ${formatBrl(updatedOrder.amountBrl)} recebido!*\n\n` +
+            `🧾 *Protocolo:* \`${updatedOrder.externalId}\`\n` +
+            `Seu pagamento já foi registrado pela processadora e está em liquidação para a carteira.`,
+          updatedOrder.customerJid
         );
-      }
-    } else if (updatedOrder.status === 'SETTLED_CRYPTO') {
-      await this.safeSendText(
-        updatedOrder.customerPhone,
-        `✅ *Pagamento de ${formatBrl(updatedOrder.amountBrl)} Confirmado!*\n\n` +
-          `🧾 *Protocolo:* \`${updatedOrder.externalId}\`\n` +
-          `Obrigado!`,
-        updatedOrder.customerJid
-      );
 
-      if (
-        this.config.adminWhatsappPhone &&
-        this.config.adminWhatsappPhone !== updatedOrder.customerPhone
-      ) {
-        const cryptoAmt = updatedOrder.estimatedCryptoAmount
-          ? `${updatedOrder.estimatedCryptoAmount} ${updatedOrder.cryptoAsset}`
-          : updatedOrder.cryptoAsset;
-        const hashLine = updatedOrder.txHash ? `\n🔗 *TxHash:* \`${updatedOrder.txHash}\`` : '';
-
+        if (
+          this.config.adminWhatsappPhone &&
+          this.config.adminWhatsappPhone !== updatedOrder.customerPhone
+        ) {
+          await this.safeSendText(
+            this.config.adminWhatsappPhone,
+            `💰 *Pix Pago pelo Cliente!* (${formatBrl(updatedOrder.amountBrl)})\n` +
+              `Protocolo: \`${updatedOrder.externalId}\` — Aguardando liquidação on-chain (${updatedOrder.cryptoAsset}/${updatedOrder.cryptoNetwork}).`
+          );
+        }
+      } else if (updatedOrder.status === 'SETTLED_CRYPTO') {
         await this.safeSendText(
-          this.config.adminWhatsappPhone,
-          `🚀 *Cripto Liquidada Direto na Carteira!*\n\n` +
-            `💵 *Pix Pago:* ${formatBrl(updatedOrder.amountBrl)}\n` +
-            `🪙 *Recebido:* ~${cryptoAmt} (${updatedOrder.cryptoNetwork})` +
-            hashLine
-        );
-      }
-    } else if (updatedOrder.status === 'FAILED') {
-      this.deactivateOrderRemotely(updatedOrder);
-
-      const otherActive = this.repository.findActivePendingOrderByPhone(updatedOrder.customerPhone);
-      if (!otherActive) {
-        const sess = this.repository.getSession(updatedOrder.customerPhone);
-        const hadDecisionMenu = sess.stage === 'AWAITING_ACTIVE_ORDER_DECISION';
-        this.repository.saveSession({
-          phone: updatedOrder.customerPhone,
-          customerJid: updatedOrder.customerJid ?? sess.customerJid,
-          stage: 'AWAITING_AMOUNT',
-          draftAmountBrl: hadDecisionMenu ? -1 : undefined,
-          pendingNewAmountBrl: hadDecisionMenu ? sess.pendingNewAmountBrl : undefined,
-          updatedAt: new Date().toISOString(),
-        });
-      }
-
-      await this.safeSendText(
-        updatedOrder.customerPhone,
-        `⚠️ O pagamento da cobrança *${updatedOrder.externalId}* foi cancelado ou estornado pela processadora. Para gerar uma nova cobrança, envie o valor desejado.`,
-        updatedOrder.customerJid
-      );
-
-      if (
-        this.config.adminWhatsappPhone &&
-        this.config.adminWhatsappPhone !== updatedOrder.customerPhone
-      ) {
-        await this.safeSendText(
-          this.config.adminWhatsappPhone,
-          `❌ *Atenção: Pagamento Estornado/Cancelado!* (${formatBrl(updatedOrder.amountBrl)})\n` +
-            `Protocolo: \`${updatedOrder.externalId}\` — A processadora recusou/estornou o pagamento.`
-        );
-      }
-    } else if (updatedOrder.status === 'EXPIRED') {
-      this.deactivateOrderRemotely(updatedOrder);
-
-      const otherActive = this.repository.findActivePendingOrderByPhone(updatedOrder.customerPhone);
-      const mostRecent = this.repository.findMostRecentOrderByPhone(updatedOrder.customerPhone);
-      const hasNewerOrder =
-        Boolean(otherActive) ||
-        Boolean(
-          mostRecent &&
-            mostRecent.id !== updatedOrder.id &&
-            mostRecent.createdAt >= updatedOrder.createdAt
+          updatedOrder.customerPhone,
+          `✅ *Pagamento de ${formatBrl(updatedOrder.amountBrl)} Confirmado!*\n\n` +
+            `🧾 *Protocolo:* \`${updatedOrder.externalId}\`\n` +
+            `Obrigado!`,
+          updatedOrder.customerJid
         );
 
-      if (!hasNewerOrder) {
-        const sess = this.repository.getSession(updatedOrder.customerPhone);
-        const hadDecisionMenu = sess.stage === 'AWAITING_ACTIVE_ORDER_DECISION';
-        this.repository.saveSession({
-          phone: updatedOrder.customerPhone,
-          customerJid: updatedOrder.customerJid ?? sess.customerJid,
-          stage: 'AWAITING_AMOUNT',
-          draftAmountBrl: hadDecisionMenu ? -1 : undefined,
-          pendingNewAmountBrl: hadDecisionMenu ? sess.pendingNewAmountBrl : undefined,
-          updatedAt: new Date().toISOString(),
-        });
+        if (
+          this.config.adminWhatsappPhone &&
+          this.config.adminWhatsappPhone !== updatedOrder.customerPhone
+        ) {
+          const cryptoAmt = updatedOrder.estimatedCryptoAmount
+            ? `${updatedOrder.estimatedCryptoAmount} ${updatedOrder.cryptoAsset}`
+            : updatedOrder.cryptoAsset;
+          const hashLine = updatedOrder.txHash ? `\n🔗 *TxHash:* \`${updatedOrder.txHash}\`` : '';
+
+          await this.safeSendText(
+            this.config.adminWhatsappPhone,
+            `🚀 *Cripto Liquidada Direto na Carteira!*\n\n` +
+              `💵 *Pix Pago:* ${formatBrl(updatedOrder.amountBrl)}\n` +
+              `🪙 *Recebido:* ~${cryptoAmt} (${updatedOrder.cryptoNetwork})` +
+              hashLine
+          );
+        }
+      } else if (updatedOrder.status === 'FAILED') {
+        this.deactivateOrderRemotely(updatedOrder);
+
+        const otherActive = this.repository.findActivePendingOrderByPhone(
+          updatedOrder.customerPhone
+        );
+        if (!otherActive) {
+          const sess = this.repository.getSession(updatedOrder.customerPhone);
+          const menuFresh =
+            sess.stage === 'AWAITING_ACTIVE_ORDER_DECISION' &&
+            Date.now() - new Date(sess.updatedAt).getTime() <= DECISION_MENU_TTL_MS;
+          this.repository.saveSession(
+            {
+              phone: updatedOrder.customerPhone,
+              customerJid: updatedOrder.customerJid ?? sess.customerJid,
+              stage: 'AWAITING_AMOUNT',
+              draftAmountBrl: menuFresh ? -1 : undefined,
+              pendingNewAmountBrl: menuFresh ? sess.pendingNewAmountBrl : undefined,
+              updatedAt: menuFresh ? sess.updatedAt : new Date().toISOString(),
+            },
+            menuFresh
+          );
+        }
 
         await this.safeSendText(
           updatedOrder.customerPhone,
-          `⏰ *Atenção: A cobrança Pix de ${formatBrl(updatedOrder.amountBrl)} expirou.*\n\n` +
-            `Não realize o pagamento em link/código vencido. Se quiser pagar agora, basta enviar o valor (*${updatedOrder.amountBrl.toFixed(2).replace('.', ',')}*) que gero uma nova na hora!`,
+          `⚠️ O pagamento da cobrança *${updatedOrder.externalId}* foi cancelado ou estornado pela processadora. Para gerar uma nova cobrança, envie o valor desejado.`,
           updatedOrder.customerJid
         );
-      }
-    }
 
-    return { matched: true, changed: true, order: updatedOrder };
+        if (
+          this.config.adminWhatsappPhone &&
+          this.config.adminWhatsappPhone !== updatedOrder.customerPhone
+        ) {
+          await this.safeSendText(
+            this.config.adminWhatsappPhone,
+            `❌ *Atenção: Pagamento Estornado/Cancelado!* (${formatBrl(updatedOrder.amountBrl)})\n` +
+              `Protocolo: \`${updatedOrder.externalId}\` — A processadora recusou/estornou o pagamento.`
+          );
+        }
+      } else if (updatedOrder.status === 'EXPIRED') {
+        this.deactivateOrderRemotely(updatedOrder);
+
+        const otherActive = this.repository.findActivePendingOrderByPhone(
+          updatedOrder.customerPhone
+        );
+        const mostRecent = this.repository.findMostRecentOrderByPhone(updatedOrder.customerPhone);
+        const hasNewerOrder =
+          Boolean(otherActive) ||
+          Boolean(
+            mostRecent &&
+              mostRecent.id !== updatedOrder.id &&
+              mostRecent.createdAt >= updatedOrder.createdAt
+          );
+
+        if (!hasNewerOrder) {
+          const sess = this.repository.getSession(updatedOrder.customerPhone);
+          const menuFresh =
+            sess.stage === 'AWAITING_ACTIVE_ORDER_DECISION' &&
+            Date.now() - new Date(sess.updatedAt).getTime() <= DECISION_MENU_TTL_MS;
+          this.repository.saveSession(
+            {
+              phone: updatedOrder.customerPhone,
+              customerJid: updatedOrder.customerJid ?? sess.customerJid,
+              stage: 'AWAITING_AMOUNT',
+              draftAmountBrl: menuFresh ? -1 : undefined,
+              pendingNewAmountBrl: menuFresh ? sess.pendingNewAmountBrl : undefined,
+              updatedAt: menuFresh ? sess.updatedAt : new Date().toISOString(),
+            },
+            menuFresh
+          );
+
+          await this.safeSendText(
+            updatedOrder.customerPhone,
+            `⏰ *Atenção: A cobrança Pix de ${formatBrl(updatedOrder.amountBrl)} expirou.*\n\n` +
+              `Não realize o pagamento em link/código vencido. Se quiser pagar agora, basta enviar o valor (*${updatedOrder.amountBrl.toFixed(2).replace('.', ',')}*) que gero uma nova na hora!`,
+            updatedOrder.customerJid
+          );
+        }
+      }
+
+      return { matched: true, changed: true, order: updatedOrder };
+    });
   }
 
   private async safeSendText(phone: string, text: string, preferredJid?: string): Promise<void> {

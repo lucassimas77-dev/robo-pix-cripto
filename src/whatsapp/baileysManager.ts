@@ -192,8 +192,10 @@ export class BaileysDirectManager {
           const { connection, lastDisconnect, qr } = update;
 
           if (qr) {
+            this.hadOpenSession = false;
+            this.connectedPhone = undefined;
             this.unscannedQrCount++;
-            if (!this.hadOpenSession && this.unscannedQrCount > MAX_UNSCANNED_QR_CYCLES) {
+            if (this.unscannedQrCount > MAX_UNSCANNED_QR_CYCLES) {
               this.intentionalStop = true;
               try {
                 sock.end(undefined);

@@ -84,6 +84,16 @@ test('Parsing monetário trata pontuação final, milhar, horários, telefones, 
   assert.equal(parseBrlAmountFromText('O pix é de R$ 50 ou R$ 100?'), null);
   assert.equal(parseBrlAmountFromText('50 reais ou 80 reais?'), null);
   assert.equal(parseBrlAmountFromText('Pix de R$ 50 ou 100?'), null);
+  assert.equal(parseBrlAmountFromText('pix de R$ 50 agora ou 100 amanhã?'), null);
+  assert.equal(parseBrlAmountFromText('pix de R$ 50 + 30'), null);
+  assert.equal(parseBrlAmountFromText('meu zap é 11 98888-7777 quero fazer um pix'), null);
+  assert.equal(parseBrlAmountFromText('meu cel 21 98888-7777 manda pix'), null);
+  assert.equal(parseBrlAmountFromText('meu email é lucas2025@hotmail.com manda um pix'), null);
+  assert.equal(parseBrlAmountFromText('nao consegui abrir https://pay.depixapp.com/c/prd_99abc'), null);
+  assert.equal(parseBrlAmountFromText('manda pix pro @cliente10'), null);
+  assert.equal(parseBrlAmountFromText('cep 01310-100 quero fazer pix'), null);
+  assert.equal(parseBrlAmountFromText('conta 56789-0 quero pix'), null);
+  assert.equal(parseBrlAmountFromText('pix de 50 (11) 98888-7777'), 50);
 
   // Proteção anti-ReDoS O(N) em mensagens gigantes (64 KB) + clampInt seguro
   const startRedos = performance.now();
@@ -112,36 +122,52 @@ test('Parsing monetário trata pontuação final, milhar, horários, telefones, 
   // Parser do menu 1 / 2 sem colisão com "atual" e sem corromper "2)", "*2*", "opção 2", "2 - ..."
   assert.deepEqual(parseActiveOrderMenuReply('Cancelar a atual e gerar 80'), {
     choice: 'new',
+    explicitOptionDigit: null,
     inlineNewAmountBrl: 80,
   });
   assert.deepEqual(parseActiveOrderMenuReply('2 - Cancelar a atual e gerar R$ 80,00'), {
     choice: 'new',
+    explicitOptionDigit: '2',
     inlineNewAmountBrl: 80,
   });
   assert.deepEqual(parseActiveOrderMenuReply('Trocar a atual'), {
     choice: 'new',
+    explicitOptionDigit: null,
     inlineNewAmountBrl: null,
   });
   assert.deepEqual(parseActiveOrderMenuReply('Não quero reenviar, quero novo'), {
     choice: 'new',
+    explicitOptionDigit: null,
     inlineNewAmountBrl: null,
   });
-  assert.deepEqual(parseActiveOrderMenuReply('2)'), { choice: 'new', inlineNewAmountBrl: null });
-  assert.deepEqual(parseActiveOrderMenuReply('*2*'), { choice: 'new', inlineNewAmountBrl: null });
+  assert.deepEqual(parseActiveOrderMenuReply('2)'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('*2*'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: null,
+  });
   assert.deepEqual(parseActiveOrderMenuReply('opção 2'), {
     choice: 'new',
+    explicitOptionDigit: '2',
     inlineNewAmountBrl: null,
   });
   assert.deepEqual(parseActiveOrderMenuReply('2 - quero outro'), {
     choice: 'new',
+    explicitOptionDigit: '2',
     inlineNewAmountBrl: null,
   });
   assert.deepEqual(parseActiveOrderMenuReply('2 - gerar 120'), {
     choice: 'new',
+    explicitOptionDigit: '2',
     inlineNewAmountBrl: 120,
   });
   assert.deepEqual(parseActiveOrderMenuReply('1)'), {
     choice: 'resend',
+    explicitOptionDigit: '1',
     inlineNewAmountBrl: null,
   });
 
@@ -911,6 +937,34 @@ test('ExpirationWatcher protege contra 503 transitório, respeita grace window d
     assert.equal(repository.getOrderById('ord_superseded_old')?.status, 'EXPIRED');
     const msgsAfterSweep = repository.listMessages(supersededPhone);
     assert.equal(msgsAfterSweep.length, msgsBeforeSweep);
+
+    // 7. Após expiração e passagem de tempo (>5 min) ou mensagem genérica "Quero fazer um novo pix",
+    //    NÃO ressuscita valor antigo pendente sem o cliente ter informado valor!
+    const stalePhone = '5511977778888';
+    repository.createOrder({
+      id: 'ord_stale_menu',
+      externalId: 'ext_stale_menu',
+      provider: 'mock',
+      providerChargeId: 'mock_stale_1',
+      customerPhone: stalePhone,
+      amountBrl: 50,
+      cryptoAsset: 'USDT',
+      cryptoNetwork: 'POLYGON',
+      walletAddress: '0x123',
+      pixCopyPaste: '000201STALE',
+      status: 'PENDING',
+      warningSent: false,
+      createdAt: basePastIso,
+      expiresAt: new Date(Date.now() + 10_000).toISOString(),
+    });
+    await engine.handleIncomingMessage({ phone: stalePhone, text: 'Pix de 80' });
+    await watcher.sweepPendingOrders(new Date(Date.now() + 20 * 60_000));
+    const ordersBeforeStaleMsg = repository.listRecentOrders().length;
+    await engine.handleIncomingMessage({
+      phone: stalePhone,
+      text: 'Bom dia! Quero fazer um novo pix',
+    });
+    assert.equal(repository.listRecentOrders().length, ordersBeforeStaleMsg);
   } finally {
     fakeServer.close();
     repository.close();

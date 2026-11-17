@@ -147,8 +147,12 @@ export class DePixAppProvider implements IPixCryptoProvider {
       );
     }
 
+    if (!Number.isFinite(input.amountBrl) || input.amountBrl <= 0) {
+      throw new Error('INVALID_AMOUNT: Valor inválido para cobrança Pix.');
+    }
+
     const amountInCents = Math.round(input.amountBrl * 100);
-    if (amountInCents < 500) {
+    if (!Number.isFinite(amountInCents) || amountInCents < 500) {
       throw new Error('MIN_AMOUNT: O valor mínimo na DePix App é de R$ 5,00.');
     }
     if (amountInCents > 600_000) {

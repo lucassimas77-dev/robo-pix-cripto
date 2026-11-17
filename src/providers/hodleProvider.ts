@@ -44,6 +44,12 @@ export class HodleProvider implements IPixCryptoProvider {
     if (!input.walletAddress) {
       throw new Error('WALLET_MISSING: Informe o endereço da sua carteira cripto no Passo 1.');
     }
+    if (!Number.isFinite(input.amountBrl) || input.amountBrl < this.minAmountBrl) {
+      throw new Error('MIN_AMOUNT: Valor inválido ou abaixo do mínimo permitido na Hodle.');
+    }
+    if (input.amountBrl > this.maxAmountBrl) {
+      throw new Error('MAX_AMOUNT: Valor acima do limite máximo permitido na Hodle.');
+    }
 
     let estimatedCryptoAmount: number | undefined;
     try {

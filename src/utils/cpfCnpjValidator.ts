@@ -142,10 +142,36 @@ export function parseBrlAmountFromText(text: string): number | null {
   const cleaned = text.trim();
   if (!cleaned) return null;
 
-  const withoutContactsAndDates = cleaned
-    // Remove telefones (sem prefixos opcionais vazios antes de \s+ — complexidade estrita O(N)!), CPFs/CNPJs, datas e horários
-    .replace(/(?:\+?\d{1,3}[ \t]+)?\(\d{2}\)[ \t]?\d{4,5}[-\s]?\d{4}/g, ' ')
-    .replace(/\b\d{4,5}-\d{4}\b/g, ' ')
+  // Passo 0 (O(N) sem regex backtracking): remove tokens de URL, e-mail, @handle e IDs prd_/chk_
+  const filteredWords = cleaned
+    .split(/\s+/)
+    .filter((tok) => {
+      const low = tok.toLowerCase();
+      if (low.includes('@')) return false;
+      if (
+        low.includes('://') ||
+        low.startsWith('www.') ||
+        low.includes('.com') ||
+        low.includes('.app') ||
+        low.includes('.net') ||
+        low.includes('.org') ||
+        low.includes('.br/') ||
+        low.includes('prd_') ||
+        low.includes('chk_')
+      ) {
+        return false;
+      }
+      return true;
+    })
+    .join(' ');
+
+  if (!filteredWords) return null;
+
+  const withoutContactsAndDates = filteredWords
+    // Remove telefones completos COM ou SEM parênteses no DDD (ex: "(11) 98888-7777", "11 98888-7777", "+55 21 98888-7777")
+    .replace(/(?:(?:\+\d{1,3}|\b55)[ \t]+)?(?:\(\d{2}\)|\b\d{2}\b)[ \t]*\d{4,5}[-\s]\d{4}\b/g, ' ')
+    // Remove CEPs, telefones sem DDD e contas/códigos hifenizados ("01310-100", "98888-7777", "56789-0")
+    .replace(/\b\d+-\d+\b/g, ' ')
     .replace(/\b\d{3}\.\d{3}\.\d{3}-\d{2}\b/g, ' ')
     .replace(/\b\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}\b/g, ' ')
     .replace(/\b\d{8,}\b/g, ' ')
@@ -159,6 +185,11 @@ export function parseBrlAmountFromText(text: string): number | null {
     /-[ \t]*r\$[ \t]*\d/i.test(withoutContactsAndDates) ||
     /(?:^|[\s(/:=])-\d/.test(withoutContactsAndDates)
   ) {
+    return null;
+  }
+
+  // Rejeita expressões de soma/multiplicação ("R$ 50 + 30", "50 + 50") para não cobrar parcela parcial
+  if (/\d[ \t]*[+*][ \t]*(?:r\$[ \t]*)?\d/i.test(withoutContactsAndDates)) {
     return null;
   }
 
@@ -193,18 +224,28 @@ export function parseBrlAmountFromText(text: string): number | null {
     .replace(/\b\d+[ \t]*(?:x|vezes|parcelas?)\b/gi, ' ')
     .replace(/\b\d+[ \t]*(?:min|minutos?|seg|segundos?|dias?|horas?|meses|anos?)\b/gi, ' ');
 
-  // Rejeita dúvidas/escolhas entre dois valores sem quantificadores de espaço adjacentes (O(N))
+  // Extrai todos os candidatos numéricos livres (sem letras/identificadores colados)
+  const allTokensRegex = new RegExp(
+    `(?<![-\\w@/.])(${NUM_CORE})(?![.,]\\d|\\d|[-\\w]|[ \\t]*%)`,
+    'g'
+  );
+  const allMatches = Array.from(sanitized.matchAll(allTokensRegex))
+    .map((m) => parseNumericToken(m[1]))
+    .filter((v): v is number => v !== null);
+
+  // Rejeita dúvidas/escolhas com "ou" quando há 2 ou mais números distintos na frase ("R$ 50 agora ou 100 amanhã?")
   if (
     /(?<!\d)\d+(?:[.,]\d+)?(?:[ \t]+(?:reais|real|brl|conto|contos))?[ \t]+ou[ \t]+(?:r\$[ \t]*)?\d/i.test(
       sanitized
-    )
+    ) ||
+    (/\bou\b/i.test(sanitized) && new Set(allMatches).size > 1)
   ) {
     return null;
   }
 
   // Camada 1: precedido por R$ (exige candidato único distinto)
   const explicitPrefixGlobal = new RegExp(
-    `(?<!-)r\\$[ \\t]*(${NUM_CORE})(?![.,]\\d|\\d|[ \\t]*%)`,
+    `(?<!-)r\\$[ \\t]*(${NUM_CORE})(?![.,]\\d|\\d|[-\\w]|[ \\t]*%)`,
     'gi'
   );
   const prefixMatches = Array.from(sanitized.matchAll(explicitPrefixGlobal))
@@ -216,7 +257,7 @@ export function parseBrlAmountFromText(text: string): number | null {
 
   // Camada 2: seguido por reais / real / brl / conto (exige candidato único distinto)
   const explicitSuffixGlobal = new RegExp(
-    `(?<!-|\\d[.,]|\\d)(${NUM_CORE})[ \\t]*(?:reais|real|brl|conto|contos)\\b`,
+    `(?<![-\\w@/.])(${NUM_CORE})[ \\t]*(?:reais|real|brl|conto|contos)\\b`,
     'gi'
   );
   const suffixMatches = Array.from(sanitized.matchAll(explicitSuffixGlobal))
@@ -227,11 +268,6 @@ export function parseBrlAmountFromText(text: string): number | null {
   if (uniqueSuffix.length === 1) return uniqueSuffix[0];
 
   // Camada 3: único número candidato inequívoco na frase
-  const allTokensRegex = new RegExp(`(?<!-|\\d[.,]|\\d)(${NUM_CORE})(?![.,]\\d|\\d|[ \\t]*%)`, 'g');
-  const allMatches = Array.from(sanitized.matchAll(allTokensRegex))
-    .map((m) => parseNumericToken(m[1]))
-    .filter((v): v is number => v !== null);
-
   if (allMatches.length !== 1) return null;
 
   return allMatches[0];
@@ -293,6 +329,7 @@ export function isHelpCommand(text: string): boolean {
 
 export interface ActiveMenuParseResult {
   choice: 'resend' | 'new' | 'none';
+  explicitOptionDigit: '1' | '2' | null;
   inlineNewAmountBrl: number | null;
 }
 
@@ -302,12 +339,12 @@ export interface ActiveMenuParseResult {
  */
 export function parseActiveOrderMenuReply(text: string): ActiveMenuParseResult {
   if (typeof text !== 'string' || text.length > MAX_NLU_LEN) {
-    return { choice: 'none', inlineNewAmountBrl: null };
+    return { choice: 'none', explicitOptionDigit: null, inlineNewAmountBrl: null };
   }
 
   const strippedMd = text.replace(/[*_~`]/g, '').trim();
   if (!strippedMd) {
-    return { choice: 'none', inlineNewAmountBrl: null };
+    return { choice: 'none', explicitOptionDigit: null, inlineNewAmountBrl: null };
   }
 
   // Passo 1: Rótulo numérico explícito de opção 1 ou 2 no início ("1", "2", "2)", "(2)", "#2", "opção 2", "2 - gerar 80")
@@ -315,7 +352,7 @@ export function parseActiveOrderMenuReply(text: string): ActiveMenuParseResult {
     /^(?:[([]\s*)?(?:#\s*)?(?:(?:op[cç][aã]o|item|n[uú]mero)[ \t#:.-]*)?([12])(?![0-9.,])(?:[)\].:,\- \t]+([\s\S]*))?$/i
   );
   if (leadingOptMatch) {
-    const optDigit = leadingOptMatch[1];
+    const optDigit = leadingOptMatch[1] as '1' | '2';
     const remainder = (leadingOptMatch[2] ?? '').trim();
     const inlineAmt = remainder ? parseBrlAmountFromText(remainder) : null;
 
@@ -330,11 +367,12 @@ export function parseActiveOrderMenuReply(text: string): ActiveMenuParseResult {
       (remCancelAndGen ||
         /\b(?:nov[oa]|outr[oa]|trocar|troca|mudar|muda|substituir|alterar)\b/i.test(remainder))
     ) {
-      return { choice: 'new', inlineNewAmountBrl: inlineAmt };
+      return { choice: 'new', explicitOptionDigit: '2', inlineNewAmountBrl: inlineAmt };
     }
 
     return {
       choice: optDigit === '1' ? 'resend' : 'new',
+      explicitOptionDigit: optDigit,
       inlineNewAmountBrl: optDigit === '2' ? inlineAmt : null,
     };
   }
@@ -352,6 +390,7 @@ export function parseActiveOrderMenuReply(text: string): ActiveMenuParseResult {
   ) {
     return {
       choice: 'new',
+      explicitOptionDigit: null,
       inlineNewAmountBrl: parseBrlAmountFromText(strippedMd),
     };
   }
@@ -362,11 +401,12 @@ export function parseActiveOrderMenuReply(text: string): ActiveMenuParseResult {
     (/\b(?:reenviar|reenvia|mesm[oa]|manter|mantenha|continua|continuar)\b/i.test(strippedMd) ||
       /\b(?:mand[ae]|envi[ae])[ \t]+(?:a[ \t]+|o[ \t]+)?atual\b/i.test(strippedMd))
   ) {
-    return { choice: 'resend', inlineNewAmountBrl: null };
+    return { choice: 'resend', explicitOptionDigit: null, inlineNewAmountBrl: null };
   }
 
   return {
     choice: 'none',
+    explicitOptionDigit: null,
     inlineNewAmountBrl: parseBrlAmountFromText(strippedMd),
   };
 }

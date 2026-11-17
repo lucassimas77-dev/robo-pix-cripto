@@ -26,6 +26,9 @@ export class MockProvider implements IPixCryptoProvider {
   }
 
   public async createCharge(input: CreateChargeInput): Promise<CreateChargeOutput> {
+    if (!Number.isFinite(input.amountBrl) || input.amountBrl <= 0) {
+      throw new Error('INVALID_AMOUNT: Valor inválido para cobrança Pix.');
+    }
     const providerChargeId = `mock_${crypto.randomBytes(6).toString('hex')}`;
     const expiresAt = new Date(Date.now() + input.expirationMinutes * 60_000).toISOString();
 

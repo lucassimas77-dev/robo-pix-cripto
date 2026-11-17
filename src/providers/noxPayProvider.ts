@@ -44,6 +44,12 @@ export class NoxPayProvider implements IPixCryptoProvider {
     if (!input.walletAddress) {
       throw new Error('WALLET_MISSING: Informe o endereço da sua carteira cripto no Passo 1.');
     }
+    if (!Number.isFinite(input.amountBrl) || input.amountBrl < this.minAmountBrl) {
+      throw new Error('MIN_AMOUNT: Valor inválido ou abaixo do mínimo permitido na NoxPay.');
+    }
+    if (input.amountBrl > this.maxAmountBrl) {
+      throw new Error('MAX_AMOUNT: Valor acima do limite máximo permitido na NoxPay.');
+    }
 
     const bodyPayload: Record<string, unknown> = {
       currency_code: 'BRL_PIX',
