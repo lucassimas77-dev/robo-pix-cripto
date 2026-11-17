@@ -291,6 +291,86 @@ export function isHelpCommand(text: string): boolean {
   );
 }
 
+export interface ActiveMenuParseResult {
+  choice: 'resend' | 'new' | 'none';
+  inlineNewAmountBrl: number | null;
+}
+
+/**
+ * Interpreta respostas ao menu `1 / 2` de cobrança ativa em tempo O(N), sem colidir
+ * com a palavra `"atual"` da Opção 2 nem confundir `"2)"`, `"*2*"`, `"opção 2"` ou `"2 - ..."` com R$ 2,00.
+ */
+export function parseActiveOrderMenuReply(text: string): ActiveMenuParseResult {
+  if (typeof text !== 'string' || text.length > MAX_NLU_LEN) {
+    return { choice: 'none', inlineNewAmountBrl: null };
+  }
+
+  const strippedMd = text.replace(/[*_~`]/g, '').trim();
+  if (!strippedMd) {
+    return { choice: 'none', inlineNewAmountBrl: null };
+  }
+
+  // Passo 1: Rótulo numérico explícito de opção 1 ou 2 no início ("1", "2", "2)", "(2)", "#2", "opção 2", "2 - gerar 80")
+  const leadingOptMatch = strippedMd.match(
+    /^(?:[([]\s*)?(?:#\s*)?(?:(?:op[cç][aã]o|item|n[uú]mero)[ \t#:.-]*)?([12])(?![0-9.,])(?:[)\].:,\- \t]+([\s\S]*))?$/i
+  );
+  if (leadingOptMatch) {
+    const optDigit = leadingOptMatch[1];
+    const remainder = (leadingOptMatch[2] ?? '').trim();
+    const inlineAmt = remainder ? parseBrlAmountFromText(remainder) : null;
+
+    const remLower = remainder.toLowerCase();
+    const remCancelAndGen =
+      remLower.includes('cancelar') &&
+      remLower.includes('gerar') &&
+      remLower.indexOf('cancelar') < remLower.indexOf('gerar');
+
+    if (
+      remainder &&
+      (remCancelAndGen ||
+        /\b(?:nov[oa]|outr[oa]|trocar|troca|mudar|muda|substituir|alterar)\b/i.test(remainder))
+    ) {
+      return { choice: 'new', inlineNewAmountBrl: inlineAmt };
+    }
+
+    return {
+      choice: optDigit === '1' ? 'resend' : 'new',
+      inlineNewAmountBrl: optDigit === '2' ? inlineAmt : null,
+    };
+  }
+
+  // Passo 2: Intenção textual de cancelar/substituir/novo valor (avaliada ANTES de reenviar!)
+  const lower = strippedMd.toLowerCase();
+  const hasCancelAndGenerate =
+    lower.includes('cancelar') &&
+    lower.includes('gerar') &&
+    lower.indexOf('cancelar') < lower.indexOf('gerar');
+
+  if (
+    hasCancelAndGenerate ||
+    /\b(?:nov[oa]|outr[oa]|trocar|troca|mudar|muda|substituir|alterar)\b/i.test(strippedMd)
+  ) {
+    return {
+      choice: 'new',
+      inlineNewAmountBrl: parseBrlAmountFromText(strippedMd),
+    };
+  }
+
+  // Passo 3: Intenção textual de reenviar/manter cobrança existente (sem negação "não")
+  if (
+    !/\bn[aã]o\b/i.test(strippedMd) &&
+    (/\b(?:reenviar|reenvia|mesm[oa]|manter|mantenha|continua|continuar)\b/i.test(strippedMd) ||
+      /\b(?:mand[ae]|envi[ae])[ \t]+(?:a[ \t]+|o[ \t]+)?atual\b/i.test(strippedMd))
+  ) {
+    return { choice: 'resend', inlineNewAmountBrl: null };
+  }
+
+  return {
+    choice: 'none',
+    inlineNewAmountBrl: parseBrlAmountFromText(strippedMd),
+  };
+}
+
 export function isStatusQueryMessage(text: string): boolean {
   if (typeof text !== 'string' || text.length > MAX_NLU_LEN) return false;
   const n = normalizeCommandText(text);

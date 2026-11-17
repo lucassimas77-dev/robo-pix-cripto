@@ -231,7 +231,9 @@ export class OrderRepository {
 
   public findMostRecentOrderByPhone(phone: string): PixCryptoOrder | null {
     const row = this.db
-      .prepare(`SELECT * FROM orders WHERE customer_phone = ? ORDER BY created_at DESC LIMIT 1`)
+      .prepare(
+        `SELECT * FROM orders WHERE customer_phone = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`
+      )
       .get(phone) as Record<string, unknown> | undefined;
     return row ? this.mapRowToOrder(row) : null;
   }
@@ -266,7 +268,7 @@ export class OrderRepository {
       .prepare(`
         SELECT * FROM orders
         WHERE customer_phone = ? AND status = 'PENDING' AND expires_at > ?
-        ORDER BY created_at DESC
+        ORDER BY created_at DESC, rowid DESC
         LIMIT 1
       `)
       .get(phone, nowIso) as Record<string, unknown> | undefined;
@@ -291,7 +293,7 @@ export class OrderRepository {
 
   public listRecentOrders(limit = 50): PixCryptoOrder[] {
     const rows = this.db
-      .prepare(`SELECT * FROM orders ORDER BY created_at DESC LIMIT ?`)
+      .prepare(`SELECT * FROM orders ORDER BY created_at DESC, rowid DESC LIMIT ?`)
       .all(limit) as Array<Record<string, unknown>>;
     return rows.map((r) => this.mapRowToOrder(r));
   }

@@ -15,8 +15,8 @@ import {
   isHelpCommand,
   isPaymentConfirmationMessage,
   isStatusQueryMessage,
-  normalizeCommandText,
   onlyDigits,
+  parseActiveOrderMenuReply,
   parseBrlAmountFromText,
 } from '../utils/cpfCnpjValidator.ts';
 
@@ -257,29 +257,20 @@ export class ConversationEngine {
     // 5. Decisão sobre cobrança ativa
     if (session.stage === 'AWAITING_ACTIVE_ORDER_DECISION') {
       const active = this.repository.findActivePendingOrderByPhone(phone);
-      const normChoice = normalizeCommandText(text);
-      const wantsResend =
-        normChoice === '1' || /\b(?:reenviar|reenvia|mesm[oa]|atual|manter)\b/.test(normChoice);
-      const wantsNew =
-        normChoice === '2' ||
-        /\b(?:nov[oa]|outr[oa]|trocar|mudar)\b/.test(normChoice) ||
-        (normChoice.includes('cancelar') &&
-          normChoice.includes('gerar') &&
-          normChoice.indexOf('cancelar') < normChoice.indexOf('gerar'));
+      const menuReply = parseActiveOrderMenuReply(text);
 
       if (!active) {
         const prevPendingAmt = session.pendingNewAmountBrl;
         session.stage = 'AWAITING_AMOUNT';
         session.pendingNewAmountBrl = undefined;
+        session.draftAmountBrl = undefined;
         this.repository.saveSession(session);
 
-        const inlineAmt =
-          normChoice !== '1' && normChoice !== '2' ? parseBrlAmountFromText(text) : null;
-        if (inlineAmt !== null) {
-          await this.proceedWithAmount(phone, inlineAmt, session.customerJid);
+        if (menuReply.inlineNewAmountBrl !== null) {
+          await this.proceedWithAmount(phone, menuReply.inlineNewAmountBrl, session.customerJid);
           return;
         }
-        if (wantsNew && prevPendingAmt) {
+        if (menuReply.choice === 'new' && prevPendingAmt) {
           await this.proceedWithAmount(phone, prevPendingAmt, session.customerJid);
           return;
         }
@@ -292,23 +283,23 @@ export class ConversationEngine {
         return;
       }
 
-      if (wantsResend) {
+      if (menuReply.choice === 'resend') {
         session.stage = 'IDLE';
         session.pendingNewAmountBrl = undefined;
+        session.draftAmountBrl = undefined;
         this.repository.saveSession(session);
         await this.resendActiveOrder(active);
         return;
       }
 
-      if (wantsNew) {
+      if (menuReply.choice === 'new') {
         this.repository.updateOrderStatus(active.id, 'CANCELLED');
         this.deactivateOrderRemotely(active);
 
-        // Prioriza eventual valor novo presente na própria resposta ("quero novo valor de 150")
-        const inlineAmt = normChoice !== '2' ? parseBrlAmountFromText(text) : null;
-        const targetAmt = inlineAmt ?? session.pendingNewAmountBrl;
+        const targetAmt = menuReply.inlineNewAmountBrl ?? session.pendingNewAmountBrl;
 
         session.pendingNewAmountBrl = undefined;
+        session.draftAmountBrl = undefined;
         session.stage = 'AWAITING_AMOUNT';
         this.repository.saveSession(session);
 
@@ -325,7 +316,7 @@ export class ConversationEngine {
         return;
       }
 
-      const newCandidateAmount = parseBrlAmountFromText(text);
+      const newCandidateAmount = menuReply.inlineNewAmountBrl;
       if (newCandidateAmount !== null) {
         session.pendingNewAmountBrl = newCandidateAmount;
         this.repository.saveSession(session);
@@ -368,7 +359,7 @@ export class ConversationEngine {
 
     // Se o cliente estava diante do menu 1 / 2 no exato segundo em que a cobrança anterior expirou/falhou:
     if (session.draftAmountBrl === -1 || session.pendingNewAmountBrl !== undefined) {
-      const normAfterExp = normalizeCommandText(text);
+      const menuAfterExp = parseActiveOrderMenuReply(text);
       const savedPendingAmt = session.pendingNewAmountBrl;
       const hadExpiredMenu = session.draftAmountBrl === -1;
 
@@ -376,19 +367,8 @@ export class ConversationEngine {
       session.pendingNewAmountBrl = undefined;
       this.repository.saveSession(session);
 
-      const choseOption2 =
-        normAfterExp === '2' ||
-        /\b(?:nov[oa]|outr[oa]|trocar|mudar)\b/.test(normAfterExp) ||
-        (normAfterExp.includes('cancelar') &&
-          normAfterExp.includes('gerar') &&
-          normAfterExp.indexOf('cancelar') < normAfterExp.indexOf('gerar'));
-      const choseOption1 =
-        normAfterExp === '1' ||
-        /\b(?:reenviar|reenvia|mesm[oa]|atual|manter)\b/.test(normAfterExp);
-
-      if (choseOption2) {
-        const inlineAmt = normAfterExp !== '2' ? parseBrlAmountFromText(text) : null;
-        const targetAmt = inlineAmt ?? savedPendingAmt;
+      if (menuAfterExp.choice === 'new') {
+        const targetAmt = menuAfterExp.inlineNewAmountBrl ?? savedPendingAmt;
         if (targetAmt) {
           await this.proceedWithAmount(phone, targetAmt, session.customerJid);
           return;
@@ -401,7 +381,7 @@ export class ConversationEngine {
         return;
       }
 
-      if (choseOption1 && hadExpiredMenu) {
+      if (menuAfterExp.choice === 'resend' && hadExpiredMenu) {
         await this.safeSendText(
           phone,
           '⏰ A cobrança anterior já expirou! Qual o *valor em Reais* que deseja gerar agora? _(Ex: 50,00)_',
@@ -758,7 +738,16 @@ export class ConversationEngine {
       this.deactivateOrderRemotely(updatedOrder);
 
       const otherActive = this.repository.findActivePendingOrderByPhone(updatedOrder.customerPhone);
-      if (!otherActive) {
+      const mostRecent = this.repository.findMostRecentOrderByPhone(updatedOrder.customerPhone);
+      const hasNewerOrder =
+        Boolean(otherActive) ||
+        Boolean(
+          mostRecent &&
+            mostRecent.id !== updatedOrder.id &&
+            mostRecent.createdAt >= updatedOrder.createdAt
+        );
+
+      if (!hasNewerOrder) {
         const sess = this.repository.getSession(updatedOrder.customerPhone);
         const hadDecisionMenu = sess.stage === 'AWAITING_ACTIVE_ORDER_DECISION';
         this.repository.saveSession({
@@ -769,14 +758,14 @@ export class ConversationEngine {
           pendingNewAmountBrl: hadDecisionMenu ? sess.pendingNewAmountBrl : undefined,
           updatedAt: new Date().toISOString(),
         });
-      }
 
-      await this.safeSendText(
-        updatedOrder.customerPhone,
-        `⏰ *Atenção: A cobrança Pix de ${formatBrl(updatedOrder.amountBrl)} expirou.*\n\n` +
-          `Não realize o pagamento em link/código vencido. Se quiser pagar agora, basta enviar o valor (*${updatedOrder.amountBrl.toFixed(2).replace('.', ',')}*) que gero uma nova na hora!`,
-        updatedOrder.customerJid
-      );
+        await this.safeSendText(
+          updatedOrder.customerPhone,
+          `⏰ *Atenção: A cobrança Pix de ${formatBrl(updatedOrder.amountBrl)} expirou.*\n\n` +
+            `Não realize o pagamento em link/código vencido. Se quiser pagar agora, basta enviar o valor (*${updatedOrder.amountBrl.toFixed(2).replace('.', ',')}*) que gero uma nova na hora!`,
+          updatedOrder.customerJid
+        );
+      }
     }
 
     return { matched: true, changed: true, order: updatedOrder };

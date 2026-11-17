@@ -17,6 +17,7 @@ import {
   isCancelCommand,
   isPaymentConfirmationMessage,
   normalizeCommandText,
+  parseActiveOrderMenuReply,
   parseBrlAmountFromText,
   stripTrailingSlashes,
 } from '../src/utils/cpfCnpjValidator.ts';
@@ -107,6 +108,42 @@ test('Parsing monetário trata pontuação final, milhar, horários, telefones, 
   assert.equal(clampInt(null, 15, 5, 20), 15);
   assert.equal(clampInt(false, 15, 5, 20), 15);
   assert.equal(clampInt({ toString: null }, 15, 5, 20), 15);
+
+  // Parser do menu 1 / 2 sem colisão com "atual" e sem corromper "2)", "*2*", "opção 2", "2 - ..."
+  assert.deepEqual(parseActiveOrderMenuReply('Cancelar a atual e gerar 80'), {
+    choice: 'new',
+    inlineNewAmountBrl: 80,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('2 - Cancelar a atual e gerar R$ 80,00'), {
+    choice: 'new',
+    inlineNewAmountBrl: 80,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('Trocar a atual'), {
+    choice: 'new',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('Não quero reenviar, quero novo'), {
+    choice: 'new',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('2)'), { choice: 'new', inlineNewAmountBrl: null });
+  assert.deepEqual(parseActiveOrderMenuReply('*2*'), { choice: 'new', inlineNewAmountBrl: null });
+  assert.deepEqual(parseActiveOrderMenuReply('opção 2'), {
+    choice: 'new',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('2 - quero outro'), {
+    choice: 'new',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('2 - gerar 120'), {
+    choice: 'new',
+    inlineNewAmountBrl: 120,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('1)'), {
+    choice: 'resend',
+    inlineNewAmountBrl: null,
+  });
 
   assert.equal(formatTimeSaoPaulo('2026-07-01T18:15:00.000Z'), '15:15');
 });
@@ -228,11 +265,19 @@ test('Concorrência, mensagens pós-pagamento ("já paguei"), estado AWAITING_AM
   assert.equal(repository.getSession(phoneMenu).stage, 'AWAITING_ACTIVE_ORDER_DECISION');
   assert.equal(repository.getSession(phoneMenu).pendingNewAmountBrl, 80);
 
-  // Responde "Quero um novo valor de 150" -> cancela R$ 60 e gera R$ 150 (não R$ 80!)
-  await engine.handleIncomingMessage({ phone: phoneMenu, text: 'Quero um novo valor de 150' });
+  // Responde "2)" ou "2 - Cancelar a atual e gerar R$ 150,00" -> cancela R$ 60 e gera R$ 150 (não R$ 80 nem reenvia R$ 60!)
+  await engine.handleIncomingMessage({
+    phone: phoneMenu,
+    text: '2 - Cancelar a atual e gerar R$ 150,00',
+  });
   const latestMenuOrder = repository.findMostRecentOrderByPhone(phoneMenu);
   assert.equal(latestMenuOrder?.amountBrl, 150);
   assert.equal(latestMenuOrder?.status, 'PENDING');
+
+  // Testa também "2)" usando pendingNewAmountBrl preservado (R$ 95) sem virar R$ 2,00!
+  await engine.handleIncomingMessage({ phone: phoneMenu, text: '95' });
+  await engine.handleIncomingMessage({ phone: phoneMenu, text: '2)' });
+  assert.equal(repository.findMostRecentOrderByPhone(phoneMenu)?.amountBrl, 95);
 
   // "Quero cancelar o pix!" cancela a cobrança ativa sem cair em loop
   await engine.handleIncomingMessage({ phone: phoneMenu, text: 'Quero cancelar o pix!' });
@@ -840,6 +885,32 @@ test('ExpirationWatcher protege contra 503 transitório, respeita grace window d
     );
     assert.equal(activeTz?.id, 'ord_tz_offset');
     assert.equal(activeTz?.expiresAt, '2026-11-16T17:15:00.000Z');
+
+    // 6. Se uma cobrança antiga venceu há 2s e o cliente já gerou uma nova cobrança ativa antes da varredura,
+    //    o ExpirationWatcher expira a antiga silenciosamente SEM mandar falso alerta de expiração embaixo do novo QR!
+    const supersededPhone = '5511966667777';
+    repository.createOrder({
+      id: 'ord_superseded_old',
+      externalId: 'ext_superseded_old',
+      provider: 'mock',
+      providerChargeId: 'mock_old_1',
+      customerPhone: supersededPhone,
+      amountBrl: 50,
+      cryptoAsset: 'USDT',
+      cryptoNetwork: 'POLYGON',
+      walletAddress: '0x123',
+      pixCopyPaste: '000201OLD',
+      status: 'PENDING',
+      warningSent: false,
+      createdAt: new Date(Date.now() - 960_000).toISOString(),
+      expiresAt: new Date(Date.now() - 2_000).toISOString(),
+    });
+    await engine.handleIncomingMessage({ phone: supersededPhone, text: 'Pix de 50' });
+    const msgsBeforeSweep = repository.listMessages(supersededPhone).length;
+    await watcher.sweepPendingOrders(new Date());
+    assert.equal(repository.getOrderById('ord_superseded_old')?.status, 'EXPIRED');
+    const msgsAfterSweep = repository.listMessages(supersededPhone);
+    assert.equal(msgsAfterSweep.length, msgsBeforeSweep);
   } finally {
     fakeServer.close();
     repository.close();

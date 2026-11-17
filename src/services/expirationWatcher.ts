@@ -240,12 +240,21 @@ export class ExpirationWatcher {
               }
             }
 
-            // Coloca sessão em `AWAITING_AMOUNT` para que o cliente possa responder o valor direto no modo `keyword_only`!
+            // Se o cliente já gerou outra cobrança mais recente (ativa ou já paga), não sobrescreve sessão nem manda falso aviso de expiração!
             const otherActive = this.repository.findActivePendingOrderByPhone(
               order.customerPhone,
               effectiveNowIso
             );
-            if (!otherActive) {
+            const mostRecent = this.repository.findMostRecentOrderByPhone(order.customerPhone);
+            const hasNewerOrder =
+              Boolean(otherActive) ||
+              Boolean(
+                mostRecent &&
+                  mostRecent.id !== order.id &&
+                  mostRecent.createdAt >= order.createdAt
+              );
+
+            if (!hasNewerOrder) {
               const sess = this.repository.getSession(order.customerPhone);
               const hadDecisionMenu = sess.stage === 'AWAITING_ACTIVE_ORDER_DECISION';
               this.repository.saveSession({
@@ -256,17 +265,17 @@ export class ExpirationWatcher {
                 pendingNewAmountBrl: hadDecisionMenu ? sess.pendingNewAmountBrl : undefined,
                 updatedAt: effectiveNowIso,
               });
-            }
 
-            try {
-              await this.whatsapp.sendText(
-                order.customerPhone,
-                `⏰ *Atenção: A cobrança Pix de ${formatBrl(order.amountBrl)} expirou.*\n\n` +
-                  `Não realize o pagamento em link/código vencido. Se quiser pagar agora, basta enviar o valor (*${order.amountBrl.toFixed(2).replace('.', ',')}*) que gero uma nova na hora!`,
-                order.customerJid
-              );
-            } catch (err) {
-              console.error('[ExpirationWatcher] Erro ao notificar expiração:', err);
+              try {
+                await this.whatsapp.sendText(
+                  order.customerPhone,
+                  `⏰ *Atenção: A cobrança Pix de ${formatBrl(order.amountBrl)} expirou.*\n\n` +
+                    `Não realize o pagamento em link/código vencido. Se quiser pagar agora, basta enviar o valor (*${order.amountBrl.toFixed(2).replace('.', ',')}*) que gero uma nova na hora!`,
+                  order.customerJid
+                );
+              } catch (err) {
+                console.error('[ExpirationWatcher] Erro ao notificar expiração:', err);
+              }
             }
           }
         } else if (!order.warningSent && diffMs <= this.warningBeforeMinutes * 60_000) {
