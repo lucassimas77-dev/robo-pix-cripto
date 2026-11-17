@@ -333,7 +333,8 @@ export class BaileysDirectManager {
               const recentOrder = this.repository.findMostRecentOrderByPhone(senderDigits);
               const hasRecentOrderContext =
                 recentOrder !== null &&
-                Date.now() - new Date(recentOrder.createdAt).getTime() < RECENT_ORDER_CONTEXT_MS;
+                (recentOrder.status === 'PIX_CONFIRMED' ||
+                  Date.now() - new Date(recentOrder.createdAt).getTime() < RECENT_ORDER_CONTEXT_MS);
 
               const isPostOrderFollowUp =
                 hasRecentOrderContext &&

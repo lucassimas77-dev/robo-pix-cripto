@@ -626,6 +626,66 @@ test('Parsing monetário trata pontuação final, milhar, horários, telefones, 
   assert.equal(parseBrlAmountFromText('Moro no ap 20, quero fazer um pix'), null);
   assert.equal(parseBrlAmountFromText('Moro no apt 12, quero fazer um pix'), null);
 
+  // Cobertura Busca #21: moedas/cripto simétricas, logradouros, negações compostas/erros/estornos, "pago" com hora/data, cancele, Nª opção e "50R$"
+  assert.equal(parseBrlAmountFromText('50 US$ no pix'), null);
+  assert.equal(parseBrlAmountFromText('50 U$ no pix'), null);
+  assert.equal(parseBrlAmountFromText('50 CAD no pix'), null);
+  assert.equal(parseBrlAmountFromText('100 ARS no pix'), null);
+  assert.equal(parseBrlAmountFromText('Quanto custa dólar 50 no pix?'), null);
+  assert.equal(parseBrlAmountFromText('Quero 50 MATIC no pix'), null);
+  assert.equal(parseBrlAmountFromText('Quero 0,5 LBTC no pix'), null);
+  assert.equal(parseBrlAmountFromText('meio milhão de satoshis no pix'), null);
+
+  assert.equal(parseBrlAmountFromText('Entrega na Rua Tiradentes, 85, manda o pix'), null);
+  assert.equal(parseBrlAmountFromText('Moro na Av. Paulista, 1000, aceita pix?'), null);
+  assert.equal(parseBrlAmountFromText('Estou na Rodovia BR-101, aceita pix?'), null);
+  assert.equal(parseBrlAmountFromText('Moro na Rua Tiradentes, 85, manda um pix de 50'), 50);
+  assert.equal(parseBrlAmountFromText('Moro na Rua Tiradentes, manda um pix de 50'), 50);
+
+  assert.equal(parseBrlAmountFromText('Não vou conseguir fazer o pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Não vou poder pagar os 50 no pix'), null);
+  assert.equal(parseBrlAmountFromText('Deixa quieto o pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Mandei errado R$ 50 no pix'), null);
+  assert.equal(parseBrlAmountFromText('Deu erro no pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Não passou o pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Meu banco recusou o pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Quero estorno do pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Me devolve os 50 do pix'), null);
+  assert.equal(isStatusQueryMessage('Mandei errado R$ 50 no pix'), true);
+  assert.equal(isStatusQueryMessage('Deu erro no pix de 50'), true);
+  assert.equal(isStatusQueryMessage('Meu banco recusou o pix de 50'), true);
+  assert.equal(isStatusQueryMessage('Deu erro no pix anterior, manda outro de 50'), false);
+  assert.equal(parseBrlAmountFromText('Deu erro no pix anterior, manda outro de 50'), 50);
+
+  assert.equal(isPaymentConfirmationMessage('Hoje às 18 pago 50 no pix'), false);
+  assert.equal(parseBrlAmountFromText('Hoje às 18 pago 50 no pix'), 50);
+  assert.equal(isPaymentConfirmationMessage('Até as 14 pago R$ 80 no pix'), false);
+  assert.equal(parseBrlAmountFromText('Até as 14 pago R$ 80 no pix'), 80);
+  assert.equal(isPaymentConfirmationMessage('Dia 15 pago R$ 100 no pix'), false);
+  assert.equal(parseBrlAmountFromText('Dia 15 pago R$ 100 no pix'), 100);
+  assert.equal(isPaymentConfirmationMessage('Às 18h pago o pix de 50'), false);
+  assert.equal(parseBrlAmountFromText('Às 18h pago o pix de 50'), 50);
+
+  assert.equal(isCancelCommand('Cancele o pix'), true);
+  assert.equal(isCancelCommand('Cancela esse pix aí'), true);
+  assert.deepEqual(parseActiveOrderMenuReply('primeira opção'), {
+    choice: 'resend',
+    explicitOptionDigit: '1',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('quero a segunda opção'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('segunda opção, gerar 80'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: 80,
+  });
+  assert.equal(parseBrlAmountFromText('pix de 50R$'), 50);
+  assert.equal(parseBrlAmountFromText('50,75R$ no pix'), 50.75);
+
   assert.equal(formatTimeSaoPaulo('2026-07-01T18:15:00.000Z'), '15:15');
 });
 
