@@ -9,6 +9,8 @@ import type {
   WebhookSettlementEvent,
 } from '../types/domain.ts';
 import {
+  asPlainObject,
+  normalizeUtcIsoTimestamp,
   safeOptionalId,
   safePositiveNumber,
   safePrimitiveString,
@@ -71,7 +73,10 @@ export class NoxPayProvider implements IPixCryptoProvider {
       throw new Error(`NoxPay (HTTP ${response.status}): ${errorText}`);
     }
 
-    const data = (await response.json()) as Record<string, unknown>;
+    const data = asPlainObject(await response.json());
+    if (!data) {
+      throw new Error('Resposta inválida da API NoxPay.');
+    }
     const pixCopyPaste = (
       safeOptionalId(data.pix_code) ??
       safeOptionalId(data.qr_code_text) ??
@@ -83,9 +88,8 @@ export class NoxPayProvider implements IPixCryptoProvider {
       throw new Error('A resposta da NoxPay não retornou código Pix nem link de checkout.');
     }
 
-    const expiresAt =
-      safeOptionalId(data.expires_at) ??
-      new Date(Date.now() + input.expirationMinutes * 60_000).toISOString();
+    const defaultExpIso = new Date(Date.now() + input.expirationMinutes * 60_000).toISOString();
+    const expiresAt = normalizeUtcIsoTimestamp(data.expires_at, defaultExpIso) ?? defaultExpIso;
 
     const pixQrCodeBase64 = await QRCode.toDataURL(pixCopyPaste, { width: 320, margin: 2 });
 
@@ -120,8 +124,8 @@ export class NoxPayProvider implements IPixCryptoProvider {
   }
 
   public parseWebhookPayload(payload: unknown): WebhookSettlementEvent | null {
-    if (!payload || typeof payload !== 'object') return null;
-    const obj = payload as Record<string, unknown>;
+    const obj = asPlainObject(payload);
+    if (!obj) return null;
     const statusRaw = safePrimitiveString(obj.status).toUpperCase();
 
     let newStatus: OrderStatus | null = null;
@@ -164,7 +168,8 @@ export class NoxPayProvider implements IPixCryptoProvider {
       );
       if (res.status === 404) return { status: 'EXPIRED' };
       if (!res.ok) return null;
-      const obj = (await res.json()) as Record<string, unknown>;
+      const obj = asPlainObject(await res.json());
+      if (!obj) return null;
       const st = safePrimitiveString(obj.status).toUpperCase();
       if (st === 'COMPLETED' || st === 'SETTLED') {
         return {

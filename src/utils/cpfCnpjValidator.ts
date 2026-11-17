@@ -1,6 +1,6 @@
 /**
  * Utilitários de extração segura de valores monetários em Reais (BRL),
- * coerção segura de primitivos/números, normalização de URLs e detecção de intenções em português
+ * coerção estrita de tipos/datas UTC, normalização de URLs e detecção de intenções em português
  * (estritamente O(N), 100% imune a ReDoS).
  */
 
@@ -29,16 +29,32 @@ export function stripTrailingSlashes(value: string): string {
   return end === value.length ? value : value.slice(0, end);
 }
 
-export function safePrimitiveString(val: unknown): string {
-  if (typeof val === 'string') return val;
-  if (typeof val === 'number' && Number.isFinite(val)) return String(val);
-  if (typeof val === 'boolean') return String(val);
-  return '';
+export function asPlainObject(val: unknown): Record<string, unknown> | null {
+  if (val !== null && typeof val === 'object' && !Array.isArray(val)) {
+    return val as Record<string, unknown>;
+  }
+  return null;
 }
 
+/**
+ * Retorna apenas strings reais (nunca converte `false`, `true`, `0` ou objetos em texto).
+ */
+export function safePrimitiveString(val: unknown): string {
+  return typeof val === 'string' ? val : '';
+}
+
+/**
+ * Extrai identificadores/textos opcionais sem jamais aceitar booleanos (`false`/`true`), `0` ou objetos.
+ */
 export function safeOptionalId(val: unknown): string | undefined {
-  const s = safePrimitiveString(val).trim();
-  return s ? s : undefined;
+  if (typeof val === 'string') {
+    const s = val.trim();
+    return s ? s : undefined;
+  }
+  if (typeof val === 'number' && Number.isFinite(val) && val > 0) {
+    return String(val);
+  }
+  return undefined;
 }
 
 export function safePositiveNumber(val: unknown): number | undefined {
@@ -52,6 +68,37 @@ export function safePositiveNumber(val: unknown): number | undefined {
     return Number.isFinite(n) && n > 0 ? n : undefined;
   }
   return undefined;
+}
+
+/**
+ * Normaliza qualquer timestamp (ISO com offset `-03:00`, UTC `Z` ou epoch numérico)
+ * para formato canônico UTC `.toISOString()` (`YYYY-MM-DDTHH:mm:ss.sssZ`), garantindo
+ * comparações lexicográficas exatas no SQLite e evitando `Invalid Date`.
+ */
+export function normalizeUtcIsoTimestamp(raw: unknown, fallbackIso?: string): string | undefined {
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
+    const ms = raw < 1e11 ? raw * 1000 : raw;
+    const d = new Date(ms);
+    if (Number.isFinite(d.getTime())) {
+      return d.toISOString();
+    }
+  } else if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (/^\d{10,13}$/.test(trimmed)) {
+      const num = Number(trimmed);
+      const ms = num < 1e11 ? num * 1000 : num;
+      const d = new Date(ms);
+      if (Number.isFinite(d.getTime())) {
+        return d.toISOString();
+      }
+    } else if (trimmed) {
+      const d = new Date(trimmed);
+      if (Number.isFinite(d.getTime())) {
+        return d.toISOString();
+      }
+    }
+  }
+  return fallbackIso;
 }
 
 export function onlyDigits(value: string): string {
@@ -245,28 +292,48 @@ export function isHelpCommand(text: string): boolean {
 }
 
 export function isStatusQueryMessage(text: string): boolean {
+  if (typeof text !== 'string' || text.length > MAX_NLU_LEN) return false;
   const n = normalizeCommandText(text);
-  if (!n) return false;
-  return (
+  if (
+    n &&
     /^(?:status|comprovante|meu pix|ver status|consultar|situa[cç][aã]o)(?: d[oa] (?:meu )?(?:pix|pagamento|pedido|cobran[cç]a))?$/.test(
       n
-    ) ||
-    /\b(?:qual (?:[eé] )?(?:o )?status|status d[oa] (?:meu )?(?:pix|pagamento|cobran[cç]a|pedido)|j[aá] (?:confirmou|caiu|compensou))\b/i.test(
-      n
     )
+  ) {
+    return true;
+  }
+
+  const t = text.trim();
+  if (!t) return false;
+
+  // Se o cliente pede explicitamente outro/novo Pix, não trata como mera consulta
+  if (
+    /\b(?:quero|gera|gerar|manda|mandar|preciso|faz|fazer)[ \t]+(?:outro|novo|mais[ \t]+um)\b/i.test(
+      t
+    )
+  ) {
+    return false;
+  }
+
+  return (
+    /\b(?:qual[ \t]+(?:[eé][ \t]+)?(?:o[ \t]+)?status|status[ \t]+d[oa][ \t]+(?:meu[ \t]+)?(?:pix|pagamento|cobran[cç]a|pedido))\b/i.test(
+      t
+    ) ||
+    /\b(?:j[aá][ \t]+)?(?:confirmou|caiu|compensou|recebeu|receberam|entrou|aprovou)\b/i.test(t) ||
+    /\bdeu[ \t]+certo[ \t]+(?:o[ \t]+|meu[ \t]+)?(?:pix|pagamento)\b/i.test(t)
   );
 }
 
 /**
- * Detecta mensagens/legendas pós-pagamento ("já paguei", "paguei 50 no pix", "comprovante do pix de 50",
- * "pix de 50 pago!", "o pix de R$ 50 já foi pago", "tá pago") em tempo O(N), sem risco de ReDoS!
+ * Detecta mensagens/legendas pós-pagamento ("já paguei", "paguei 50 no pix", "fiz 50 no pix",
+ * "passei 50 no pix", "depositei 50 no pix", "comprovante do pix de 50", "pix de 50 pago!")
+ * em tempo O(N), sem risco de ReDoS!
  */
 export function isPaymentConfirmationMessage(text: string): boolean {
   if (typeof text !== 'string' || text.length > MAX_NLU_LEN) return false;
   const t = text.trim();
   if (!t) return false;
 
-  // Se o cliente pede explicitamente outro/novo Pix ou diz que ainda vai pagar, não trata como aviso de pagamento
   if (
     /\b(?:quero|gera|gerar|manda|mandar|preciso|faz|fazer)[ \t]+(?:outro|novo|mais[ \t]+um)\b/i.test(
       t
@@ -283,7 +350,7 @@ export function isPaymentConfirmationMessage(text: string): boolean {
   }
 
   return (
-    /\bpaguei\b/i.test(t) ||
+    /\b(?:paguei|quitei|depositei|passei)\b/i.test(t) ||
     /\bcomprovante\b/i.test(t) ||
     /\b(?:t[aá]|est[aá]|foi)[ \t]+pago\b/i.test(t) ||
     /\bpix[ \t]+(?:de[ \t]+)?(?:(?:r\$[ \t]*)?[\d.,]+[ \t]+(?:reais[ \t]+)?)?(?:j[aá][ \t]+)?(?:foi[ \t]+|est[aá][ \t]+|t[aá][ \t]+)?(?:pago|enviado|feito|realizado|efetuado|conclu[ií]do|transferido)\b/i.test(
@@ -292,10 +359,10 @@ export function isPaymentConfirmationMessage(text: string): boolean {
     /\bpagamento[ \t]+(?:d[eo][ \t]+)?(?:(?:r\$[ \t]*)?[\d.,]+[ \t]+(?:reais[ \t]+)?)?(?:j[aá][ \t]+)?(?:foi[ \t]+|est[aá][ \t]+|t[aá][ \t]+)?(?:feito|realizado|efetuado|enviado|conclu[ií]do|pago)\b/i.test(
       t
     ) ||
-    /\b(?:j[aá][ \t]+)?fiz[ \t]+(?:o[ \t]+|a[ \t]+|um[ \t]+)?(?:pix|pagamento|dep[oó]sito|transfer[eê]ncia)\b/i.test(
+    /\b(?:j[aá][ \t]+)?(?:fiz|efetuei|realizei)[ \t]+(?:(?:o[ \t]+|os[ \t]+|a[ \t]+|um[ \t]+)?(?:pix|pagamento|dep[oó]sito|transfer[eê]ncia)|(?:os[ \t]+)?(?:r\$[ \t]*)?\d)/i.test(
       t
     ) ||
-    /\bacabei[ \t]+de[ \t]+(?:pagar|fazer|enviar|mandar|transferir)\b/i.test(t) ||
+    /\bacabei[ \t]+de[ \t]+(?:pagar|fazer|enviar|mandar|transferir|depositar|passar)\b/i.test(t) ||
     /\b(?:mandei|enviei|transferi)[ \t]+(?:o[ \t]+|os[ \t]+|a[ \t]+|as[ \t]+|um[ \t]+|meu[ \t]+)?(?:pix|pagamento|valor|comprovante|r\$[ \t]*\d|\d)/i.test(
       t
     )

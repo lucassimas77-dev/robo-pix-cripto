@@ -468,6 +468,12 @@ export function createAppHttpServer(params: {
           sendJson(res, 200, { ignored: true });
           return;
         }
+        if (headerEventId && settlementEvent.eventId && headerEventId !== settlementEvent.eventId) {
+          sendJson(res, 400, {
+            error: 'Cabeçalho X-DePix-Event-Id diverge do event_id assinado no payload.',
+          });
+          return;
+        }
         if (headerEventId && !settlementEvent.eventId) {
           settlementEvent.eventId = headerEventId;
         }

@@ -9,6 +9,8 @@ import type {
   WebhookSettlementEvent,
 } from '../types/domain.ts';
 import {
+  asPlainObject,
+  normalizeUtcIsoTimestamp,
   safeOptionalId,
   safePositiveNumber,
   safePrimitiveString,
@@ -56,9 +58,12 @@ export class HodleProvider implements IPixCryptoProvider {
         }
       );
       if (quoteRes.ok) {
-        const quoteData = (await quoteRes.json()) as Record<string, unknown>;
-        estimatedCryptoAmount =
-          safePositiveNumber(quoteData.estimatedAmount) ?? safePositiveNumber(quoteData.amountOut);
+        const quoteData = asPlainObject(await quoteRes.json());
+        if (quoteData) {
+          estimatedCryptoAmount =
+            safePositiveNumber(quoteData.estimatedAmount) ??
+            safePositiveNumber(quoteData.amountOut);
+        }
       }
     } catch {
       // Cotação prévia opcional
@@ -92,7 +97,10 @@ export class HodleProvider implements IPixCryptoProvider {
       throw new Error(`Hodle (HTTP ${response.status}): ${errorText}`);
     }
 
-    const data = (await response.json()) as Record<string, unknown>;
+    const data = asPlainObject(await response.json());
+    if (!data) {
+      throw new Error('Resposta inválida da API Hodle.');
+    }
     const pixCopyPaste = (
       safeOptionalId(data.pixCopyPaste) ??
       safeOptionalId(data.qrCode) ??
@@ -103,13 +111,14 @@ export class HodleProvider implements IPixCryptoProvider {
       throw new Error('Resposta da API Hodle não retornou o código Pix Copia e Cola.');
     }
 
-    const expiresAt =
-      safeOptionalId(data.expiresAt) ??
-      new Date(Date.now() + input.expirationMinutes * 60_000).toISOString();
+    const defaultExpIso = new Date(Date.now() + input.expirationMinutes * 60_000).toISOString();
+    const expiresAt = normalizeUtcIsoTimestamp(data.expiresAt, defaultExpIso) ?? defaultExpIso;
 
+    const rawQr = safeOptionalId(data.qrCodeBase64);
     const pixQrCodeBase64 =
-      safeOptionalId(data.qrCodeBase64) ??
-      (await QRCode.toDataURL(pixCopyPaste, { width: 320, margin: 2 }));
+      rawQr && /^data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+$/.test(rawQr)
+        ? rawQr
+        : await QRCode.toDataURL(pixCopyPaste, { width: 320, margin: 2 });
 
     return {
       providerChargeId:
@@ -143,13 +152,10 @@ export class HodleProvider implements IPixCryptoProvider {
   }
 
   public parseWebhookPayload(payload: unknown): WebhookSettlementEvent | null {
-    if (!payload || typeof payload !== 'object') return null;
-    const root = payload as Record<string, unknown>;
+    const root = asPlainObject(payload);
+    if (!root) return null;
     const event = safePrimitiveString(root.event);
-    const data = (typeof root.data === 'object' && root.data ? root.data : {}) as Record<
-      string,
-      unknown
-    >;
+    const data = asPlainObject(root.data) ?? {};
 
     let newStatus: OrderStatus | null = null;
     if (event === 'DEPOSIT_PIX_CONFIRMED') {
@@ -192,7 +198,8 @@ export class HodleProvider implements IPixCryptoProvider {
       );
       if (res.status === 404) return { status: 'EXPIRED' };
       if (!res.ok) return null;
-      const data = (await res.json()) as Record<string, unknown>;
+      const data = asPlainObject(await res.json());
+      if (!data) return null;
       const st = safePrimitiveString(data.status).toUpperCase();
       if (st === 'COMPLETED' || st === 'ASSET_SUCCESS' || st === 'SETTLED') {
         return {

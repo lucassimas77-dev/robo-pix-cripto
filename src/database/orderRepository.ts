@@ -9,6 +9,7 @@ import type {
   RuntimeAccountSettings,
   SupportedProviderName,
 } from '../types/domain.ts';
+import { normalizeUtcIsoTimestamp } from '../utils/cpfCnpjValidator.ts';
 
 export class OrderRepository {
   private db: DatabaseSync;
@@ -212,9 +213,12 @@ export class OrderRepository {
       remoteDeactivatedFlag ? 1 : 0,
       order.txHash ?? null,
       order.endToEndId ?? null,
-      order.createdAt,
-      order.expiresAt,
-      order.paidAt ?? null
+      normalizeUtcIsoTimestamp(order.createdAt, new Date().toISOString())!,
+      normalizeUtcIsoTimestamp(
+        order.expiresAt,
+        new Date(Date.now() + 15 * 60_000).toISOString()
+      )!,
+      order.paidAt ? (normalizeUtcIsoTimestamp(order.paidAt) ?? null) : null
     );
   }
 
@@ -325,11 +329,13 @@ export class OrderRepository {
   }
 
   public extendOrderExpiration(orderId: string, newExpiresAtIso: string): void {
+    const normalizedIso = normalizeUtcIsoTimestamp(newExpiresAtIso);
+    if (!normalizedIso) return;
     this.db
       .prepare(
         `UPDATE orders SET expires_at = ? WHERE id = ? AND status = 'PENDING' AND expires_at < ?`
       )
-      .run(newExpiresAtIso, orderId, newExpiresAtIso);
+      .run(normalizedIso, orderId, normalizedIso);
   }
 
   public updateOrderStatus(

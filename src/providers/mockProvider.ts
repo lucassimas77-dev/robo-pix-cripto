@@ -8,6 +8,7 @@ import type {
   WebhookSettlementEvent,
 } from '../types/domain.ts';
 import {
+  asPlainObject,
   safeOptionalId,
   safePositiveNumber,
   safePrimitiveString,
@@ -76,13 +77,10 @@ export class MockProvider implements IPixCryptoProvider {
   }
 
   public parseWebhookPayload(payload: unknown): WebhookSettlementEvent | null {
-    if (!payload || typeof payload !== 'object') return null;
-    const obj = payload as Record<string, unknown>;
+    const obj = asPlainObject(payload);
+    if (!obj) return null;
     const event = safePrimitiveString(obj.event);
-    const data = (typeof obj.data === 'object' && obj.data ? obj.data : {}) as Record<
-      string,
-      unknown
-    >;
+    const data = asPlainObject(obj.data) ?? {};
 
     if (event === 'MOCK_SETTLED_CRYPTO') {
       return {

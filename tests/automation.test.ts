@@ -201,6 +201,14 @@ test('Concorrência, mensagens pós-pagamento ("já paguei"), estado AWAITING_AM
     'Aqui está o comprovante de 50',
     'Pix de 50 pago!',
     'O pix de R$ 50 já foi pago',
+    'Recebeu o pix de 50?',
+    'Já recebeu o pix de 50?',
+    'Caiu o pix de 50?',
+    'Confirmou o pix de 50?',
+    'Deu certo o pix de 50?',
+    'Fiz 50 no pix',
+    'Passei 50 no pix',
+    'Depositei 50 no pix',
   ]) {
     await engine.handleIncomingMessage({
       phone: clientPhone,
@@ -378,6 +386,32 @@ test('Servidor HTTP bloqueia Bearer password brute-force, CSRF cross-site, NaN e
     const whJson2 = (await whRes2.json()) as Record<string, unknown>;
     assert.equal(whJson2.duplicate, true);
 
+    // Divergência entre X-DePix-Event-Id e data.event_id assinado é bloqueada com HTTP 400!
+    const mismatchPayload = JSON.stringify({
+      event: 'checkout.completed',
+      data: {
+        event_id: 'evt_signed_body_id',
+        id: 'chk_999',
+        product_id: 'prd_e2e_1',
+        status: 'completed',
+        is_live: true,
+      },
+    });
+    const sigMismatch = crypto
+      .createHmac('sha256', 'whsec_e2e_depix')
+      .update(`${ts}.${mismatchPayload}`)
+      .digest('hex');
+    const whMismatchRes = await fetch(`${url}/webhooks/depixapp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-DePix-Signature': `t=${ts},v1=${sigMismatch}`,
+        'X-DePix-Event-Id': 'evt_spoofed_header_id',
+      },
+      body: mismatchPayload,
+    });
+    assert.equal(whMismatchRes.status, 400);
+
     // 6. Filtro allowedTestPhone incompleto (<10 dígitos) é rejeitado com HTTP 400 (fail-closed)!
     const badPhoneFilter = await fetch(`${url}/api/whatsapp/settings`, {
       method: 'POST',
@@ -429,6 +463,29 @@ test('Servidor HTTP bloqueia Bearer password brute-force, CSRF cross-site, NaN e
       body: hugeBody,
     });
     assert.equal(tooLargeRes.status, 413);
+    // 5. Normalização UTC de expiresAt com offset -03:00 funciona na comparação lexicográfica do SQLite!
+    repository.createOrder({
+      id: 'ord_tz_offset',
+      externalId: 'ext_tz_offset',
+      provider: 'hodle',
+      providerChargeId: 'dep_tz_1',
+      customerPhone: '5511933334444',
+      amountBrl: 100,
+      cryptoAsset: 'USDT',
+      cryptoNetwork: 'POLYGON',
+      walletAddress: '0x123',
+      pixCopyPaste: '000201...',
+      status: 'PENDING',
+      warningSent: false,
+      createdAt: '2026-11-16T17:00:00.000Z',
+      expiresAt: '2026-11-16T14:15:00-03:00',
+    });
+    const activeTz = repository.findActivePendingOrderByPhone(
+      '5511933334444',
+      '2026-11-16T17:00:00.000Z'
+    );
+    assert.equal(activeTz?.id, 'ord_tz_offset');
+    assert.equal(activeTz?.expiresAt, '2026-11-16T17:15:00.000Z');
   } finally {
     server.close();
     repository.close();
@@ -461,6 +518,7 @@ test('DePixAppProvider detecta estorno (cancelled -> FAILED) em prd_..., prioriz
       res.end(
         JSON.stringify({
           checkouts: [
+            null,
             { id: 'chk_1', status: 'cancelled', is_live: 1 },
             { id: 'chk_2', status: 'completed', is_live: 1 },
           ],
@@ -527,6 +585,33 @@ test('DePixAppProvider detecta estorno (cancelled -> FAILED) em prd_..., prioriz
       data: { id: 'chk_adv_2', status: 'completed', is_live: true, amount_received: '' },
     });
     assert.equal(advAmt2?.cryptoAmount, undefined);
+
+    // Whitelist estrita fail-closed para is_live em produção ("false", undefined, null, "0" -> rejeita!)
+    for (const fakeLive of ['false', '0', undefined, null, false, 0]) {
+      assert.equal(
+        depix.parseWebhookPayload({
+          event: 'checkout.completed',
+          data: { id: 'chk_fake_live', status: 'completed', is_live: fakeLive },
+        }),
+        null
+      );
+    }
+
+    // Booleanos false / 0 em IDs não viram strings "false"/"0"
+    const boolIds = depix.parseWebhookPayload({
+      event: 'checkout.completed',
+      data: {
+        event_id: false,
+        id: 'chk_real_999',
+        product_id: false,
+        status: 'completed',
+        is_live: 1,
+        blockchain_tx_id: false,
+      },
+    });
+    assert.equal(boolIds?.providerChargeId, 'chk_real_999');
+    assert.equal(boolIds?.eventId, undefined);
+    assert.equal(boolIds?.txHash, undefined);
   } finally {
     fakeDepixServer.close();
   }
@@ -732,6 +817,29 @@ test('ExpirationWatcher protege contra 503 transitório, respeita grace window d
     await engine.handleIncomingMessage({ phone: racePhone, text: '2' });
     const afterTwo = repository.findMostRecentOrderByPhone(racePhone);
     assert.equal(afterTwo?.amountBrl, 80);
+    // 5. Normalização UTC de expiresAt com offset -03:00 funciona na comparação lexicográfica do SQLite!
+    repository.createOrder({
+      id: 'ord_tz_offset',
+      externalId: 'ext_tz_offset',
+      provider: 'hodle',
+      providerChargeId: 'dep_tz_1',
+      customerPhone: '5511933334444',
+      amountBrl: 100,
+      cryptoAsset: 'USDT',
+      cryptoNetwork: 'POLYGON',
+      walletAddress: '0x123',
+      pixCopyPaste: '000201...',
+      status: 'PENDING',
+      warningSent: false,
+      createdAt: '2026-11-16T17:00:00.000Z',
+      expiresAt: '2026-11-16T14:15:00-03:00',
+    });
+    const activeTz = repository.findActivePendingOrderByPhone(
+      '5511933334444',
+      '2026-11-16T17:00:00.000Z'
+    );
+    assert.equal(activeTz?.id, 'ord_tz_offset');
+    assert.equal(activeTz?.expiresAt, '2026-11-16T17:15:00.000Z');
   } finally {
     fakeServer.close();
     repository.close();

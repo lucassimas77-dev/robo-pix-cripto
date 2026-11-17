@@ -9,6 +9,7 @@ import type {
   WebhookSettlementEvent,
 } from '../types/domain.ts';
 import {
+  asPlainObject,
   safeOptionalId,
   safePositiveNumber,
   safePrimitiveString,
@@ -89,12 +90,22 @@ export class DePixAppProvider implements IPixCryptoProvider {
   }
 
   /**
-   * Fail-closed conforme `depix_docs.md:1715`: bloqueia eventos `is_live: false | 0`
-   * sempre que a chave NÃO for explicitamente uma chave sandbox `sk_test_`.
+   * Whitelist estrita fail-closed conforme `depix_docs.md:1715`:
+   * Em produção (`!isTestKey()`), todo checkout exige `is_live === true || is_live === 1`.
+   * Eventos `deposit.*` (que não existem em sandbox e omitem `is_live`, conf. `depix_docs.md:1744`)
+   * só são bloqueados se trouxerem flag explicitamente falsa.
    */
-  private shouldRejectSandboxItem(isLiveField: unknown): boolean {
+  private shouldRejectSandboxItem(isLiveField: unknown, isDepositEvent = false): boolean {
     if (this.isTestKey()) return false;
-    return isLiveField === false || isLiveField === 0;
+    if (isDepositEvent) {
+      return (
+        isLiveField === false ||
+        isLiveField === 0 ||
+        isLiveField === 'false' ||
+        isLiveField === '0'
+      );
+    }
+    return !(isLiveField === true || isLiveField === 1);
   }
 
   private extractCryptoAmountFromItem(item: Record<string, unknown>): number | undefined {
@@ -197,11 +208,11 @@ export class DePixAppProvider implements IPixCryptoProvider {
       throw new Error(this.extractHumanError(response.status, errBody));
     }
 
-    const data = (await response.json()) as Record<string, unknown>;
-    const product =
-      typeof data.product === 'object' && data.product
-        ? (data.product as Record<string, unknown>)
-        : data;
+    const data = asPlainObject(await response.json());
+    if (!data) {
+      throw new Error('Resposta inválida da DePix App ao criar cobrança.');
+    }
+    const product = asPlainObject(data.product) ?? data;
     const prdId = safePrimitiveString(product.id).trim();
     const paymentUrl =
       safePrimitiveString(product.payment_url).trim() ||
@@ -266,15 +277,16 @@ export class DePixAppProvider implements IPixCryptoProvider {
   }
 
   public parseWebhookPayload(payload: unknown): WebhookSettlementEvent | null {
-    if (!payload || typeof payload !== 'object') return null;
-    const root = payload as Record<string, unknown>;
+    const root = asPlainObject(payload);
+    if (!root) return null;
     const eventName = safePrimitiveString(root.event).toLowerCase();
-    const data = (typeof root.data === 'object' && root.data ? root.data : root) as Record<
-      string,
-      unknown
-    >;
+    const data = asPlainObject(root.data) ?? root;
 
-    if (this.shouldRejectSandboxItem(data.is_live)) {
+    const isDepositEvent =
+      eventName.startsWith('deposit.') ||
+      safePrimitiveString(data.type).toLowerCase() === 'deposit';
+
+    if (this.shouldRejectSandboxItem(data.is_live, isDepositEvent)) {
       return null;
     }
 
@@ -368,12 +380,16 @@ export class DePixAppProvider implements IPixCryptoProvider {
         if (res.status === 404) return { status: 'EXPIRED' };
         if (!res.ok) return null;
 
-        const root = (await res.json()) as Record<string, unknown>;
-        const rawList = Array.isArray(root.checkouts)
-          ? (root.checkouts as Array<Record<string, unknown>>)
-          : [];
+        const root = asPlainObject(await res.json());
+        if (!root) return null;
+        const rawList = Array.isArray(root.checkouts) ? (root.checkouts as unknown[]) : [];
 
-        const validItems = rawList.filter((item) => !this.shouldRejectSandboxItem(item.is_live));
+        const validItems = rawList
+          .map((entry) => asPlainObject(entry))
+          .filter(
+            (item): item is Record<string, unknown> =>
+              item !== null && !this.shouldRejectSandboxItem(item.is_live, false)
+          );
         if (validItems.length === 0) {
           return { status: 'PENDING' };
         }
@@ -451,13 +467,11 @@ export class DePixAppProvider implements IPixCryptoProvider {
       if (res.status === 404) return { status: 'EXPIRED' };
       if (!res.ok) return null;
 
-      const root = (await res.json()) as Record<string, unknown>;
-      const chk =
-        typeof root.checkout === 'object' && root.checkout
-          ? (root.checkout as Record<string, unknown>)
-          : root;
+      const root = asPlainObject(await res.json());
+      if (!root) return null;
+      const chk = asPlainObject(root.checkout) ?? root;
 
-      if (this.shouldRejectSandboxItem(chk.is_live)) {
+      if (this.shouldRejectSandboxItem(chk.is_live, false)) {
         return { status: 'PENDING' };
       }
 
@@ -541,11 +555,9 @@ export class DePixAppProvider implements IPixCryptoProvider {
         }
       );
       if (!res.ok) return {};
-      const root = (await res.json()) as Record<string, unknown>;
-      const chk =
-        typeof root.checkout === 'object' && root.checkout
-          ? (root.checkout as Record<string, unknown>)
-          : root;
+      const root = asPlainObject(await res.json());
+      if (!root) return {};
+      const chk = asPlainObject(root.checkout) ?? root;
       return {
         txHash: safeOptionalId(chk.blockchain_tx_id),
         cryptoAmount: this.extractCryptoAmountFromItem(chk),
