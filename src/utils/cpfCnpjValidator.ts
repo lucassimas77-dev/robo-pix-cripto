@@ -21,6 +21,10 @@ const EDGE_PUNCT_CHARS = new Set([
   ';',
   ':',
   '-',
+  '*',
+  '_',
+  '~',
+  '`',
 ]);
 
 const RESERVED_TLDS = new Set([
@@ -257,7 +261,7 @@ function parseNumericToken(token: string): number | null {
 
 const NUM_CORE =
   '(?:\\d{1,3}(?:\\.\\d{3})+,\\d{1,2}|\\d{1,3}(?:\\.\\d{3})+(?![.,]\\d|\\d)|\\d+,\\d{1,2}(?!\\d)|\\d+\\.\\d{1,2}(?![.,]\\d|\\d)|\\d+)';
-const NUM_LEFT = '(?<![-\\w@/,]|\\d\\.)';
+const NUM_LEFT = '(?<![-\\w@/,.])';
 const NUM_RIGHT = '(?![.,]\\d|\\d|[-\\w]|[ \\t]*%|\\.[a-zA-Z]|\\/[a-zA-Z0-9])';
 
 export function parseBrlAmountFromText(text: string): number | null {
@@ -290,24 +294,29 @@ export function parseBrlAmountFromText(text: string): number | null {
 
   if (!filteredWords) return null;
 
-  const withoutContactsAndDates = filteredWords
+  // Remove formatação Markdown do WhatsApp (*50,00*, _50,00_, ~50~, `50`) preservando underscores internos de códigos (ord_123)
+  const unformattedWords = filteredWords
+    .replace(/(^|[\s(])_([^_\n]+)_(?=$|[\s).,!?;:])/g, '$1$2')
+    .replace(/[*~`]/g, '');
+
+  const withoutContactsAndDates = unformattedWords
     // 1) Remove documentos estruturados (CPF, CNPJ numérico ou alfanumérico, CEP pontuado, RG) e datas ANTES de pares hifenizados!
     .replace(/(?<![A-Za-z0-9])[A-Za-z0-9]{2}\.[A-Za-z0-9]{3}\.[A-Za-z0-9]{3}\/[A-Za-z0-9]{4}-\d{2}(?!\d)/g, ' ')
     .replace(/(?<!\d)\d{3}\.\d{3}\.\d{3}-\d{2}(?!\d)/g, ' ')
     .replace(/(?<!\d)\d{2}\.\d{3}-\d{3}(?!\d)/g, ' ')
     .replace(/(?<!\d)\d{1,2}\.\d{3}\.\d{3}-[\dxX]\b/g, ' ')
-    .replace(/\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/g, ' ')
+    .replace(/(?<!\d)(?:\d{4}\/\d{1,2}\/\d{1,2}|\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)(?!\d)/g, ' ')
     .replace(/(?<!\d)(?:\d{4}-\d{1,2}-\d{1,2}|\d{1,2}-\d{1,2}-\d{2,4})(?!\d)/g, ' ')
     .replace(/(?<![\d.,])\d+(?:-\d+){2,}(?![\d.,])/g, ' ')
-    // 2) Remove telefones completos COM ou SEM parênteses, DDD 2 ou 3 dígitos (011), com ou sem hífen central e +55 colado
+    // 2) Remove telefones completos COM ou SEM parênteses, DDD 2 ou 3 dígitos (011), com ou sem espaço após DDD/DDI
     .replace(
-      /(?:(?:\+\d{1,3}[ \t]*|\b55[ \t]+))?(?:\(0?\d{2}\)[ \t]*|\b0?\d{2}[ \t]+)\d{4,5}[-\s]?\d{4}\b/g,
+      /(?:(?:\+\d{1,3}[ \t]*|\b55[ \t]+))?(?:\(0?\d{2}\)[ \t]*|\b0?\d{2}[ \t]*)\d{4,5}[-\s]?\d{4}\b/g,
       ' '
     )
-    // 3) Remove CEPs simples, telefones curtos e contas hifenizadas ("01310-100", "98888-7777", "56789-0")
+    // 3) Remove CEPs simples, telefones curtos, números longos e horários HH:MM(:SS)
     .replace(/(?<![\d.,/-])\d+-\d+(?![\d.,/-])/g, ' ')
     .replace(/\b\d{8,}\b/g, ' ')
-    .replace(/\b\d{1,2}:\d{2}\b/g, ' ')
+    .replace(/\b\d{1,2}:\d{2}(?::\d{2})?\b/g, ' ')
     .replace(/\b\d{1,2}h(?:\d{2})?\b/gi, ' ');
 
   // Rejeita valores negativos explícitos, vírgulas malformadas com 3+ dígitos ("150,555", "1,500") e centavos decimais ("10,50 centavos")
@@ -359,41 +368,44 @@ export function parseBrlAmountFromText(text: string): number | null {
       /\b(?:pedido|ordem|protocolo|chamado|fatura|boleto|nota|nf|mesa|quarto|apto|apartamento|id|cod|c[oó]digo|item|op[cç][aã]o|ag[eê]ncia|ag|conta|cc|banco|cpf|cnpj|cep|rg)(?:[ \t]*[:=-][ \t]*(?:#|n[º°o.]?[ \t:.=-]*)?|[ \t]+(?:#|n[º°o.]?[ \t:.=-]*)?|[ \t]*#[ \t]*)\d+(?:[.,]\d+)?\b/gi,
       ' '
     )
-    // Converte composições faladas em português ("2 mil e 500", "um mil", "mil reais", "5 mil", "1.500 reais e 50 centavos", "150 centavos")
-    .replace(/(?<![-\w@/,]|\d\.)um[ \t]+mil[ \t]+e[ \t]+(\d{1,3})(?![.,]\d|\d)/gi, (_m, rest) =>
-      String(1000 + Number(rest))
-    )
+    // Remove "1 pix" / "5 pix" ANTES de normalizar "mil" para que "um pix de mil e 500" vire "pix de mil e 500" limpo!
+    .replace(/(?<!r\$[ \t]*)\b\d+[ \t]+pix\b/gi, ' pix ')
+    // Converte milhões para escala exata (caindo no aviso de teto máximo em vez de cobrar R$ 1,00!)
     .replace(
-      /(?<![-\w@/,]|\d\.)(\d{1,3})[ \t]*mil[ \t]+e[ \t]+(\d{1,3})(?![.,]\d|\d)/gi,
-      (_m, k, rest) => String(Number(k) * 1000 + Number(rest))
+      /(?<![-\w@/,.])(\d{1,3}(?:[.,]\d{1,2})?)(?![.,]\d|\d)[ \t]*milh(?:[aã]o|[oõ]es)\b/gi,
+      (_m, nStr) => String(Math.round(Number(String(nStr).replace(',', '.')) * 1_000_000))
     )
-    .replace(/\bum[ \t]+mil\b/gi, '1000')
-    .replace(/\br\$[ \t]*mil\b/gi, 'R$ 1000')
-    .replace(/\bmil[ \t]+(reais|real|brl|contos?)\b/gi, '1000 $1')
-    .replace(/\bpix[ \t]+de[ \t]+mil\b/gi, 'pix de 1000')
+    // Passagem única determinística para TODAS as composições com "mil" ("[N|um] mil [reais] [e M [reais] [e C centavos] | e C centavos]")
     .replace(
-      /(?<![-\w@/,]|\d\.)(\d{1,4}(?:[.,]\d{1,2})?)(?![.,]\d|\d)[ \t]*mil\b/gi,
-      (_m, nStr) => {
-        const val = Number(String(nStr).replace(',', '.')) * 1000;
-        return Number.isFinite(val) ? String(Math.round(val * 100) / 100).replace('.', ',') : ' ';
+      /(?:(?<![-\w@/,.])(\d{1,4}(?:[.,]\d{1,2})?)(?![.,]\d|\d)[ \t]*|\bum[ \t]+|(?<![-\w@/,.\d]))mil\b(?:[ \t]+(reais|real|brl|contos?)\b)?(?:[ \t]+e[ \t]+(?:(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b|(\d{1,3})(?![.,]\d|\d|[ \t]*centavos?\b)(?:[ \t]*(reais|real|brl|contos?)\b)?(?:[ \t]+e[ \t]+(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b)?))?/gi,
+      (_m, multStr, unit1, directCents, extraReais, unit2, tailCents) => {
+        const mult = multStr ? Number(String(multStr).replace(',', '.')) : 1;
+        if (!Number.isFinite(mult) || mult <= 0) return ' ';
+        const addReais = extraReais ? Number(extraReais) : 0;
+        const cents = directCents ? Number(directCents) : tailCents ? Number(tailCents) : 0;
+        const total = Math.round((mult * 1000 + addReais + cents / 100) * 100) / 100;
+        const formatted = Number.isInteger(total)
+          ? String(total)
+          : total.toFixed(2).replace('.', ',');
+        const hasUnit = Boolean(unit1 || unit2 || directCents || tailCents);
+        return hasUnit ? `${formatted} reais` : formatted;
       }
     )
+    // Converte "X reais e Y centavos" (incluindo milhar pontuado "1.500 reais e 50 centavos") e "N centavos" isolado
     .replace(
-      /(?<![-\w@/,]|\d\.)(\d{1,3}(?:\.\d{3})+|\d{1,6})[ \t]*(?:reais|real)[ \t]+e[ \t]+(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b/gi,
+      /(?<![-\w@/,.])(\d{1,3}(?:\.\d{3})+|\d{1,6})[ \t]*(?:reais|real)[ \t]+e[ \t]+(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b/gi,
       (_m, r, c) => `R$ ${String(r).replace(/\./g, '')},${String(c).padStart(2, '0')}`
     )
-    .replace(/(?<![-\w@/,]|\d\.)(\d{1,6})(?![.,]\d|\d)[ \t]*centavos?\b/gi, (_m, c) => {
+    .replace(/(?<![-\w@/,.])(\d{1,6})(?![.,]\d|\d)[ \t]*centavos?\b/gi, (_m, c) => {
       const valFixed = (Number(c) / 100).toFixed(2).replace('.', ',');
       return `R$ ${valFixed}`;
     })
-    // Remove "1 pix" / "5 pix" (sem valor ou com valor já separado), parcelas ("3x") e durações ("15 min")
-    .replace(/(?<!r\$[ \t]*)\b\d+[ \t]+pix\b/gi, ' pix ')
     .replace(/\b\d+[ \t]*(?:x|vezes|parcelas?)\b/gi, ' ')
     .replace(/\b\d+[ \t]*(?:min|minutos?|seg|segundos?|dias?|horas?|meses|anos?)\b/gi, ' ');
 
-  // Rejeita somas implícitas com "e" entre dois valores distintos ("pix de R$ 50 e 30 reais")
+  // Rejeita somas implícitas com "e" ou "mais" entre dois valores distintos ("pix de R$ 50 e 30 reais", "pix de R$ 50 mais 30")
   if (
-    /(?<![-\w@/,]|\d\.)(?:r\$[ \t]*)?\d[\d.,]*[ \t]*(?:reais|real|brl|conto|contos)?[ \t]+e[ \t]+(?:r\$[ \t]*)?\d/i.test(
+    /(?<![-\w@/,.])(?:r\$[ \t]*)?\d[\d.,]*[ \t]*(?:reais|real|brl|conto|contos)?[ \t]+(?:e|mais)[ \t]+(?:r\$[ \t]*)?\d/i.test(
       sanitized
     )
   ) {
@@ -416,16 +428,12 @@ export function parseBrlAmountFromText(text: string): number | null {
     return null;
   }
 
-  // Camada 1: precedido por R$ (exige candidato único distinto)
+  // Camadas 1 & 2 combinadas: se houver valores explícitos com "R$" e/ou "reais", exige que não haja conflito entre eles!
   const explicitPrefixGlobal = new RegExp(`(?<!-)r\\$[ \\t]*(${NUM_CORE})${NUM_RIGHT}`, 'gi');
   const prefixMatches = Array.from(sanitized.matchAll(explicitPrefixGlobal))
     .map((m) => parseNumericToken(m[1]))
     .filter((v): v is number => v !== null);
-  const uniquePrefix = Array.from(new Set(prefixMatches));
-  if (uniquePrefix.length > 1) return null;
-  if (uniquePrefix.length === 1) return uniquePrefix[0];
 
-  // Camada 2: seguido por reais / real / brl / conto (exige candidato único distinto)
   const explicitSuffixGlobal = new RegExp(
     `${NUM_LEFT}(${NUM_CORE})[ \\t]*(?:reais|real|brl|conto|contos)\\b`,
     'gi'
@@ -433,9 +441,10 @@ export function parseBrlAmountFromText(text: string): number | null {
   const suffixMatches = Array.from(sanitized.matchAll(explicitSuffixGlobal))
     .map((m) => parseNumericToken(m[1]))
     .filter((v): v is number => v !== null);
-  const uniqueSuffix = Array.from(new Set(suffixMatches));
-  if (uniqueSuffix.length > 1) return null;
-  if (uniqueSuffix.length === 1) return uniqueSuffix[0];
+
+  const uniqueExplicit = Array.from(new Set([...prefixMatches, ...suffixMatches]));
+  if (uniqueExplicit.length > 1) return null;
+  if (uniqueExplicit.length === 1) return uniqueExplicit[0];
 
   // Camada 3: único número candidato inequívoco na frase
   if (allMatches.length !== 1) return null;
@@ -461,8 +470,10 @@ export function normalizeCommandText(text: string): string {
 
   return text
     .slice(start, end + 1)
+    .replace(/[*_~`]/g, '')
     .toLowerCase()
-    .replace(/\s+/g, ' ');
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 export function isExitCommand(text: string): boolean {
@@ -592,6 +603,9 @@ export function isStatusQueryMessage(text: string): boolean {
   if (
     /\b(?:quero|gera|gerar|manda|mandar|preciso|faz|fazer)[ \t]+(?:outro|novo|mais[ \t]+um)\b/i.test(
       t
+    ) ||
+    /\b(?:quero|preciso|vou|posso|pode|gostaria[ \t]+de)[ \t]+(?:pagar|fazer[ \t]+um[ \t]+pix|gerar)\b/i.test(
+      t
     )
   ) {
     return false;
@@ -601,8 +615,13 @@ export function isStatusQueryMessage(text: string): boolean {
     /\b(?:qual[ \t]+(?:[eé][ \t]+)?(?:o[ \t]+)?status|status[ \t]+d[oa][ \t]+(?:meu[ \t]+)?(?:pix|pagamento|cobran[cç]a|pedido))\b/i.test(
       t
     ) ||
-    /\b(?:j[aá][ \t]+)?(?:confirmou|caiu|compensou|recebeu|receberam|entrou|aprovou)\b/i.test(t) ||
-    /\bdeu[ \t]+certo[ \t]+(?:o[ \t]+|meu[ \t]+)?(?:pix|pagamento)\b/i.test(t)
+    /\b(?:j[aá][ \t]+)?(?:confirmou|caiu|compensou|recebeu|receberam|entrou|aprovou|chegou|bateu|creditou|processou)\b/i.test(
+      t
+    ) ||
+    /\bdeu[ \t]+(?:tudo[ \t]+)?certo\b/i.test(t) ||
+    /\b(?:foi|est[aá]|t[aá])[ \t]+(?:confirmad[oa]|aprovad[oa]|compensad[oa]|recebid[oa]|processad[oa]|creditad[oa]|identificad[oa])\b/i.test(
+      t
+    )
   );
 }
 

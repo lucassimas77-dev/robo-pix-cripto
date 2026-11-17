@@ -15,8 +15,10 @@ import { ExpirationWatcher } from '../src/services/expirationWatcher.ts';
 import {
   formatTimeSaoPaulo,
   isCancelCommand,
+  isExitCommand,
   isPaymentConfirmationMessage,
   isPublicHttpsWebhookUrl,
+  isStatusQueryMessage,
   normalizeCommandText,
   normalizeUtcIsoTimestamp,
   parseActiveOrderMenuReply,
@@ -193,6 +195,38 @@ test('Parsing monetário trata pontuação final, milhar, horários, telefones, 
     explicitOptionDigit: null,
     inlineNewAmountBrl: 100,
   });
+
+  // Casos da Busca #14: composições completas com "mil/reais/centavos", "mais", conflito R$/reais, .50, +55 colado ao DDD, HH:MM:SS, YYYY/MM/DD e Markdown WhatsApp
+  assert.equal(parseBrlAmountFromText('pix de 5 mil reais'), 5000);
+  assert.equal(parseBrlAmountFromText('R$ 5 mil reais'), 5000);
+  assert.equal(parseBrlAmountFromText('pix de 1,5 mil reais'), 1500);
+  assert.equal(parseBrlAmountFromText('pix de 2 mil reais e 50 centavos'), 2000.5);
+  assert.equal(parseBrlAmountFromText('2 mil e 50 centavos'), 2000.5);
+  assert.equal(parseBrlAmountFromText('mil e 50 centavos'), 1000.5);
+  assert.equal(parseBrlAmountFromText('mil e 500 reais'), 1500);
+  assert.equal(parseBrlAmountFromText('manda mil e 500 no pix'), 1500);
+  assert.equal(parseBrlAmountFromText('quero um pix de mil e 500'), 1500);
+  assert.equal(parseBrlAmountFromText('manda mil no pix'), 1000);
+  assert.equal(parseBrlAmountFromText('pix de R$ 50 mais 30'), null);
+  assert.equal(parseBrlAmountFromText('pix de 50 mais 30 reais'), null);
+  assert.equal(parseBrlAmountFromText('era 100 reais agora é R$ 80?'), null);
+  assert.equal(parseBrlAmountFromText('pix de .50'), null);
+  assert.equal(parseBrlAmountFromText('meu zap é +55 11988887777 quero fazer um pix'), null);
+  assert.equal(parseBrlAmountFromText('meu zap é +55 1198888-7777 quero fazer um pix'), null);
+  assert.equal(parseBrlAmountFromText('meu zap é 55 11988887777 quero fazer um pix'), null);
+  assert.equal(parseBrlAmountFromText('quero pagar até 14:30:15 no pix'), null);
+  assert.equal(parseBrlAmountFromText('vou pagar em 2026/11/17 no pix'), null);
+  assert.equal(parseBrlAmountFromText('pix de _50,00_'), 50);
+  assert.equal(parseBrlAmountFromText('pix de *150,00*'), 150);
+  assert.equal(isStatusQueryMessage('O pix de 50 deu certo?'), true);
+  assert.equal(isStatusQueryMessage('Chegou o pix de 50?'), true);
+  assert.equal(isStatusQueryMessage('Bateu o pix de 50 aí?'), true);
+  assert.equal(isStatusQueryMessage('Foi confirmado o pix de 50?'), true);
+  assert.equal(isStatusQueryMessage('O pagamento de 50 foi aprovado?'), true);
+  assert.equal(isExitCommand('*sair*'), true);
+  assert.equal(isCancelCommand('*cancelar*'), true);
+  assert.equal(isStatusQueryMessage('*status*'), true);
+  assert.equal(isPaymentConfirmationMessage('*pago*'), true);
 
   // Proteção anti-ReDoS O(N) em mensagens gigantes (64 KB) + clampInt seguro
   const startRedos = performance.now();
