@@ -877,7 +877,7 @@ function unwrapWhatsAppMarkdown(input: string): string {
 }
 
 const FOREIGN_OR_CRYPTO_TOKEN =
-  '(?:us\\$|u\\$|usd|eur|gbp|ars|cad|aud|chf|jpy|cny|pyg|usdt|usdc|btc|lbtc|bitcoins?|sats?|satoshis?|eth|ether|ethereum|sol|solana|bnb|xrp|trx|ltc|doge|matic|pol|depix|d[oó]lar(?:es)?|euros?|libras?|pesos?|ienes?)';
+  '(?:us\\$|u\\$|usd|eur|gbp|ars|cad|aud|chf|jpy|cny|pyg|usdt|tether|usdc|dai|busd|rlusd|btc|lbtc|bitcoins?|sats?|satoshis?|eth|ether|ethereum|sol|solana|bnb|xrp|trx|tron|ltc|doge|ada|cardano|avax|shib|toncoin|xmr|monero|matic|pol|depix|d[oó]lar(?:es)?|euros?|libras?|pesos?|ienes?)';
 
 const FOREIGN_CURRENCY_PREFIX_RE = new RegExp(
   `(?:(?<![A-Za-zÀ-ÿ])${FOREIGN_OR_CRYPTO_TOKEN}(?![A-Za-zÀ-ÿ])(?:[ \\t]+de)?|[€£¥]|(?<!(?<![A-Za-zÀ-ÿ])[rR])\\$)[ \\t]*\\d`,
@@ -889,22 +889,61 @@ const FOREIGN_CURRENCY_SUFFIX_RE = new RegExp(
   'i'
 );
 
+const FOREIGN_CONVERSION_TARGET_RE = new RegExp(
+  `(?:r\\$[ \\t]*\\d[\\d.,]*(?![\\d.,])|(?<![\\d.,])\\d[\\d.,]*(?![\\d.,])(?:[ \\t]*(?:mil|milh(?:[aã]o|[oõ]es)))?[ \\t]*(?:reais|real|brl|contos?))[ \\t]+(?:em|para|pra|por)[ \\t]+${FOREIGN_OR_CRYPTO_TOKEN}(?![A-Za-zÀ-ÿ0-9])`,
+  'i'
+);
+
 function hasForeignCurrencyOrCrypto(input: string): boolean {
-  return FOREIGN_CURRENCY_PREFIX_RE.test(input) || FOREIGN_CURRENCY_SUFFIX_RE.test(input);
+  return (
+    FOREIGN_CURRENCY_PREFIX_RE.test(input) ||
+    FOREIGN_CURRENCY_SUFFIX_RE.test(input) ||
+    FOREIGN_CONVERSION_TARGET_RE.test(input)
+  );
 }
 
 const PHYSICAL_OR_SPEC_SUFFIX_UNIT_PATTERN =
   '(?:x|vezes|parcelas?|itens?|unidades?|pe[cç]as?|produtos?|pacotes?|caixas?|kits?|ingressos?|cotas?|kg|quilos?|g|gramas?|mg|ton|toneladas?|ha|hectares?|arrobas?|alqueires?|l|litros?|ml|m|metros?|m2|m²|m3|m³|cm|cm2|cm²|mm|km|quil[oô]metros?|polegadas?|gb|gigas?|gigabytes?|mb|megas?|megabytes?|tb|terabytes?|kb|mbps|gbps|w|watts?|kw|kwh|kva|v|volts?|kv|mah|amperes?|hz|khz|mhz|ghz|btu|btus|cv|cilindradas?|kcal|calorias?|graus?|pessoas?|lugares?)';
 
+const PCT_REGEX = new RegExp(
+  `${NUM_LEFT}(?:${NUM_CORE})[ \\t]*(?:%|por[ \\t]*cento\\b|porcento\\b)`,
+  'i'
+);
+
+const QTY_WITH_UNIT_PRICE_RE = new RegExp(
+  `(?<![\\d.,])\\d+(?:[.,]\\d+)?(?![.,]\\d|\\d)[ \\t]*${PHYSICAL_OR_SPEC_SUFFIX_UNIT_PATTERN}[ \\t]+(?:de[ \\t]+|por[ \\t]+|a[ \\t]+)?(?:r\\$[ \\t]*)?\\d`,
+  'i'
+);
+
+const SUFFIX_UNIT_STRIP_RE = new RegExp(
+  `(?<![\\d.,])\\d+(?:[.,]\\d+)*(?![.,]\\d|\\d)[ \\t]*${PHYSICAL_OR_SPEC_SUFFIX_UNIT_PATTERN}(?![A-Za-zÀ-ÿ0-9])`,
+  'gi'
+);
+
+const ALL_TOKENS_REGEX = new RegExp(`${NUM_LEFT}(${NUM_CORE})${NUM_RIGHT}`, 'g');
+
 const ACCOUNT_DEBITED_REPORT_RE =
   /\b(?:descontou|descontaram|debitou|debitaram|(?:saiu|sa[ií]ram)(?:[ \t]+(?:os?|as?|r\$|\d[\d.,]*|reais|real|valor|dinheiro|pagamento|pix)){0,6}[ \t]+(?:da[ \t]+(?:minha[ \t]+)?conta|do[ \t]+(?:meu[ \t]+)?(?:banco|saldo)))\b/i;
+
+const PAYMENT_FAILURE_OR_REFUND_RE =
+  /\b(?:deu[ \t]+(?:erro|falha|problema|ruim)|(?:erro|falha)[ \t]+(?:no|na|ao|em|com)\b|falhou|recusou|recusaram|recusad[oa]s?|bloqueou|bloquearam|bloquead[oa]s?|n[aã]o[ \t]+passou|(?:mandei|enviei|fiz|transferi|paguei)[ \t]+errad[oa]|estorno|estornar|estornou|estornaram|estornad[oa]s?|reembolso|reembolsar|reembolsou|reembolsaram|reembolsad[oa]s?|devolv(?:er|a|e|eu|eram|id[oa]s?)|devolu[cç][aã]o|(?:voltou|voltaram|retornou|retornaram)(?:[ \t]+(?:os?|as?|r\$|\d[\d.,]*|reais|real|valor|dinheiro|pagamento|pix)){0,6}[ \t]+(?:pra|para|na|[aà])[ \t]+(?:minha[ \t]+)?(?:conta|banco|saldo))(?![A-Za-zÀ-ÿ0-9])/i;
+
+const EXPLICIT_NEW_ORDER_INTENT_RE =
+  /(?<!(?<![A-Za-zÀ-ÿ0-9])(?:acabei|terminei|vem|vim|desisti|esquece|esque[cç]a|deixa|parei)[ \t]+de[ \t]+|(?<![A-Za-zÀ-ÿ0-9])(?:consegui|fui|tentei|ap[oó]s|depois[ \t]+de|n[aã]o|nem)[ \t]+|(?<![A-Za-zÀ-ÿ0-9])n[aã]o[ \t]+(?:quero|vou|posso|consigo|conseguir|poder|preciso|precisa|vai)[ \t]+)\b(?:quero|queria|gostaria[ \t]+de|gera|gerar|gere|mand[ae]|mandar|envi[ae]|enviar|pass[ae]|passar|preciso(?:[ \t]+de)?|faz|fa[cç]a|fazer|cria|cri[ae]|criar)(?![ \t]+(?:a[ií][ \t]+|aqui[ \t]+)?(?:o[ \t]+|a[ \t]+|meu[ \t]+|minha[ \t]+|um[ \t]+|uma[ \t]+|esse[ \t]+|essa[ \t]+)?(?:comprovante|recibo|status|confirma[cç][aã]o|estorno|reembolso|devolu[cç][aã]o)(?![A-Za-zÀ-ÿ0-9]))[ \t]+(?:(?:a[ií][ \t]+|aqui[ \t]+|agora[ \t]+)?(?:(?:um[ \t]+|uma[ \t]+)?(?:outro|outra|novo|nova)|mais[ \t]+um[a]?)|(?:a[ií][ \t]+|aqui[ \t]+|agora[ \t]+)?(?:um[ \t]+|o[ \t]+)?pix(?![A-Za-zÀ-ÿ0-9])|(?:uma[ \t]+|a[ \t]+)?cobran[cç]a(?![A-Za-zÀ-ÿ0-9])|(?:de[ \t]+)?(?:r\$[ \t]*\d[\d.,]*|\d[\d.,]*[ \t]*(?:reais|real|mil)\b|mil\b))/i;
+
+const POLITE_NEW_ORDER_MODAL_RE =
+  /(?<!(?<![A-Za-zÀ-ÿ0-9])(?:acabei|terminei|consegui|tentei|desisti|esquece|deixa|parei)[ \t]+(?:de[ \t]+)?|(?<![A-Za-zÀ-ÿ0-9])(?:n[aã]o|nem)[ \t]+)\b(?:quero|queria|preciso(?:[ \t]+de)?|vou|posso|pode|poderia|gostaria[ \t]+de|me)[ \t]+(?:pagar|fazer[ \t]+(?:(?:um[ \t]+)?(?:novo[ \t]+|outro[ \t]+)?pix|(?:uma[ \t]+)?(?:nova[ \t]+|outra[ \t]+)?cobran[cç]a)|(?:gerar|mandar|mand[ae]|passar|pass[ae]|enviar|envi[ae]|criar|cri[ae])[ \t]+(?:a[ií][ \t]+|aqui[ \t]+|agora[ \t]+)?(?:(?:um[ \t]+|uma[ \t]+)?(?:outro|outra|novo|nova)|mais[ \t]+um[a]?|(?:um[ \t]+|uma[ \t]+|o[ \t]+|a[ \t]+)?(?:pix|cobran[cç]a|link|qr(?:[ \t]*code)?|chave)|(?:de[ \t]+)?(?:r\$[ \t]*\d|\d+[ \t]*(?:reais|real|mil)\b|mil\b)))(?![A-Za-zÀ-ÿ0-9])/i;
 
 function stripDatesAndHours(input: string): string {
   return input
     .replace(/(?<!\d)(?:\d{4}\/\d{1,2}\/\d{1,2}|\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)(?!\d)/g, ' ')
     .replace(/(?<!\d)(?:\d{4}-\d{1,2}-\d{1,2}|\d{1,2}-\d{1,2}-\d{2,4})(?!\d)/g, ' ')
     .replace(
-      /(?<![\d.,])\d{1,2}:\d{2}(?::\d{2})?(?:[ \t]*(?:h|hs|hr|hrs|horas?|min|mins|minutos?))?(?![A-Za-zÀ-ÿ0-9])/gi,
+      /(?<![\d.,])\d{1,2}:\d{2}(?::\d{2})?(?:[ \t]*(?:a\.m\.|p\.m\.|(?:am|pm|h|hs|hr|hrs|horas?|min|mins|minutos?)(?![A-Za-zÀ-ÿ0-9])))?(?![A-Za-zÀ-ÿ0-9])/gi,
+      ' '
+    )
+    .replace(
+      /(?<![\d.,])(?:0?[1-9]|1[0-2])[ \t]*(?:a\.m\.|p\.m\.|(?:am|pm)(?![A-Za-zÀ-ÿ0-9]))/gi,
       ' '
     )
     .replace(
@@ -975,8 +1014,9 @@ export function parseBrlAmountFromText(text: string): number | null {
     return null;
   }
 
-  // Remove formatação Markdown pareada do WhatsApp (*50,00*, _50,00_, ~50~, `50`) e separa unidade BRL colada ("50reais", "50R$")
+  // Remove formatação Markdown pareada do WhatsApp (*50,00*, _50,00_, ~50~), desenrola citações pareadas ("pix de 50") sem afetar polegadas (27") e separa "50reais"/"50R$"
   const unformattedWords = unwrapWhatsAppMarkdown(filteredWords)
+    .replace(/(^|[\s([{:=-])"([^"\n]+)"(?=$|[\s)\]}.,!?;:])/g, '$1$2')
     .replace(/(\d)(reais|real|brl|contos?|centavos?)(?![A-Za-zÀ-ÿ0-9])/gi, '$1 $2')
     .replace(/(\d)(r\$)/gi, '$1 $2');
   // Converte "50 R$" pós-fixado em "R$ 50" quando não for prefixo de segundo número ("50 R$ 30")
@@ -991,6 +1031,13 @@ export function parseBrlAmountFromText(text: string): number | null {
   }
 
   const withoutContactsAndDates = normalizedBrlOrder
+    // 0) Remove linhas digitáveis FEBRABAN de boletos bancários (47 dígitos) e convênios/concessionárias (48 dígitos) ANTES de sobrar o dígito verificador isolado!
+    .replace(
+      /(?<!\d)\d{5}\.?\d{5}[ \t]+\d{5}\.?\d{6}[ \t]+\d{5}\.?\d{6}[ \t]+\d[ \t]+\d{14}(?!\d)/g,
+      ' '
+    )
+    .replace(/(?<!\d)(?:\d{11}[ \t-]+\d[ \t]*){4}(?!\d)/g, ' ')
+    .replace(/(?<!\d)\d{12}[ \t]+\d{12}[ \t]+\d{12}[ \t]+\d{12}(?!\d)/g, ' ')
     // 1) Remove documentos estruturados (CPF, CNPJ numérico ou alfanumérico, CEP pontuado, RG) e datas ANTES de pares hifenizados!
     .replace(/(?<![A-Za-z0-9])[A-Za-z0-9]{2}\.[A-Za-z0-9]{3}\.[A-Za-z0-9]{3}\/[A-Za-z0-9]{4}-\d{2}(?!\d)/g, ' ')
     .replace(/(?<!\d)\d{3}\.\d{3}\.\d{3}-\d{2}(?!\d)/g, ' ')
@@ -1025,6 +1072,10 @@ export function parseBrlAmountFromText(text: string): number | null {
     /\b(?:(?:e|mas|ent[aã]o|agora)[ \t]+(?:quero[ \t]+|pode[ \t]+)?(?:gerar|gera|gere|fazer|faz|fa[cç]a|criar|cri[ae]|mandar|mand[ae])|trocar|troca|mudar|muda|substituir|alterar|nov[oa]|outr[oa])\b/i.test(
       withNormalizedPtNumbers
     );
+  const hasExplicitNewOrderIntent =
+    EXPLICIT_NEW_ORDER_INTENT_RE.test(withNormalizedPtNumbers) ||
+    POLITE_NEW_ORDER_MODAL_RE.test(withNormalizedPtNumbers);
+
   if (
     /(?<![A-Za-zÀ-ÿ0-9])n[aã]o(?:[ \t]+(?:quero|vou|posso|consigo|consegui|conseguir|poder|preciso|precisa|deu|vai|dar|mais|de|do|da|para|pra|agora|hoje)){1,4}[ \t]+(?:pagar|fazer|gerar|mandar|enviar|(?:o[ \t]+|os[ \t]+|um[ \t]+)?pix\b|r\$|\d)/i.test(
       withNormalizedPtNumbers
@@ -1033,10 +1084,13 @@ export function parseBrlAmountFromText(text: string): number | null {
       withNormalizedPtNumbers
     ) ||
     (!hasReplacementVerb &&
+      /\b(?:cancel(?:ar|a|e)|esquece|esque[cç]a|desisto|desisti|deixa[ \t]+(?:pra[ \t]+l[aá]|quieto|assim)|melhor[ \t]+n[aã]o)(?![A-Za-zÀ-ÿ0-9])/i.test(
+        withNormalizedPtNumbers
+      )) ||
+    (!hasReplacementVerb &&
+      !hasExplicitNewOrderIntent &&
       (ACCOUNT_DEBITED_REPORT_RE.test(withNormalizedPtNumbers) ||
-        /\b(?:cancel(?:ar|a|e)|esquece|esque[cç]a|desisto|desisti|deixa[ \t]+(?:pra[ \t]+l[aá]|quieto|assim)|melhor[ \t]+n[aã]o|deu[ \t]+erro|falhou|recusou|recusad[oa]|bloqueou|bloquead[oa]|estorno|estornar|reembolso|reembolsar|devolv(?:er|a|e)|devolu[cç][aã]o|(?:mandei|enviei|fiz|transferi|paguei)[ \t]+errad[oa])(?![A-Za-zÀ-ÿ0-9])/i.test(
-          withNormalizedPtNumbers
-        )))
+        PAYMENT_FAILURE_OR_REFUND_RE.test(withNormalizedPtNumbers)))
   ) {
     return null;
   }
@@ -1057,11 +1111,11 @@ export function parseBrlAmountFromText(text: string): number | null {
 
   // Rejeita expressões aritméticas (+, *, /, dividido, -, menos — inclusive após "reais") e dúvidas sobre taxas/descontos
   if (
-    /(?<![-\w@/,.])(?:r\$[ \t]*)?\d[\d.,]*[ \t]*(?:reais|real|brl|contos?|centavos?)?[ \t]*[+*×÷/][ \t]*(?:r\$[ \t]*)?\d/i.test(
+    /(?<![-\w@/,.])(?:r\$[ \t]*)?\d[\d.,]*(?![\d.,])[ \t]*(?:reais|real|brl|contos?|centavos?)?[ \t]*[+*×÷/][ \t]*(?:r\$[ \t]*)?\d/i.test(
       withNormalizedPtNumbers
     ) ||
     /\bdividid[oa]s?[ \t]+(?:por|em)[ \t]+\d/i.test(withNormalizedPtNumbers) ||
-    /(?<![-\w@/,.])(?:r\$[ \t]*)?\d[\d.,]*[ \t]*(?:reais|real|brl|contos?)?(?:[ \t]*-[ \t]*(?:r\$[ \t]*)?\d|[ \t]+menos[ \t]+(?:r\$[ \t]*)?\d)/i.test(
+    /(?<![-\w@/,.])(?:r\$[ \t]*)?\d[\d.,]*(?![\d.,])[ \t]*(?:reais|real|brl|contos?)?(?:[ \t]*-[ \t]*(?:r\$[ \t]*)?\d|[ \t]+menos[ \t]+(?:r\$[ \t]*)?\d)/i.test(
       withNormalizedPtNumbers
     ) ||
     /\b(?:taxa|tarifa|juros|multa|desconto)(?:[ \t]+(?:de|do|da|no|na|em|num|numa|pra|para|pro|sobre|acima|abaixo|por|o|a|um|uma|pix|pagamento|cobran[cç]a|valor)){1,6}[ \t]+(?:r\$[ \t]*)?\d/i.test(
@@ -1072,21 +1126,13 @@ export function parseBrlAmountFromText(text: string): number | null {
   }
 
   // Rejeita porcentagens
-  const pctRegex = new RegExp(
-    `${NUM_LEFT}(?:${NUM_CORE})[ \\t]*(?:%|por[ \\t]*cento\\b|porcento\\b)`,
-    'i'
-  );
-  if (pctRegex.test(withNormalizedPtNumbers)) {
+  if (PCT_REGEX.test(withNormalizedPtNumbers)) {
     return null;
   }
 
   // Rejeita multiplicadores de quantidade e medidas com preço unitário ("2 itens de R$ 50", "2 kg de R$ 50", "2 pix de 50")
-  const qtyWithUnitPriceRe = new RegExp(
-    `(?<![\\d.,])\\d+(?:[.,]\\d+)?[ \\t]*${PHYSICAL_OR_SPEC_SUFFIX_UNIT_PATTERN}[ \\t]+(?:de[ \\t]+|por[ \\t]+|a[ \\t]+)?(?:r\\$[ \\t]*)?\\d`,
-    'i'
-  );
   if (
-    qtyWithUnitPriceRe.test(withNormalizedPtNumbers) ||
+    QTY_WITH_UNIT_PRICE_RE.test(withNormalizedPtNumbers) ||
     /(?<![\d.,])(?:[2-9]|\d{2,})[ \t]*pix[ \t]+(?:de[ \t]+|por[ \t]+|a[ \t]+)?(?:r\$[ \t]*)?\d/i.test(
       withNormalizedPtNumbers
     )
@@ -1094,25 +1140,21 @@ export function parseBrlAmountFromText(text: string): number | null {
     return null;
   }
 
-  const suffixUnitStripRe = new RegExp(
-    `(?<![\\d.,])\\d+(?:[.,]\\d+)*[ \\t]*${PHYSICAL_OR_SPEC_SUFFIX_UNIT_PATTERN}(?![A-Za-zÀ-ÿ0-9])`,
-    'gi'
-  );
-
   const sanitized = withNormalizedPtNumbers
-    // Remove hashtags/códigos (#80, #150), "nº 50"/"número 50" autônomo e dados bancários/endereços/especificações/pedidos com ou sem ':'
+    // Remove hashtags/códigos (#80, #150), polegadas com símbolo (27", 15,6", 17'') e "nº 50"/"número 50" autônomo
     .replace(/#[ \t]*\d+(?:[.,]\d+)?/g, ' ')
+    .replace(/(?<![\d.,])\d+(?:[.,]\d+)?(?:"|''|″)/g, ' ')
     .replace(
       /(?<![A-Za-zÀ-ÿ0-9])(?:n[º°]|n[uú]mero|n[uú]m\.?)[ \t#:.-]*\d+(?:[.,]\d+)?(?![A-Za-zÀ-ÿ0-9])/gi,
       ' '
     )
-    // Remove logradouros com ou sem nome da via + número do imóvel ("Rua Tiradentes, 85", "Av. Paulista, 1000", "Rodovia BR-101")
+    // Remove logradouros com ou sem nome da via + número do imóvel ("Rua Tiradentes, 85", "Av. Paulista, 1000", "Rodovia BR-101") sem confundir "TV" ou "largo por 100"!
     .replace(
-      /\b(?:rua|av\.?|avenida|travessa|tv\.?|alameda|al\.?|rodovia|rod\.?|estrada|est\.?|pra[cç]a|largo|viela|beco)(?![A-Za-zÀ-ÿ0-9])(?:[ \t]+(?!(?:pix|pagar|pago|pagamento|cobran[cç]a|mand[ae]|mandar|gera|gerar|faz|fazer|envi[ae]|enviar|pass[ae]|passar|cobr[ae]|cobrar|cria|criar|depositar|transferir|transfiro|quero|preciso|valor|total|reais|real|brl|contos?)(?![A-Za-zÀ-ÿ0-9]))[A-Za-zÀ-ÿ][-A-Za-zÀ-ÿ.]{0,24}(?![-A-Za-zÀ-ÿ.])){0,5}[ \t,-]*(?:n[º°o.]?[ \t]*)?\d{1,5}(?![.,]\d|\d|[ \t]*(?:reais|real|brl|contos?|centavos?|pix)\b)/gi,
+      /(?<![A-Za-zÀ-ÿ0-9])(?:(?:rua|avenida|av|travessa|alameda|rodovia|estrada|pra[cç]a|viela|beco)(?![A-Za-zÀ-ÿ0-9])|(?:av|tv|al|rod|est)\.(?![A-Za-zÀ-ÿ0-9])|largo(?=[ \t]+(?:d[oa]s?|de|s[aã]o|santa|santo|nossa)(?![A-Za-zÀ-ÿ0-9])))(?:[ \t]+(?!(?:pix|pagar|pago|pagamento|cobran[cç]a|mand[ae]|mandar|gera|gerar|faz|fazer|envi[ae]|enviar|pass[ae]|passar|cobr[ae]|cobrar|cria|criar|depositar|transferir|transfiro|quero|preciso|valor|total|reais|real|brl|contos?|por(?=[ \t]+(?:r\$[ \t]*)?\d))(?![A-Za-zÀ-ÿ0-9]))[A-Za-zÀ-ÿ][-A-Za-zÀ-ÿ.]{0,24}(?![-A-Za-zÀ-ÿ.])){0,5}[ \t,-]*(?:n[º°o.]?[ \t]*)?\d{1,5}(?![.,]\d|\d|[ \t]*(?:reais|real|brl|contos?|centavos?|pix)\b)/gi,
       ' '
     )
     .replace(
-      /\b(?:pedido|ordem|protocolo|chamado|fatura|boleto|nota|nf|mesa|quarto|ap|apt|apto|apartamento|rua|av|avenida|travessa|alameda|rodovia|estrada|km|bloco|bl|quadra|qd|lote|lt|casa|sala|loja|andar|piso|id|cod|c[oó]digo|item|op[cç][aã]o|tamanho|tam|numera[cç][aã]o|aro|calibre|bitola|modelo|mod|vers[aã]o|voltagem|tens[aã]o|pot[eê]ncia|ag[eê]ncia|ag|conta|cc|banco|cpf|cnpj|cep|rg)\.?(?:[ \t]*[:=-][ \t]*(?:#|n[º°o.]?[ \t:.=-]*)?|[ \t]+(?:#|n[º°o.]?[ \t:.=-]*)?|[ \t]*#[ \t]*)\d+(?:[.,]\d+)?(?![.,]\d|\d|[ \t]*(?:reais|real|brl|contos?|centavos?)\b)\b/gi,
+      /\b(?:pedido|ordem|protocolo|chamado|fatura|boleto|nota[ \t]+fiscal|nota|nf-?e|nfs-?e|nf|danfe|comanda|cupom|senha|ficha|contrato|matr[ií]cula|or[cç]amento|reserva|mesa|quarto|ap|apt|apto|apartamento|rua|av|avenida|travessa|alameda|rodovia|estrada|km|bloco|bl|quadra|qd|lote|lt|casa|sala|loja|andar|piso|id|cod|c[oó]digo|item|op[cç][aã]o|tamanho|tam|numera[cç][aã]o|aro|calibre|bitola|modelo|mod|vers[aã]o|voltagem|tens[aã]o|pot[eê]ncia|ag[eê]ncia|ag|conta|cc|banco|cpf|cnpj|cep|rg)\.?(?:[ \t]*[:=-][ \t]*(?:#|n[º°o.]?[ \t:.=-]*)?|[ \t]+(?:#|n[º°o.]?[ \t:.=-]*)?|[ \t]*#[ \t]*)\d+(?:[.,]\d+)?(?![.,]\d|\d|[ \t]*(?:reais|real|brl|contos?|centavos?)\b)\b/gi,
       ' '
     )
     // Remove contagem inteira "1 pix" / "5 pix" SEM corromper "R$ 1.500 pix" ou "50,75 pix"!
@@ -1168,10 +1210,10 @@ export function parseBrlAmountFromText(text: string): number | null {
       const valFixed = (Number(c) / 100).toFixed(2).replace('.', ',');
       return `R$ ${valFixed}`;
     })
-    .replace(suffixUnitStripRe, ' ')
-    .replace(/(?<![\d.,])\d+(?:[.,]\d+)*ah(?![A-Za-zÀ-ÿ0-9])/gi, ' ')
+    .replace(SUFFIX_UNIT_STRIP_RE, ' ')
+    .replace(/(?<![\d.,])\d+(?:[.,]\d+)*(?![.,]\d|\d)ah(?![A-Za-zÀ-ÿ0-9])/gi, ' ')
     .replace(
-      /(?<![\d.,])\d+(?:[.,]\d+)*[ \t]*(?:min|mins|minutos?|seg|segs|segundos?|dias?|semanas?|horas?|m[eê]s|meses|anos?)(?![A-Za-zÀ-ÿ0-9])/gi,
+      /(?<![\d.,])\d+(?:[.,]\d+)*(?![.,]\d|\d)[ \t]*(?:min|mins|minutos?|seg|segs|segundos?|dias?|semanas?|horas?|m[eê]s|meses|anos?)(?![A-Za-zÀ-ÿ0-9])/gi,
       ' '
     );
 
@@ -1182,10 +1224,10 @@ export function parseBrlAmountFromText(text: string): number | null {
 
   // Rejeita somas, subtrações e intervalos ("R$ 50 e 30", "R$ 50 mais 30", "R$ 50 - 10", "50 a 100 reais", "de 50 até 100")
   if (
-    /(?<![-\w@/,.])(?:r\$[ \t]*)?\d[\d.,]*[ \t]*(?:reais|real|brl|conto|contos)?[ \t]+(?:e|mais|menos|a|à|at[eé])[ \t]+(?:r\$[ \t]*)?\d/i.test(
+    /(?<![-\w@/,.])(?:r\$[ \t]*)?\d[\d.,]*(?![\d.,])[ \t]*(?:reais|real|brl|conto|contos)?[ \t]+(?:e|mais|menos|a|à|at[eé])[ \t]+(?:r\$[ \t]*)?\d/i.test(
       sanitized
     ) ||
-    /(?<![-\w@/,.])(?:r\$[ \t]*)?\d[\d.,]*[ \t]*(?:reais|real|brl|conto|contos)?[ \t]*-[ \t]*(?:r\$[ \t]*)?\d/i.test(
+    /(?<![-\w@/,.])(?:r\$[ \t]*)?\d[\d.,]*(?![\d.,])[ \t]*(?:reais|real|brl|conto|contos)?[ \t]*-[ \t]*(?:r\$[ \t]*)?\d/i.test(
       sanitized
     )
   ) {
@@ -1193,8 +1235,7 @@ export function parseBrlAmountFromText(text: string): number | null {
   }
 
   // Extrai todos os candidatos numéricos livres com fronteiras esquerda/direita estritas
-  const allTokensRegex = new RegExp(`${NUM_LEFT}(${NUM_CORE})${NUM_RIGHT}`, 'g');
-  const allMatches = Array.from(sanitized.matchAll(allTokensRegex))
+  const allMatches = Array.from(sanitized.matchAll(ALL_TOKENS_REGEX))
     .map((m) => parseNumericToken(m[1]))
     .filter((v): v is number => v !== null);
 
@@ -1420,12 +1461,6 @@ export function parseActiveOrderMenuReply(text: string): ActiveMenuParseResult {
   };
 }
 
-const EXPLICIT_NEW_ORDER_INTENT_RE =
-  /(?<!(?<![A-Za-zÀ-ÿ0-9])(?:acabei|terminei|vem|vim)[ \t]+de[ \t]+|(?<![A-Za-zÀ-ÿ0-9])(?:consegui|fui|tentei|ap[oó]s|depois[ \t]+de)[ \t]+)\b(?:quero|gera|gerar|gere|mand[ae]|mandar|pass[ae]|passar|preciso|faz|fazer|cria|criar)(?![ \t]+(?:a[ií][ \t]+|aqui[ \t]+)?(?:o[ \t]+|meu[ \t]+|um[ \t]+|esse[ \t]+)?(?:comprovante|recibo|status|confirma[cç][aã]o)(?![A-Za-zÀ-ÿ0-9]))[ \t]+(?:outro|novo|mais[ \t]+um|(?:a[ií][ \t]+)?(?:um[ \t]+|o[ \t]+)?pix(?![A-Za-zÀ-ÿ0-9])|(?:uma[ \t]+)?cobran[cç]a(?![A-Za-zÀ-ÿ0-9])|(?:de[ \t]+)?(?:r\$[ \t]*\d[\d.,]*|\d[\d.,]*[ \t]*(?:reais|real|mil)\b|mil\b))/i;
-
-const POLITE_NEW_ORDER_MODAL_RE =
-  /(?<!(?<![A-Za-zÀ-ÿ0-9])(?:acabei|terminei|consegui|tentei)[ \t]+(?:de[ \t]+)?)\b(?:quero|preciso|vou|posso|pode|poderia|gostaria[ \t]+de|me)[ \t]+(?:pagar|fazer[ \t]+(?:um[ \t]+)?pix|(?:gerar|mandar|mand[ae]|passar|pass[ae]|enviar|envi[ae]|criar|cri[ae])[ \t]+(?:a[ií][ \t]+|aqui[ \t]+|agora[ \t]+)?(?:outro|novo|mais[ \t]+um|(?:um[ \t]+|uma[ \t]+|o[ \t]+|a[ \t]+)?(?:pix|cobran[cç]a|link|qr(?:[ \t]*code)?|chave)|(?:de[ \t]+)?(?:r\$[ \t]*\d|\d+[ \t]*(?:reais|real|mil)\b|mil\b)))(?![A-Za-zÀ-ÿ0-9])/i;
-
 export function isStatusQueryMessage(text: string): boolean {
   if (typeof text !== 'string' || text.length > MAX_NLU_LEN * 2) return false;
   const n = normalizeCommandText(text);
@@ -1442,12 +1477,12 @@ export function isStatusQueryMessage(text: string): boolean {
   if (!rawTrimmed || rawTrimmed.length > MAX_NLU_LEN) return false;
   const t = normalizePortugueseNumberWords(rawTrimmed);
 
-  if (ACCOUNT_DEBITED_REPORT_RE.test(t) && !EXPLICIT_NEW_ORDER_INTENT_RE.test(t)) {
-    return true;
-  }
-
   if (EXPLICIT_NEW_ORDER_INTENT_RE.test(t) || POLITE_NEW_ORDER_MODAL_RE.test(t)) {
     return false;
+  }
+
+  if (ACCOUNT_DEBITED_REPORT_RE.test(t) || PAYMENT_FAILURE_OR_REFUND_RE.test(t)) {
+    return true;
   }
 
   return (
@@ -1459,9 +1494,6 @@ export function isStatusQueryMessage(text: string): boolean {
       t
     ) ||
     /\bdeu[ \t]+(?:tudo[ \t]+)?certo\b/i.test(t) ||
-    /\b(?:deu[ \t]+erro|falhou|recusou|n[aã]o[ \t]+passou|(?:mandei|enviei|fiz|transferi|paguei)[ \t]+errad[oa]|estorno|reembolso)\b/i.test(
-      t
-    ) ||
     /\b(?:foi|est[aá]|t[aá])[ \t]+(?:confirmad[oa]|aprovad[oa]|compensad[oa]|recebid[oa]|processad[oa]|creditad[oa]|identificad[oa])\b/i.test(
       t
     )

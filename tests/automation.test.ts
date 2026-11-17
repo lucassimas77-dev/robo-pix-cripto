@@ -716,6 +716,65 @@ test('Parsing monetário trata pontuação final, milhar, horários, telefones, 
   assert.equal(parseBrlAmountFromText('Bateria 60Ah no pix'), null);
   assert.equal(parseBrlAmountFromText('Camisa tam. 42, manda um pix de 80'), 80);
 
+  // Cobertura Busca #23: estornos/devoluções no pretérito/particípio, novos pedidos com artigo/feminino/"preciso de",
+  // "TV"/"largo por 100", linha digitável FEBRABAN, "nota fiscal"/"nf-e"/"comanda"/"cupom"/"contrato", polegadas 27", 2:30pm, tether e "100 reais em BTC"
+  assert.equal(isStatusQueryMessage('O banco estornou meu pix de 50, por quê?'), true);
+  assert.equal(parseBrlAmountFromText('O banco estornou meu pix de 50, por quê?'), null);
+  assert.equal(isStatusQueryMessage('Estornou os 50 reais do pix'), true);
+  assert.equal(parseBrlAmountFromText('Estornou os 50 reais do pix'), null);
+  assert.equal(isStatusQueryMessage('O pix de 50 foi estornado'), true);
+  assert.equal(parseBrlAmountFromText('O pix de 50 foi estornado'), null);
+  assert.equal(isStatusQueryMessage('O pix de 50 foi devolvido'), true);
+  assert.equal(parseBrlAmountFromText('O pix de 50 foi devolvido'), null);
+  assert.equal(isStatusQueryMessage('Reembolsou o pix de 50'), true);
+  assert.equal(parseBrlAmountFromText('Reembolsou o pix de 50'), null);
+  assert.equal(isStatusQueryMessage('O pix de 50 voltou pra minha conta'), true);
+  assert.equal(parseBrlAmountFromText('O pix de 50 voltou pra minha conta'), null);
+  assert.equal(isStatusQueryMessage('Retornou os 50 reais pra minha conta'), true);
+  assert.equal(isStatusQueryMessage('Foi estornado!'), true);
+  assert.equal(isStatusQueryMessage('Deu falha no pix de 50'), true);
+  assert.equal(parseBrlAmountFromText('Deu falha no pix de 50'), null);
+
+  assert.equal(isStatusQueryMessage('Deu erro antes, gera um novo pix de 80'), false);
+  assert.equal(parseBrlAmountFromText('Deu erro antes, gera um novo pix de 80'), 80);
+  assert.equal(isPaymentConfirmationMessage('Já fiz aquele pix, agora preciso de outro de 100'), false);
+  assert.equal(parseBrlAmountFromText('Já fiz aquele pix, agora preciso de outro de 100'), 100);
+  assert.equal(isStatusQueryMessage('Faz uma nova cobrança de 100'), false);
+  assert.equal(isPaymentConfirmationMessage('Faz uma nova cobrança de 100'), false);
+  assert.equal(parseBrlAmountFromText('Faz uma nova cobrança de 100'), 100);
+
+  assert.equal(parseBrlAmountFromText('Pix do conserto da TV 250'), 250);
+  assert.equal(parseBrlAmountFromText('Pix da TV nova 1500'), 1500);
+  assert.equal(parseBrlAmountFromText('Manda o pix da TV, 500'), 500);
+  assert.equal(parseBrlAmountFromText('Eu largo por 100 no pix'), 100);
+  assert.equal(parseBrlAmountFromText('Moro na Tv. das Acácias, 45, manda o pix'), null);
+  assert.equal(parseBrlAmountFromText('Moro no Largo da Batata, 50, aceita pix?'), null);
+
+  assert.equal(
+    parseBrlAmountFromText(
+      'Pagar boleto 34191.79001 01043.510047 91020.150008 5 89990000015000 no pix'
+    ),
+    null
+  );
+  assert.equal(parseBrlAmountFromText('Quero pagar a nota fiscal 1234 no pix'), null);
+  assert.equal(parseBrlAmountFromText('Nota fiscal 1234, manda pix de 300'), 300);
+  assert.equal(parseBrlAmountFromText('NF-e 1234 no pix'), null);
+  assert.equal(parseBrlAmountFromText('Comanda 18 no pix'), null);
+  assert.equal(parseBrlAmountFromText('Cupom 50 no pix'), null);
+  assert.equal(parseBrlAmountFromText('Contrato 1200 no pix'), null);
+  assert.equal(parseBrlAmountFromText('Matrícula 2040 no pix'), null);
+
+  assert.equal(parseBrlAmountFromText('Monitor 27" no pix'), null);
+  assert.equal(parseBrlAmountFromText('Notebook 15,6" no pix'), null);
+  assert.equal(parseBrlAmountFromText('Roda 17\'\' no pix'), null);
+  assert.equal(parseBrlAmountFromText('Ele pediu "pix de 50"'), 50);
+  assert.equal(parseBrlAmountFromText('Te mando o pix 2:30pm'), null);
+  assert.equal(parseBrlAmountFromText('Te mando o pix 10am'), null);
+
+  assert.equal(parseBrlAmountFromText('50 tether no pix'), null);
+  assert.equal(parseBrlAmountFromText('Quanto dá 100 reais em BTC no pix?'), null);
+  assert.equal(parseBrlAmountFromText('Quero converter 100 reais em USDT'), null);
+
   assert.equal(formatTimeSaoPaulo('2026-07-01T18:15:00.000Z'), '15:15');
 });
 
