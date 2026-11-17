@@ -406,6 +406,12 @@ const QTY_OR_UNIT_WORDS = new Set([
   'quilômetro',
   'quilometros',
   'quilômetros',
+  'm2',
+  'm²',
+  'm3',
+  'm³',
+  'cm2',
+  'cm²',
   'pessoa',
   'pessoas',
   'lugar',
@@ -571,7 +577,7 @@ function normalizePortugueseNumberWords(input: string): string {
         ) ||
         (prevWord === 'os' && value === 2));
 
-    const isHourPreposition = ['as', 'às', 'pelas', 'das'].includes(prevWord);
+    const isHourPreposition = ['as', 'às', 'pelas', 'das', 'pras'].includes(prevWord);
 
     // Centavos coloquiais por extenso: "dez e cinquenta" -> "10,50", "vinte e cinco e cinquenta" -> "25,50"
     // Nunca combina como centavos quando for horário ("às duas e trinta", "seis e trinta da tarde") ou intervalo ("entre...")!
@@ -688,6 +694,17 @@ function unwrapWhatsAppMarkdown(input: string): string {
   return s;
 }
 
+function hasForeignCurrencyOrCrypto(input: string): boolean {
+  return (
+    /(?:(?<![A-Za-zÀ-ÿ])(?:us\$|u\$|usd|eur|gbp|ars|cad|aud|chf|jpy|cny|pyg|usdt|usdc|btc|eth|sol|bnb|xrp|trx|ltc|doge|depix)(?![A-Za-zÀ-ÿ])|[€£¥]|(?<!(?<![A-Za-zÀ-ÿ])[rR])\$)[ \t]*\d/i.test(
+      input
+    ) ||
+    /(?<![\d.,])\d+(?:[.,]\d+)*(?:[ \t]*(?:mil|milh(?:[aã]o|[oõ]es)))?[ \t]*(?:usd|usdt|usdc|btc|bitcoins?|sats?|satoshis?|eth|ether|ethereum|sol|solana|bnb|xrp|trx|ltc|doge|depix|d[oó]lar(?:es)?|eur|euros?|gbp|libras?|pesos?|ienes?|[€£¥])(?![A-Za-zÀ-ÿ0-9])/i.test(
+      input
+    )
+  );
+}
+
 export function hasPixTriggerKeyword(text: string): boolean {
   if (typeof text !== 'string' || text.length > MAX_NLU_LEN * 2) return false;
   const norm = normalizeHorizontalSpaces(text);
@@ -736,15 +753,8 @@ export function parseBrlAmountFromText(text: string): number | null {
     '$1 $2'
   );
 
-  // Rejeita moedas estrangeiras e criptoativos ("US$ 50", "$50", "€ 50", "100 USDT", "50 dólares", "0,05 BTC")
-  if (
-    /(?:(?<![A-Za-zÀ-ÿ])(?:us\$|u\$|usd|eur|gbp|ars|cad|aud|chf|jpy|cny|pyg|usdt|usdc|btc|eth|sol|bnb|xrp|trx|ltc|doge|depix)(?![A-Za-zÀ-ÿ])|[€£¥]|(?<!(?<![A-Za-zÀ-ÿ])[rR])\$)[ \t]*\d/i.test(
-      unformattedWords
-    ) ||
-    /\b\d+(?:[.,]\d+)?[ \t]*(?:usd|usdt|usdc|btc|bitcoins?|sats?|satoshis?|eth|ether|ethereum|sol|solana|bnb|xrp|trx|ltc|doge|depix|d[oó]lar(?:es)?|eur|euros?|gbp|libras?|pesos?|ienes?|[€£¥])(?![A-Za-zÀ-ÿ0-9])/i.test(
-      unformattedWords
-    )
-  ) {
+  // Rejeita vírgulas decimais malformadas (3+ dígitos após vírgula, ex: "150,555" ou "50,12345678") ANTES de limpar \d{8,}!
+  if (/\d,\d{3,}/.test(unformattedWords) || hasForeignCurrencyOrCrypto(unformattedWords)) {
     return null;
   }
 
@@ -757,32 +767,33 @@ export function parseBrlAmountFromText(text: string): number | null {
     .replace(/(?<!\d)(?:\d{4}\/\d{1,2}\/\d{1,2}|\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)(?!\d)/g, ' ')
     .replace(/(?<!\d)(?:\d{4}-\d{1,2}-\d{1,2}|\d{1,2}-\d{1,2}-\d{2,4})(?!\d)/g, ' ')
     .replace(/(?<![\d.,])\d+(?:-\d+){2,}(?![\d.,])/g, ' ')
-    // 2) Remove telefones completos COM ou SEM parênteses, DDD 2/3 dígitos, espaço após o 9º dígito ou pontos separadores
+    // 2) Remove telefones completos COM ou SEM parênteses, DDD, espaço após o 9º dígito, pontos ou fixos 8 dígitos ("3333 3333")
     .replace(
-      /(?:(?:\+\d{1,3}[ \t]*|\b55[ \t]+))?(?:\(0?\d{2}\)[ \t]*|\b0?\d{2}[ \t]*)(?:9[-.\s]?)?\d{4}[-.\s]?\d{4}\b/g,
+      /(?<![\d.,])(?:(?:\+\d{1,3}[ \t]*|\b55[ \t]+))?(?:\(0?\d{2}\)[ \t]*|\b0?\d{2}[ \t]*)(?:9[-.\s]?)?\d{4}[-.\s]?\d{4}(?![.,]\d|\d)/g,
       ' '
     )
-    .replace(/\b(?:9[-.\s]?)?\d{4}[-.]\d{4}\b/g, ' ')
-    // 3) Remove CEPs simples, telefones curtos, números longos e horários HH:MM(:SS)(h/min) ou "10h 30(min)"
+    .replace(/(?<![\d.,])(?:9[-.\s]?)?\d{4}[-.]\d{4}(?![.,]\d|\d)/g, ' ')
+    .replace(/(?<![\d.,])\b[2-5]\d{3}[ \t]+\d{4}\b(?![.,]\d)/g, ' ')
+    // 3) Remove CEPs simples, telefones curtos, números longos e horários HH:MM(:SS)(h/min) ou "10h 30(min)" / "10,5h"
     .replace(/(?<![\d.,/-])\d+-\d+(?![\d.,/-])/g, ' ')
-    .replace(/\b\d{8,}\b/g, ' ')
+    .replace(/(?<![\d.,])\d{8,}(?![\d.,])/g, ' ')
     .replace(
-      /\b\d{1,2}:\d{2}(?::\d{2})?(?:[ \t]*(?:h|hs|hr|hrs|horas?|min|mins|minutos?))?(?![A-Za-zÀ-ÿ0-9])/gi,
+      /(?<![\d.,])\d{1,2}:\d{2}(?::\d{2})?(?:[ \t]*(?:h|hs|hr|hrs|horas?|min|mins|minutos?))?(?![A-Za-zÀ-ÿ0-9])/gi,
       ' '
     )
     .replace(
-      /\b\d{1,2}[ \t]*(?:h|hs|hr|hrs)(?:[ \t]*[0-5]\d(?![.,]\d|[ \t]*(?:reais|real|brl|contos?|centavos?)\b)(?:[ \t]*min(?:utos?)?)?)?(?![A-Za-zÀ-ÿ0-9])/gi,
+      /(?<![\d.,])\d{1,2}(?:[.,]\d+)?[ \t]*(?:h|hs|hr|hrs)(?:[ \t]*[0-5]\d(?![.,]\d|[ \t]*(?:reais|real|brl|contos?|centavos?)\b)(?:[ \t]*min(?:utos?)?)?)?(?![A-Za-zÀ-ÿ0-9])/gi,
       ' '
     );
 
   // Converte numerais cardinais em português ("dois mil", "dez e cinquenta", "quatro da tarde") ANTES de limpar horas/datas!
   const withNormalizedPtNumbers = normalizePortugueseNumberWords(withoutContactsAndDates)
     .replace(
-      /(?<![A-Za-zÀ-ÿ0-9])(?:[aà]s|pelas|das)[ \t]+(?:[01]?\d|2[0-4])\b(?![.,]\d|[ \t]*(?:reais|real|brl|contos?|centavos?)\b)(?:[ \t]+e[ \t]+(?:meia(?![A-Za-zÀ-ÿ0-9])|[0-5]?\d\b)(?:[ \t]*min(?:utos?)?(?![A-Za-zÀ-ÿ0-9]))?)?(?:[ \t]+da[ \t]+(?:manh[aã]|tarde|noite|madrugada)(?![A-Za-zÀ-ÿ0-9]))?/gi,
+      /(?<![A-Za-zÀ-ÿ0-9])(?:[aà]s|pelas|das|pras)[ \t]+(?:[01]?\d|2[0-4])\b(?![.,]\d|[ \t]*(?:reais|real|brl|contos?|centavos?)\b)(?:[ \t]+e[ \t]+(?:meia(?![A-Za-zÀ-ÿ0-9])|[0-5]?\d\b)(?:[ \t]*min(?:utos?)?(?![A-Za-zÀ-ÿ0-9]))?)?(?:[ \t]+da[ \t]+(?:manh[aã]|tarde|noite|madrugada)(?![A-Za-zÀ-ÿ0-9]))?/gi,
       ' '
     )
     .replace(
-      /\b(?:[01]?\d|2[0-4])(?:[ \t]+e[ \t]+(?:meia|[0-5]?\d)(?:[ \t]*min(?:utos?)?)?)?[ \t]+da[ \t]+(?:manh[aã]|tarde|noite|madrugada)(?![A-Za-zÀ-ÿ0-9])/gi,
+      /(?<![\d.,])(?:[01]?\d|2[0-4])(?:[ \t]+e[ \t]+(?:meia|[0-5]?\d)(?:[ \t]*min(?:utos?)?)?)?[ \t]+da[ \t]+(?:manh[aã]|tarde|noite|madrugada)(?![A-Za-zÀ-ÿ0-9])/gi,
       ' '
     )
     .replace(
@@ -794,13 +805,18 @@ export function parseBrlAmountFromText(text: string): number | null {
       ' '
     );
 
-  // Rejeita intenções negadas ou de cancelamento/desistência sem pedido de substituição ("Não quero pagar 50", "Cancela o pix de 50", "Esquece o pix de 50")
+  // Rejeita moedas estrangeiras/cripto mesmo após normalizar numerais por extenso ("cinquenta dólares", "cem USDT", "US$ cinquenta")
+  if (hasForeignCurrencyOrCrypto(withNormalizedPtNumbers)) {
+    return null;
+  }
+
+  // Rejeita intenções negadas ou de cancelamento/desistência sem pedido independente de substituição
   const hasReplacementVerb =
-    /\b(?:gerar|gera|gere|fazer|faz|fa[cç]a|criar|cri[ae]|trocar|troca|mudar|muda|substituir|alterar|nov[oa]|outr[oa])\b/i.test(
+    /(?<!(?<![A-Za-zÀ-ÿ0-9])(?:desist[io]|esquece|esque[cç]a|deixa[ \t]+pra[ \t]+l[aá]|n[aã]o|nem|sem)(?:[ \t]+(?:de|quero|vou|precisa|preciso|posso|consigo))?[ \t]+)\b(?:gerar|gera|gere|fazer|faz|fa[cç]a|criar|cri[ae]|trocar|troca|mudar|muda|substituir|alterar|nov[oa]|outr[oa])\b/i.test(
       withNormalizedPtNumbers
     );
   if (
-    /(?<![A-Za-zÀ-ÿ0-9])n[aã]o[ \t]+(?:(?:quero|vou|posso|preciso|precisa)[ \t]+(?:mais[ \t]+)?(?:pagar|fazer|gerar|mandar|enviar|(?:o[ \t]+|um[ \t]+)?pix\b|r\$|\d)|(?:gera|gerar|mand[ae]|mandar|faz|fazer|envi[ae]|enviar|pagar)(?![A-Za-zÀ-ÿ0-9]))/i.test(
+    /(?<![A-Za-zÀ-ÿ0-9])n[aã]o[ \t]+(?:(?:quero|vou|posso|consigo|consegui|preciso|precisa|deu|vai[ \t]+dar)(?:[ \t]+mais)?(?:[ \t]+(?:de|do|da|para|pra))?[ \t]+(?:pagar|fazer|gerar|mandar|enviar|(?:o[ \t]+|um[ \t]+)?pix\b|r\$|\d)|(?:gera|gerar|mand[ae]|mandar|faz|fazer|envi[ae]|enviar|pagar)(?![A-Za-zÀ-ÿ0-9]))/i.test(
       withNormalizedPtNumbers
     ) ||
     (!hasReplacementVerb &&
@@ -825,9 +841,11 @@ export function parseBrlAmountFromText(text: string): number | null {
     return null;
   }
 
-  // Rejeita expressões aritméticas (+, *, /, dividido, -, menos) e dúvidas sobre taxas/descontos (inclusive "taxa no pix de 100")
+  // Rejeita expressões aritméticas (+, *, /, dividido, -, menos — inclusive após "reais") e dúvidas sobre taxas/descontos
   if (
-    /\d[ \t]*[+*×÷/][ \t]*(?:r\$[ \t]*)?\d/i.test(withNormalizedPtNumbers) ||
+    /(?<![-\w@/,.])(?:r\$[ \t]*)?\d[\d.,]*[ \t]*(?:reais|real|brl|contos?|centavos?)?[ \t]*[+*×÷/][ \t]*(?:r\$[ \t]*)?\d/i.test(
+      withNormalizedPtNumbers
+    ) ||
     /\bdividid[oa]s?[ \t]+(?:por|em)[ \t]+\d/i.test(withNormalizedPtNumbers) ||
     /(?<![-\w@/,.])(?:r\$[ \t]*)?\d[\d.,]*[ \t]*(?:reais|real|brl|contos?)?(?:[ \t]*-[ \t]*(?:r\$[ \t]*)?\d|[ \t]+menos[ \t]+(?:r\$[ \t]*)?\d)/i.test(
       withNormalizedPtNumbers
@@ -848,12 +866,12 @@ export function parseBrlAmountFromText(text: string): number | null {
     return null;
   }
 
-  // Rejeita multiplicadores de quantidade ("2 itens de R$ 50", "2 pix de 50", "3x de R$ 50")
+  // Rejeita multiplicadores de quantidade e medidas com preço unitário ("2 itens de R$ 50", "2 kg de R$ 50", "2 pix de 50")
   if (
-    /\b\d+[ \t]*(?:itens?|unidades?|pe[cç]as?|produtos?|pacotes?|caixas?|kits?|ingressos?|cotas?|x|vezes|parcelas?)[ \t]+(?:de[ \t]+|por[ \t]+|a[ \t]+)?(?:r\$[ \t]*)?\d/i.test(
+    /(?<![\d.,])\d+(?:[.,]\d+)?[ \t]*(?:itens?|unidades?|pe[cç]as?|produtos?|pacotes?|caixas?|kits?|ingressos?|cotas?|x|vezes|parcelas?|kg|quilos?|g|gramas?|mg|l|litros?|ml|m|metros?|m2|m²|m3|m³|cm|cm2|cm²|mm|km|quil[oô]metros?|pessoas?|lugares?)[ \t]+(?:de[ \t]+|por[ \t]+|a[ \t]+)?(?:r\$[ \t]*)?\d/i.test(
       withNormalizedPtNumbers
     ) ||
-    /\b(?:[2-9]|\d{2,})[ \t]*pix[ \t]+(?:de[ \t]+|por[ \t]+|a[ \t]+)?(?:r\$[ \t]*)?\d/i.test(
+    /(?<![\d.,])(?:[2-9]|\d{2,})[ \t]*pix[ \t]+(?:de[ \t]+|por[ \t]+|a[ \t]+)?(?:r\$[ \t]*)?\d/i.test(
       withNormalizedPtNumbers
     )
   ) {
@@ -861,18 +879,18 @@ export function parseBrlAmountFromText(text: string): number | null {
   }
 
   const sanitized = withNormalizedPtNumbers
-    // Remove hashtags/códigos (#80, #150), "nº 50"/"número 50" autônomo e dados bancários/pedidos com ou sem ':'
+    // Remove hashtags/códigos (#80, #150), "nº 50"/"número 50" autônomo e dados bancários/endereços/pedidos com ou sem ':'
     .replace(/#[ \t]*\d+(?:[.,]\d+)?/g, ' ')
     .replace(
       /(?<![A-Za-zÀ-ÿ0-9])(?:n[º°]|n[uú]mero|n[uú]m\.?)[ \t#:.-]*\d+(?:[.,]\d+)?(?![A-Za-zÀ-ÿ0-9])/gi,
       ' '
     )
     .replace(
-      /\b(?:pedido|ordem|protocolo|chamado|fatura|boleto|nota|nf|mesa|quarto|apto|apartamento|rua|av|avenida|travessa|alameda|rodovia|estrada|km|bloco|bl|quadra|qd|lote|lt|casa|sala|loja|andar|piso|id|cod|c[oó]digo|item|op[cç][aã]o|ag[eê]ncia|ag|conta|cc|banco|cpf|cnpj|cep|rg)(?:[ \t]*[:=-][ \t]*(?:#|n[º°o.]?[ \t:.=-]*)?|[ \t]+(?:#|n[º°o.]?[ \t:.=-]*)?|[ \t]*#[ \t]*)\d+(?:[.,]\d+)?\b/gi,
+      /\b(?:pedido|ordem|protocolo|chamado|fatura|boleto|nota|nf|mesa|quarto|ap|apt|apto|apartamento|rua|av|avenida|travessa|alameda|rodovia|estrada|km|bloco|bl|quadra|qd|lote|lt|casa|sala|loja|andar|piso|id|cod|c[oó]digo|item|op[cç][aã]o|ag[eê]ncia|ag|conta|cc|banco|cpf|cnpj|cep|rg)(?:[ \t]*[:=-][ \t]*(?:#|n[º°o.]?[ \t:.=-]*)?|[ \t]+(?:#|n[º°o.]?[ \t:.=-]*)?|[ \t]*#[ \t]*)\d+(?:[.,]\d+)?\b/gi,
       ' '
     )
-    // Remove "1 pix" / "5 pix" ANTES de normalizar "mil" para que "um pix de mil e 500" vire "pix de mil e 500" limpo!
-    .replace(/(?<!r\$[ \t]*)\b\d+[ \t]+pix\b/gi, ' pix ')
+    // Remove contagem inteira "1 pix" / "5 pix" SEM corromper "R$ 1.500 pix" ou "50,75 pix"!
+    .replace(/(?<!(?<![A-Za-zÀ-ÿ])r\$[ \t]*)(?<![\d.,])\d+(?![.,]\d)[ \t]+pix\b/gi, ' pix ')
     // Converte milhões para escala exata (caindo no aviso de teto máximo em vez de cobrar R$ 1,00!)
     .replace(
       /(?:(?<![-\w@/,.])(\d{1,3}(?:[.,]\d{1,2})?)(?![.,]\d|\d)[ \t]*|\b(meio)[ \t]+)milh(?:[aã]o|[oõ]es)\b/gi,
@@ -925,13 +943,18 @@ export function parseBrlAmountFromText(text: string): number | null {
       return `R$ ${valFixed}`;
     })
     .replace(
-      /\b\d+[ \t]*(?:x|vezes|parcelas?|itens?|unidades?|pe[cç]as?|produtos?|pacotes?|caixas?|kits?|ingressos?|cotas?|kg|quilos?|g|gramas?|mg|l|litros?|ml|m|metros?|cm|mm|km|quil[oô]metros?|pessoas?|lugares?)(?![A-Za-zÀ-ÿ0-9])/gi,
+      /(?<![\d.,])\d+(?:[.,]\d+)*[ \t]*(?:x|vezes|parcelas?|itens?|unidades?|pe[cç]as?|produtos?|pacotes?|caixas?|kits?|ingressos?|cotas?|kg|quilos?|g|gramas?|mg|l|litros?|ml|m|metros?|m2|m²|m3|m³|cm|cm2|cm²|mm|km|quil[oô]metros?|pessoas?|lugares?)(?![A-Za-zÀ-ÿ0-9])/gi,
       ' '
     )
     .replace(
-      /\b\d+[ \t]*(?:min|mins|minutos?|seg|segs|segundos?|dias?|semanas?|horas?|m[eê]s|meses|anos?)(?![A-Za-zÀ-ÿ0-9])/gi,
+      /(?<![\d.,])\d+(?:[.,]\d+)*[ \t]*(?:min|mins|minutos?|seg|segs|segundos?|dias?|semanas?|horas?|m[eê]s|meses|anos?)(?![A-Za-zÀ-ÿ0-9])/gi,
       ' '
     );
+
+  // Rejeita moedas/criptoativos também após conversão de "mil"/"milhão" ("2 mil USDT", "5 mil satoshis")
+  if (hasForeignCurrencyOrCrypto(sanitized)) {
+    return null;
+  }
 
   // Rejeita somas, subtrações e intervalos ("R$ 50 e 30", "R$ 50 mais 30", "R$ 50 - 10", "50 a 100 reais", "de 50 até 100")
   if (
@@ -951,14 +974,12 @@ export function parseBrlAmountFromText(text: string): number | null {
     .map((m) => parseNumericToken(m[1]))
     .filter((v): v is number => v !== null);
 
-  // Qualquer segundo número distinto remanescente na frase após limpar datas/horários/contatos/documentos
-  // ("Vou levar 3 de R$ 50", "Pix de R$ 50, ops 80", "Era R$ 50 mas agora é 80") representa ambiguidade real!
-  const uniqueCandidates = Array.from(new Set(allMatches));
-  if (uniqueCandidates.length !== 1) {
+  // Exige exatamente 1 ocorrência numérica na frase (rejeita inclusive duplicados como "50 reais e outro de 50 reais" ou "3333 3333")!
+  if (allMatches.length !== 1) {
     return null;
   }
 
-  return uniqueCandidates[0];
+  return allMatches[0];
 }
 
 /**
@@ -994,8 +1015,9 @@ export function isExitCommand(text: string): boolean {
 }
 
 export function isCancelCommand(text: string): boolean {
-  const n = normalizeCommandText(text);
-  if (!n) return false;
+  const rawNorm = normalizeCommandText(text);
+  if (!rawNorm) return false;
+  const n = normalizePortugueseNumberWords(rawNorm).replace(/\bmil\b/gi, '1000');
   if (
     /\b(?:n[aã]o|nem|gerar|gera|gere|fazer|faz|fa[cç]a|criar|cri[ae]|trocar|troca|mudar|muda|substituir|alterar|nov[oa]|outr[oa])\b/i.test(
       n
@@ -1032,7 +1054,7 @@ export interface ActiveMenuParseResult {
 }
 
 const LEADING_MENU_OPT_RE =
-  /^(?:(?:quero|escolho|prefiro|vai|fico[ \t]+com|pode[ \t]+ser)[ \t]+)?(?:(?:a|o|na|no)[ \t]+)?([([#][ \t]*)?(?:(op[cç][aã]o|item|n[uú]mero)[ \t#:.-]*)?([12])(?![0-9]|[.,*][0-9])(?:([ \t]*[)\].:\-!?]+[ \t]*|[ \t,]+)([\s\S]*))?$/i;
+  /^(?:(?:quero|escolho|prefiro|vai|fico[ \t]+com|pode[ \t]+ser)[ \t]+)?(?:(?:a|o|na|no)[ \t]+)?([([#][ \t]*)?(?:(op[cç][aã]o|item|n[uú]mero)[ \t#:.-]*)?(?:([12])(?![0-9]|[.,*][0-9])|(um|uma|dois|duas|primeir[oa]|segund[oa])(?![A-Za-zÀ-ÿ0-9]))(?:([ \t]*[)\].:\-!?]+[ \t]*|[ \t,]+)([\s\S]*))?$/i;
 
 function matchLeadingMenuOption(strippedMd: string): {
   optDigit: '1' | '2';
@@ -1043,9 +1065,28 @@ function matchLeadingMenuOption(strippedMd: string): {
 
   const openSym = leadingOptMatch[1] ?? '';
   const menuWord = leadingOptMatch[2] ?? '';
-  const optDigit = leadingOptMatch[3] as '1' | '2';
-  const sep = leadingOptMatch[4] ?? '';
-  const remainder = (leadingOptMatch[5] ?? '').trim();
+  const rawDigit = leadingOptMatch[3];
+  const rawWord = (leadingOptMatch[4] ?? '').toLowerCase();
+  const sep = leadingOptMatch[5] ?? '';
+  const remainder = (leadingOptMatch[6] ?? '').trim();
+
+  const optDigit: '1' | '2' = rawDigit
+    ? (rawDigit as '1' | '2')
+    : rawWord === 'um' || rawWord === 'uma' || rawWord.startsWith('primeir')
+      ? '1'
+      : '2';
+
+  // "Quero um novo valor" / "Quero um de 80": "um"/"uma" seguido de substantivo/preposição é artigo indefinido, não opção 1!
+  if (
+    rawWord &&
+    !menuWord &&
+    remainder.length > 0 &&
+    !/^(?:por[ \t]+favor|pfv?|obrigad[oa]|valeu|agrade[cç]o|agora|a[ií])(?![A-Za-zÀ-ÿ0-9])/i.test(
+      remainder
+    )
+  ) {
+    return null;
+  }
 
   const startsWithNumberUnit =
     !menuWord &&
@@ -1087,7 +1128,7 @@ export function hasUnparsedDigitsInMenuReply(text: string): boolean {
 }
 
 const MENU_NEW_INTENT_UNNEGATED_RE =
-  /(?<!(?<![A-Za-zÀ-ÿ0-9])n[aã]o[ \t]+(?:(?:quero|preciso|precisa|vou|pode|favor)[ \t]+)?|(?<![A-Za-zÀ-ÿ0-9])nem[ \t]+)\b(?:cancel(?:ar|a|e)|(?<!de[ \t]+)nov[oa]|outr[oa]|trocar|troca|mudar|muda|substituir|alterar)(?![A-Za-zÀ-ÿ0-9])/i;
+  /(?<!(?<![A-Za-zÀ-ÿ0-9])n[aã]o[ \t]+(?:(?:quero|preciso|precisa|vou|pode|favor)[ \t]+)?|(?<![A-Za-zÀ-ÿ0-9])(?:nem|sem)[ \t]+)\b(?:cancel(?:ar|a|e)|(?<!de[ \t]+)nov[oa]|outr[oa]|trocar|troca|mudar|muda|substituir|alterar)(?![A-Za-zÀ-ÿ0-9])/i;
 
 const MENU_RESEND_INTENT_UNNEGATED_RE =
   /(?<!(?<![A-Za-zÀ-ÿ0-9])n[aã]o[ \t]+(?:(?:quero|preciso|precisa|vou|pode|favor|mand[ae]|envi[ae])[ \t]+)?|(?<![A-Za-zÀ-ÿ0-9])nem[ \t]+)\b(?:reenviar|reenvia|mesm[oa]|manter|mantenha|mant[eé]m|continua|continuar|de[ \t]+novo|(?:mand[ae]|envi[ae])[ \t]+(?:a[ \t]+|o[ \t]+)?(?:atual|ess[ae]))(?![A-Za-zÀ-ÿ0-9])/i;
@@ -1112,7 +1153,11 @@ export function parseActiveOrderMenuReply(text: string): ActiveMenuParseResult {
     const { optDigit, remainder } = matchedOpt;
     const inlineAmt = remainder ? parseBrlAmountFromText(remainder) : null;
 
-    if (remainder && MENU_NEW_INTENT_UNNEGATED_RE.test(remainder)) {
+    if (
+      remainder &&
+      MENU_NEW_INTENT_UNNEGATED_RE.test(remainder) &&
+      !(optDigit === '1' && MENU_RESEND_INTENT_UNNEGATED_RE.test(remainder))
+    ) {
       return { choice: 'new', explicitOptionDigit: '2', inlineNewAmountBrl: inlineAmt };
     }
 
@@ -1148,7 +1193,10 @@ const EXPLICIT_NEW_ORDER_INTENT_RE =
   /(?<!(?<![A-Za-zÀ-ÿ0-9])(?:acabei|terminei|vem|vim)[ \t]+de[ \t]+|(?<![A-Za-zÀ-ÿ0-9])(?:consegui|fui|tentei|ap[oó]s|depois[ \t]+de)[ \t]+)\b(?:quero|gera|gerar|gere|mand[ae]|mandar|pass[ae]|passar|preciso|faz|fazer|cria|criar)(?![ \t]+(?:a[ií][ \t]+|aqui[ \t]+)?(?:o[ \t]+|meu[ \t]+|um[ \t]+|esse[ \t]+)?(?:comprovante|recibo|status|confirma[cç][aã]o)(?![A-Za-zÀ-ÿ0-9]))[ \t]+(?:outro|novo|mais[ \t]+um|(?:a[ií][ \t]+)?(?:um[ \t]+|o[ \t]+)?pix(?![A-Za-zÀ-ÿ0-9])|(?:uma[ \t]+)?cobran[cç]a(?![A-Za-zÀ-ÿ0-9])|(?:de[ \t]+)?(?:r\$[ \t]*\d[\d.,]*|\d[\d.,]*[ \t]*(?:reais|real|mil)\b|mil\b))/i;
 
 const POLITE_NEW_ORDER_MODAL_RE =
-  /(?<!(?<![A-Za-zÀ-ÿ0-9])(?:acabei|terminei)[ \t]+de[ \t]+)\b(?:quero|preciso|vou|posso|pode|poderia|gostaria[ \t]+de|me)[ \t]+(?:pagar|fazer[ \t]+(?:um[ \t]+)?pix|(?:gerar|mandar|mand[ae]|passar|pass[ae]|enviar|envi[ae]|criar|cri[ae])(?![ \t]+(?:a[ií][ \t]+|aqui[ \t]+)?(?:o[ \t]+|meu[ \t]+|um[ \t]+|esse[ \t]+)?(?:comprovante|recibo|status|confirma[cç][aã]o)(?![A-Za-zÀ-ÿ0-9])))(?![A-Za-zÀ-ÿ0-9])/i;
+  /(?<!(?<![A-Za-zÀ-ÿ0-9])(?:acabei|terminei|consegui|tentei)[ \t]+(?:de[ \t]+)?)\b(?:quero|preciso|vou|posso|pode|poderia|gostaria[ \t]+de|me)[ \t]+(?:pagar|fazer[ \t]+(?:um[ \t]+)?pix|(?:gerar|mandar|mand[ae]|passar|pass[ae]|enviar|envi[ae]|criar|cri[ae])[ \t]+(?:a[ií][ \t]+|aqui[ \t]+|agora[ \t]+)?(?:outro|novo|mais[ \t]+um|(?:um[ \t]+|uma[ \t]+|o[ \t]+|a[ \t]+)?(?:pix|cobran[cç]a|link|qr(?:[ \t]*code)?|chave)|(?:de[ \t]+)?(?:r\$[ \t]*\d|\d+[ \t]*(?:reais|real|mil)\b|mil\b)))(?![A-Za-zÀ-ÿ0-9])/i;
+
+const ACCOUNT_DEBITED_REPORT_RE =
+  /\b(?:descontou|debitou|saiu[ \t]+da[ \t]+(?:minha[ \t]+)?conta)\b/i;
 
 export function isStatusQueryMessage(text: string): boolean {
   if (typeof text !== 'string' || text.length > MAX_NLU_LEN * 2) return false;
@@ -1166,6 +1214,10 @@ export function isStatusQueryMessage(text: string): boolean {
   if (!rawTrimmed || rawTrimmed.length > MAX_NLU_LEN) return false;
   const t = normalizePortugueseNumberWords(rawTrimmed);
 
+  if (ACCOUNT_DEBITED_REPORT_RE.test(t) && !EXPLICIT_NEW_ORDER_INTENT_RE.test(t)) {
+    return true;
+  }
+
   if (EXPLICIT_NEW_ORDER_INTENT_RE.test(t) || POLITE_NEW_ORDER_MODAL_RE.test(t)) {
     return false;
   }
@@ -1174,9 +1226,7 @@ export function isStatusQueryMessage(text: string): boolean {
     /\b(?:qual[ \t]+(?:[eé][ \t]+)?(?:o[ \t]+)?status|status[ \t]+d[oa][ \t]+(?:meu[ \t]+)?(?:pix|pagamento|cobran[cç]a|pedido))\b/i.test(
       t
     ) ||
-    /\b(?:pode|poderia|me)[ \t]+(?:mandar|mand[ae]|enviar|envi[ae]|gerar|gera)[ \t]+(?:a[ií][ \t]+|aqui[ \t]+)?(?:o[ \t]+|meu[ \t]+|um[ \t]+)?(?:comprovante|recibo)\b/i.test(
-      t
-    ) ||
+    /\b(?:comprovante|recibo)\b/i.test(t) ||
     /\b(?:j[aá][ \t]+)?(?:confirmou|caiu|compensou|recebeu|receberam|entrou|aprovou|chegou|bateu|creditou|processou)\b/i.test(
       t
     ) ||
@@ -1236,14 +1286,10 @@ export function isPaymentConfirmationMessage(text: string): boolean {
     return true;
   }
 
-  const hasFutureReceiptPromise =
-    /\b(?:vou[ \t]+(?:mandar|enviar)|irei[ \t]+(?:mandar|enviar)|j[aá][ \t]+(?:envio|mando)|depois[ \t]+(?:envio|mando))[ \t]+(?:o[ \t]+)?comprovante\b/i.test(
-      t
-    );
-
   return (
     /\b(?:paguei|quitei|depositei|passei)\b/i.test(t) ||
-    (!hasFutureReceiptPromise && /\bcomprovante\b/i.test(t)) ||
+    /\b(?:comprovante|recibo)\b/i.test(t) ||
+    /\b(?:descontou|debitou|saiu[ \t]+da[ \t]+(?:minha[ \t]+)?conta)\b/i.test(t) ||
     /\bsegue(?:[ \t]+(?:a[ií]|aqui|anexo|abaixo))?[ \t]+(?:(?:o|a|os|meu|minha)[ \t]+)?(?:pix|pagamento|comprovante|recibo|transfer[eê]ncia|dep[oó]sito)\b/i.test(
       t
     ) ||

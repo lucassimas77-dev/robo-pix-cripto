@@ -553,6 +553,79 @@ test('Parsing monetário trata pontuação final, milhar, horários, telefones, 
   assert.equal(parseBrlAmountFromText('100reais no pix'), 100);
   assert.equal(parseBrlAmountFromText('50,00reais'), 50);
 
+  // Casos da Busca #20: "R$ 1.500 pix" / "50,75 pix", medidas/horas decimais ("10,5 kg", "10,5h", "50 m2", "50,12345678"),
+  // cripto/moedas por extenso ou com "mil", pós-pagamento com entrega/print/descontou, desistências com infinitivo,
+  // somas de mesmo valor ("50 reais + 50 reais", "3333 3333"), menu "dois" / "1 - reenviar sem cancelar" e "pras"/"ap"
+  assert.equal(parseBrlAmountFromText('R$ 1.500 pix'), 1500);
+  assert.equal(parseBrlAmountFromText('1.500 pix'), 1500);
+  assert.equal(parseBrlAmountFromText('R$ 50,75 pix'), 50.75);
+  assert.equal(parseBrlAmountFromText('50,75 pix'), 50.75);
+  assert.equal(parseBrlAmountFromText('Quero 10,5 kg no pix'), null);
+  assert.equal(parseBrlAmountFromText('Preciso de 2,5 metros, posso pagar no pix?'), null);
+  assert.equal(parseBrlAmountFromText('Quero 1.500 kg no pix'), null);
+  assert.equal(parseBrlAmountFromText('Daqui a 10,5 horas mando o pix'), null);
+  assert.equal(parseBrlAmountFromText('Daqui a 10,5h mando o pix'), null);
+  assert.equal(parseBrlAmountFromText('Preciso de 50 m2 no pix'), null);
+  assert.equal(parseBrlAmountFromText('pix de 50,12345678'), null);
+
+  assert.equal(parseBrlAmountFromText('Quanto fica cinquenta dólares no pix?'), null);
+  assert.equal(parseBrlAmountFromText('Quanto fica US$ cinquenta no pix?'), null);
+  assert.equal(parseBrlAmountFromText('Quero comprar cem USDT, manda o pix'), null);
+  assert.equal(parseBrlAmountFromText('Quero 2 mil USDT, manda o pix'), null);
+  assert.equal(parseBrlAmountFromText('Quero 5 mil satoshis no pix'), null);
+
+  assert.equal(isPaymentConfirmationMessage('Já paguei o pix de 50, pode mandar o produto?'), true);
+  assert.equal(isPaymentConfirmationMessage('Paguei os R$ 50, me envia o acesso!'), true);
+  assert.equal(isPaymentConfirmationMessage('Posso mandar print do comprovante de R$ 50?'), true);
+  assert.equal(
+    isPaymentConfirmationMessage('Vou enviar foto do comprovante do pix de 50'),
+    true
+  );
+  assert.equal(
+    isPaymentConfirmationMessage('Pronto, vou mandar o comprovante do pix de 50'),
+    true
+  );
+  assert.equal(
+    isStatusQueryMessage('Tentei pagar o pix de 50 e descontou da minha conta'),
+    true
+  );
+  assert.equal(isStatusQueryMessage('O pix de 50 descontou mas deu erro'), true);
+  assert.equal(isStatusQueryMessage('Descontou 50 reais da minha conta no pix'), true);
+
+  assert.equal(parseBrlAmountFromText('Desisti de fazer o pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Esquece de fazer o pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Não consigo pagar R$ 50 no pix'), null);
+  assert.equal(parseBrlAmountFromText('Não precisa mais do pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Não quero de 50 no pix'), null);
+  assert.equal(isCancelCommand('Cancela o pix de cinquenta reais'), true);
+
+  assert.equal(parseBrlAmountFromText('pix de 50 reais + 50 reais'), null);
+  assert.equal(parseBrlAmountFromText('quero um pix de 50 reais e outro de 50 reais'), null);
+  assert.equal(parseBrlAmountFromText('Meu tel é 3333 3333 quero fazer pix'), null);
+  assert.equal(parseBrlAmountFromText('Quero 2 kg de R$ 50 no pix'), null);
+  assert.equal(parseBrlAmountFromText('Preciso de 3 metros de R$ 20 no pix'), null);
+
+  assert.deepEqual(parseActiveOrderMenuReply('dois'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('quero a dois'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('1 - reenviar sem cancelar'), {
+    choice: 'resend',
+    explicitOptionDigit: '1',
+    inlineNewAmountBrl: null,
+  });
+
+  assert.equal(parseBrlAmountFromText('Te mando o pix lá pras 18'), null);
+  assert.equal(parseBrlAmountFromText('pras seis faço o pix'), null);
+  assert.equal(parseBrlAmountFromText('Moro no ap 20, quero fazer um pix'), null);
+  assert.equal(parseBrlAmountFromText('Moro no apt 12, quero fazer um pix'), null);
+
   assert.equal(formatTimeSaoPaulo('2026-07-01T18:15:00.000Z'), '15:15');
 });
 
