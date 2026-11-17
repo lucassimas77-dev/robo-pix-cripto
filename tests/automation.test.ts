@@ -2745,3 +2745,122 @@ test('11. Busca #31: emojis WhatsApp, menu 1/2 ("É a 2", "2 🙏"), "e meio", "
     repository.close();
   }
 });
+
+test('12. Busca #32: fronteiras Unicode (milímetros/°C), invisíveis ZWSP/LRM, menu ("Sim, a 2", "2 obg"), "voltou"/dando inválido, horários ("dez pra uma"), "mil" livre e "Pronto, já paguei!"', async () => {
+  // Achado 1: Unidades por extenso / °C sem corromper "milímetros" em "mil\b"
+  assert.equal(parseBrlAmountFromText('Chapa de 10 centímetros, aceita pix?'), null);
+  assert.equal(parseBrlAmountFromText('Fita de 20 milimetros no pix'), null);
+  assert.equal(parseBrlAmountFromText('Cabo de 6 milímetros no pix'), null);
+  assert.equal(parseBrlAmountFromText('Remédio de 500 miligramas no pix'), null);
+  assert.equal(parseBrlAmountFromText('Seringa de 10 mililitros no pix'), null);
+  assert.equal(parseBrlAmountFromText('Forno 180 °C no pix'), null);
+  assert.equal(parseBrlAmountFromText('Cabo de 10 centímetros, manda um pix de 50'), 50);
+  assert.equal(parseBrlAmountFromText('Cabo de 6 milímetros, manda um pix de 50'), 50);
+  assert.equal(parseBrlAmountFromText('Cabo de 6 milimetros, manda um pix de 50'), 50);
+
+  // Achado 2: Caracteres invisíveis do WhatsApp (ZWSP, LRM, RLM, BiDi, BOM, soft hyphen)
+  assert.equal(isExitCommand('\u200Bsair'), true);
+  assert.equal(isCancelCommand('\u200Ecancelar'), true);
+  assert.equal(isStatusQueryMessage('\u200Bstatus'), true);
+  assert.equal(isPaymentConfirmationMessage('\u200Bpago'), true);
+  assert.deepEqual(parseActiveOrderMenuReply('\u200E2'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('2\u200B'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: null,
+  });
+  assert.equal(hasUnparsedDigitsInMenuReply('\u200E2'), false);
+
+  // Achado 3: Confirmações e cortesias coloquiais no menu 1 / 2
+  for (const msg of [
+    'Sim, a 2',
+    'Ok, a 2',
+    'Beleza, a 2',
+    'Por favor, a 2',
+    'Bora na 2',
+    'Vamos de 2',
+    'Pela 2',
+    '2 obg',
+    '2 vlw',
+    'Oi, bom dia! É a 2',
+  ]) {
+    assert.deepEqual(
+      parseActiveOrderMenuReply(msg),
+      { choice: 'new', explicitOptionDigit: '2', inlineNewAmountBrl: null },
+      `Menu opção 2 falhou em: ${msg}`
+    );
+    assert.equal(hasUnparsedDigitsInMenuReply(msg), false, `Dígito extra falso em: ${msg}`);
+  }
+  for (const msg of ['Sim, a 1', 'Ok, 1', '1 obg', '1 vlw', 'Pela 1']) {
+    assert.deepEqual(
+      parseActiveOrderMenuReply(msg),
+      { choice: 'resend', explicitOptionDigit: '1', inlineNewAmountBrl: null },
+      `Menu opção 1 falhou em: ${msg}`
+    );
+  }
+
+  // Achado 4: Estornos curtos ("voltou"), erro aspectual ("dando inválido") e pagamento a maior/repetido
+  for (const msg of [
+    'Meu pix de 50 voltou',
+    'O pix de 50 voltou',
+    'Os 50 reais voltaram',
+    'O pagamento de 50 retornou',
+    'O código de 50 está dando inválido',
+    'O link de 50 aparece inválido',
+    'Mandei 50 a mais no pix sem querer',
+    'Paguei 50 a mais no pix',
+  ]) {
+    assert.equal(isStatusQueryMessage(msg), true, `Status deveria ser true em: ${msg}`);
+    assert.equal(parseBrlAmountFromText(msg), null, `Não deveria cobrar em: ${msg}`);
+  }
+  assert.equal(parseBrlAmountFromText('Voltei agora, manda pix de 50'), 50);
+
+  // Achado 5: Horários ("vinte para as três", "dez pra uma"), troco/pechincha/misto e chave/empréstimo
+  for (const msg of [
+    'vinte para as três faço o pix',
+    'dez pra uma mando o pix',
+    '15 pra meia-noite mando o pix',
+    'Tem troco pra 100 no pix?',
+    'Fecha em 80 no pix?',
+    'Dá pra fechar em 80 no pix?',
+    'Consegue abaixar pra 80 no pix?',
+    'Consegue tirar 10 reais no pix?',
+    'Quero pagar metade no cartão e 50 no pix',
+    'Passo no cartão e 50 no pix',
+    'Me faz um pix de 50, minha chave é 11988887777',
+    'Manda 50 no pix, minha chave é joao@gmail.com',
+    'Me empresta 50 no pix?',
+  ]) {
+    assert.equal(parseBrlAmountFromText(msg), null, `Falso positivo em: ${msg}`);
+  }
+  assert.equal(parseBrlAmountFromText('Meu cartão não passou, manda um pix de 50'), 50);
+  assert.equal(parseBrlAmountFromText('Manda um pix de 50 pra uma amiga'), 50);
+
+  // Achado 6: "mil" livre e milhares compostos com centavos por extenso
+  assert.equal(parseBrlAmountFromText('Bom dia mil reais no pix'), 1000);
+  assert.equal(parseBrlAmountFromText('Manda aqui mil reais no pix'), 1000);
+  assert.equal(parseBrlAmountFromText('Gera lá mil reais no pix'), 1000);
+  assert.equal(
+    parseBrlAmountFromText('pix de dois mil e quinhentos e cinquenta centavos'),
+    2500.5
+  );
+  assert.equal(parseBrlAmountFromText('Hoje o dia tá a mil, manda pix de 50'), 50);
+  assert.equal(parseBrlAmountFromText('Mil desculpas pela demora, manda pix de 50'), 50);
+
+  // Achado 7: Prefixos conversacionais ("Pronto, ...") e "já" posposto em isPostOrderFollowUpMessage
+  for (const msg of [
+    'Pronto, já paguei!',
+    'Pronto, tá pago!',
+    'Pronto, paguei os 50!',
+    'Tá pago já!',
+    'Foi pago já!',
+    'Oi, já caiu?',
+  ]) {
+    assert.equal(isPostOrderFollowUpMessage(msg), true, `Follow-up deveria aceitar: ${msg}`);
+  }
+  assert.equal(isPostOrderFollowUpMessage('Pronto, mandei 50 mensagens'), false);
+});

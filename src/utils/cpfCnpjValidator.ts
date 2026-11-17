@@ -269,7 +269,10 @@ const DECORATIVE_EMOJI_RE =
   /(?:\p{Extended_Pictographic}|\p{Emoji_Presentation}|[\u2139\u2611\u2705\u2714\u274C\u274E]|\u200D|[\u{1F3FB}-\u{1F3FF}]|\uFE0F(?!\u20E3))+/gu;
 
 function normalizeHorizontalSpaces(input: string): string {
-  return input.normalize('NFC').replace(/[\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]/g, ' ');
+  return input
+    .normalize('NFC')
+    .replace(/[\u00AD\u034F\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u2069\uFEFF]/g, '')
+    .replace(/[\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]/g, ' ');
 }
 
 function stripDecorativeEmojis(input: string): string {
@@ -613,6 +616,39 @@ const QTY_OR_UNIT_WORDS = new Set([
   'pessoas',
   'lugar',
   'lugares',
+  'centimetro',
+  'centímetro',
+  'centimetros',
+  'centímetros',
+  'milimetro',
+  'milímetro',
+  'milimetros',
+  'milímetros',
+  'decimetro',
+  'decímetro',
+  'decimetros',
+  'decímetros',
+  'miligrama',
+  'miligramas',
+  'micrograma',
+  'microgramas',
+  'mcg',
+  'mililitro',
+  'mililitros',
+  'quilometro',
+  'quilômetro',
+  'quilometros',
+  'quilômetros',
+  'polegada',
+  'polegadas',
+  'milha',
+  'milhas',
+  'grau',
+  'graus',
+  'celsius',
+  'fahrenheit',
+  'megapixel',
+  'megapixels',
 ]);
 
 const PLURAL_DETERMINER_WORDS = new Set([
@@ -800,7 +836,18 @@ function readSubThousandTokens(
     ) {
       const sub = readSubHundredTokens(tokens, idx + 4);
       if (sub) {
-        return { value: base + sub.value, endIdx: sub.endIdx, singleUm: false };
+        const isPrecededByMil =
+          idx >= 2 &&
+          /(?:^|[^A-Za-zÀ-ÿ0-9])mil(?:[ \t]+e|[ \t]*,)?[ \t]+$/i.test(
+            tokens.slice(Math.max(0, idx - 4), idx).join('')
+          );
+        const isSubFollowedByCentavos =
+          sub.endIdx + 2 < tokens.length &&
+          /^[ \t]+$/.test(tokens[sub.endIdx + 1]) &&
+          /^centavos?$/i.test(tokens[sub.endIdx + 2]);
+        if (!(isPrecededByMil && isSubFollowedByCentavos)) {
+          return { value: base + sub.value, endIdx: sub.endIdx, singleUm: false };
+        }
       }
     }
     return { value: base, endIdx: idx, singleUm: false };
@@ -899,8 +946,11 @@ function normalizePortugueseNumberWords(input: string): string {
     // Pronomes plurais ("nós dois", "os dois") e artigo feminino plural antes de substantivo comum ("as dez fotos")
     // permanecem bloqueados; já preposições de hora ("às", "das", "pelas", "as 10", "as duas e trinta") convertem para dígitos
     // para que o limpador completo de horários remova a expressão inteira sem deixar os minutos soltos!
+    const isMinutesToHourPreposition =
+      prevWord === 'as' && ['para', 'pra'].includes(prevPrevWord);
     const isPluralArticleBeforeNoun =
       prevWord === 'as' &&
+      !isMinutesToHourPreposition &&
       nextWord.length > 0 &&
       nextWord !== 'e' &&
       nextWord !== 'da' &&
@@ -916,10 +966,14 @@ function normalizePortugueseNumberWords(input: string): string {
         ) ||
         (prevWord === 'os' && value === 2));
 
-    const isHourPreposition = ['as', 'às', 'à', 'pelas', 'das', 'pras', 'umas'].includes(prevWord);
+    const isHourPreposition =
+      ['às', 'à', 'pelas', 'das', 'pras', 'umas'].includes(prevWord) ||
+      (prevWord === 'as' && !isMinutesToHourPreposition);
 
     // Centavos coloquiais por extenso: "dez e cinquenta" -> "10,50", "vinte e cinco e cinquenta" -> "25,50"
-    // Nunca combina como centavos quando for horário ("às duas e trinta", "três e vinte faço o pix"), intervalo ou enumeração!
+    // Nunca combina como centavos quando for horário ("às duas e trinta", "três e vinte faço o pix"), após "mil", intervalo ou enumeração!
+    const isAfterThousandScale =
+      prevWord === 'mil' || (prevWord === 'e' && prevPrevWord === 'mil');
     const isPrecededByEnumerationContext =
       ENUMERATION_PREV_WORDS.has(prevWord) ||
       (prevWord === 'de' && PLURAL_DETERMINER_WORDS.has(prevPrevWord));
@@ -927,6 +981,7 @@ function normalizePortugueseNumberWords(input: string): string {
     if (
       !blockedPronoun &&
       !isHourPreposition &&
+      !isAfterThousandScale &&
       !isPrecededByEnumerationContext &&
       endIdx + 4 < tokens.length &&
       /^[ \t]+$/.test(tokens[endIdx + 1]) &&
@@ -1013,10 +1068,41 @@ function normalizePortugueseNumberWords(input: string): string {
 
     let shouldConvert = false;
     if (singleUm) {
+      const recentOutTail = out.slice(-8).join('');
+      const isMinutesBeforeOne =
+        (prevWord === 'pra' ||
+          prevWord === 'para' ||
+          (prevWord === 'a' && ['para', 'pra'].includes(prevPrevWord))) &&
+        !/(?:de|por|valor|r\$)[ \t]*\d+[ \t]+(?:para(?:[ \t]+a)?|pra(?:[ \t]+a)?)[ \t]*$/i.test(
+          recentOutTail
+        ) &&
+        /(?:^|[^\d.,])(?:[0-5]?\d)(?:[ \t]*min(?:utos?)?)?[ \t]+(?:para(?:[ \t]+a)?|pra(?:[ \t]+a)?)[ \t]*$/i.test(
+          recentOutTail
+        ) &&
+        [
+          '',
+          'e',
+          'da',
+          'mando',
+          'faço',
+          'faco',
+          'pago',
+          'envio',
+          'passo',
+          'transfiro',
+          'deposito',
+          'vou',
+          'eu',
+          'ja',
+          'já',
+          'ai',
+          'aí',
+        ].includes(nextWord);
       const isSingularOneHour =
         tokens[i].toLowerCase() === 'uma' &&
         (prevWord === 'à' ||
           prevWord === 'umas' ||
+          isMinutesBeforeOne ||
           (prevWord === 'a' && ['e', 'da', 'mando', 'faço', 'faco', 'pago', 'envio'].includes(nextWord)));
       const isRangeOrChoiceConnector =
         (tokens[i].toLowerCase() === 'um' && nextWord === 'e' && nextNextWord === 'meio') ||
@@ -1141,7 +1227,7 @@ function hasForeignCurrencyOrCrypto(input: string): boolean {
 }
 
 const PHYSICAL_OR_SPEC_SUFFIX_UNIT_PATTERN =
-  '(?:x|vezes|parcelas?|itens?|unidades?|pe[cç]as?|produtos?|pacotes?|caixas?|kits?|ingressos?|cotas?|kg|quilos?|g|gramas?|mg|ton|toneladas?|ha|hectares?|arrobas?|alqueires?|l|litros?|ml|m|metros?|m2|m²|m3|m³|cm|cm2|cm²|mm|km|quil[oô]metros?|polegadas?|gb|gigas?|gigabytes?|mb|megas?|megabytes?|tb|terabytes?|kb|mbps|gbps|w|watts?|kw|kwh|kva|v|volts?|kv|mah|amperes?|hz|khz|mhz|ghz|btu|btus|cv|cilindradas?|kcal|calorias?|graus?|camisas?|camisetas?|cal[cç]as?|bermudas?|vestidos?|blusas?|jaquetas?|pares?|sapatos?|t[eê]nis|chinelos?|pneus?|rodas?|garrafas?|latas?|sacos?|sacolas?|fardos?|potes?|frascos?|cartelas?|comprimidos?|c[aá]psulas?|doses?|passagens?|di[aá]rias?|noites?|mensalidades?|faturas?|boletos?|contas?|notas?|duplicatas?|carn[ê]s?|d[uú]vidas?|perguntas?|tentativas?|erros?|fotos?|imagens?|prints?|arquivos?|v[ií]deos?|p[aá]ginas?|folhas?|pontos?|estrelas?|clientes?|usu[aá]rios?|mesas?|cadeiras?|quartos?|salas?|lotes?|pessoas?|lugares?)';
+  '(?:x|vezes|parcelas?|itens?|unidades?|pe[cç]as?|produtos?|pacotes?|caixas?|kits?|ingressos?|cotas?|kg|quilos?|g|gramas?|mg|miligramas?|mcg|microgramas?|ton|toneladas?|ha|hectares?|arrobas?|alqueires?|l|litros?|ml|mililitros?|decilitros?|m|metros?(?:[ \\t]+(?:quadrados?|c[uú]bicos?))?|m2|m²|m3|m³|cm|cent[ií]metros?|cm2|cm²|mm|mil[ií]metros?|dec[ií]metros?|micr[oô]metros?|km|quil[oô]metros?|milhas?|polegadas?|jardas?|on[cç]as?|oz|lbs?|quilates?|gb|gigas?|gigabytes?|mb|megas?|megabytes?|tb|terabytes?|kb|mbps|gbps|w|watts?|kw|quilowatts?|kwh|kva|mw|megawatts?|v|volts?|kv|mah|amperes?|ohms?|hz|khz|mhz|ghz|btu|btus|cv|hps?|cilindradas?|psi|rpm|fps|dpi|mp|megapixels?|pixels?|px|kcal|calorias?|graus?(?:[ \\t]*(?:celsius|cent[ií]grados?|fahrenheit))?|[º°][ \\t]*[cfk]|celsius|fahrenheit|camisas?|camisetas?|cal[cç]as?|bermudas?|vestidos?|blusas?|jaquetas?|pares?|sapatos?|t[eê]nis|chinelos?|pneus?|rodas?|garrafas?|latas?|sacos?|sacolas?|fardos?|potes?|frascos?|cartelas?|comprimidos?|c[aá]psulas?|doses?|passagens?|di[aá]rias?|noites?|mensalidades?|faturas?|boletos?|contas?|notas?|duplicatas?|carn[ê]s?|d[uú]vidas?|perguntas?|tentativas?|erros?|fotos?|imagens?|prints?|arquivos?|v[ií]deos?|p[aá]ginas?|folhas?|pontos?|estrelas?|clientes?|usu[aá]rios?|mesas?|cadeiras?|quartos?|salas?|lotes?|pessoas?|lugares?)';
 
 const PCT_REGEX = new RegExp(
   `${NUM_LEFT}(?:${NUM_CORE})[ \\t]*(?:%|por[ \\t]*cento(?![A-Za-zÀ-ÿ0-9])|porcento(?![A-Za-zÀ-ÿ0-9]))`,
@@ -1169,21 +1255,24 @@ const NEGATED_SETTLEMENT_STATUS_CORE =
   'n[aã]o[ \\t]+(?:j[aá][ \\t]+)?(?:(?:te|lhe|lhes|me|nos)[ \\t]+)?(?:passou|passaram|concluiu|conclu[ií]ram|completou|completaram|finalizou|finalizaram|processou|processaram|confirmou|confirmaram|aprovou|aprovaram|autorizou|autorizaram|liberou|liberaram|deixou|deixaram|permitiu|permitiram|aceitou|aceitaram|compensou|compensaram|creditou|creditaram|caiu|ca[ií]ram|cairam|entrou|entraram|bateu|bateram|chegou|chegaram|recebeu|receberam|efetivou|liquidou|vai|foi(?![ \\t]+(?:eu|ele|ela|ontem|hoje)(?![A-Za-zÀ-ÿ0-9]))|foi[ \\t]+poss[ií]vel|(?:est[aá]|est[aã]o|t[aá]|t[aã]o)[ \\t]+(?:aprovando|autorizando|passando|completando|concluindo|finalizando|liberando|aceitando|processando|confirmando|compensando|indo|entrando|caindo)|deu[ \\t]+certo|(?:(?:foi|foram|est[aá]|est[aã]o|t[aá]|t[aã]o)[ \\t]+)?(?:aprovad[oa]s?|autorizad[oa]s?|liberad[oa]s?|aceit[oa]s?|permitid[oa]s?|confirmad[oa]s?|compensad[oa]s?|processad[oa]s?|creditad[oa]s?|recebid[oa]s?|conclu[ií]d[oa]s?|efetuad[oa]s?|realizad[oa]s?|enviad[oa]s?|transferid[oa]s?|depositad[oa]s?|quitad[oa]s?|identificad[oa]s?))';
 
 const EXPIRED_CHARGE_REPORT_CLAUSE =
-  '(?:expirou|expiraram|expirad[oa]s?|(?:venceu|venceram)[ \\t]+(?:o[ \\t]+|a[ \\t]+|meu[ \\t]+|minha[ \\t]+|esse[ \\t]+|essa[ \\t]+)?(?:pix|pagamento|cobran[cç]a|link|qr(?:[ \\t]*code)?|c[oó]digo|chave)|(?:pix|pagamento|cobran[cç]a|link|qr(?:[ \\t]*code)?|c[oó]digo|chave)(?:[ \\t]+(?:d[eo]s?|da|no|na|r\\$|\\d[\\d.,]*|reais|real|pilas?)){0,4}[ \\t]+(?:(?:est[aá]|t[aá]|ficou|foi|aparece|consta)[ \\t]+)?(?:venceu|venceram|vencid[oa]s?))';
+  '(?:expirou|expiraram|expirad[oa]s?|(?:venceu|venceram)[ \\t]+(?:o[ \\t]+|a[ \\t]+|meu[ \\t]+|minha[ \\t]+|esse[ \\t]+|essa[ \\t]+)?(?:pix|pagamento|cobran[cç]a|link|qr(?:[ \\t]*code)?|c[oó]digo|chave)|(?:pix|pagamento|cobran[cç]a|link|qr(?:[ \\t]*code)?|c[oó]digo|chave)(?:[ \\t]+(?:d[eo]s?|da|no|na|r\\$|\\d[\\d.,]*|reais|real|contos?|pilas?)){0,4}[ \\t]+(?:(?:(?:est[aá]|t[aá]|fica|ficou|continua)[ \\t]+)?(?:dando|aparecendo|acusando)[ \\t]+(?:como[ \\t]+)?|(?:deu|est[aá]|t[aá]|fica|ficou|foi|aparece|apareceu|consta|diz)[ \\t]+(?:como[ \\t]+)?)?(?:venceu|venceram|vencid[oa]s?|inv[aá]lid[oa]s?|quebrad[oa]s?|indispon[ií]vel|inexistente))';
+
+const FINANCIAL_RETURNED_REPORT_CLAUSE =
+  '(?:(?:voltou|voltaram|retornou|retornaram)(?:[ \\t]+(?:os?|as?|r\\$|\\d[\\d.,]*|reais|real|contos?|pilas?|valor|dinheiro|pagamento|pix)){0,6}[ \\t]+(?:pra|para|na|[aà])[ \\t]+(?:minha[ \\t]+)?(?:conta|banco|saldo)|(?:pix|pagamento|transfer[eê]ncia|dep[oó]sito|transa[cç][aã]o|valor|dinheiro)(?:[ \\t]+(?:d[eo]s?|da|no|na|que[ \\t]+(?:eu[ \\t]+)?(?:fiz|mandei|enviei|paguei|passei|transferi)|r\\$|\\d[\\d.,]*|reais|real|contos?|pilas?)){0,6}[ \\t]+(?:acabou[ \\t]+de[ \\t]+)?(?:voltar|voltou|voltaram|retornar|retornou|retornaram)|(?:(?:os?|meus?)[ \\t]+)?(?:r\\$[ \\t]*\\d[\\d.,]*|\\d[\\d.,]*[ \\t]+(?:reais|real|contos?|pilas?))[ \\t]+(?:acabou[ \\t]+de[ \\t]+|acabaram[ \\t]+de[ \\t]+)?(?:voltar|voltou|voltaram|retornar|retornou|retornaram)|(?:voltou|voltaram|retornou|retornaram)[ \\t]+(?:(?:o|os|meu|meus|esse|esses)[ \\t]+)?(?:(?:pix|pagamento|valor|dinheiro)(?:[ \\t]+d[eo][ \\t]+(?:r\\$[ \\t]*)?\\d[\\d.,]*)?|r\\$[ \\t]*\\d[\\d.,]*|\\d[\\d.,]*[ \\t]+(?:reais|real|contos?|pilas?)))';
 
 const OUTGOING_PAYOUT_OR_DEBT_RE =
-  /(?<![A-Za-zÀ-ÿ0-9])(?:(?:para|pra|pro)[ \t]+(?:a[ \t]+|o[ \t]+)?(?:minha[ \t]+(?:conta|chave|carteira)|meu[ \t]+pix)|(?:na|no)[ \t]+(?:a[ \t]+|o[ \t]+)?minha[ \t]+chave|(?:mand[ae]|mandar|envi[ae]|enviar|faz|fa[cç]a|fazer|transfere|transferir|deposita|depositar|paga|pague|pagar|cai|cair)(?:[ \t]+(?:os?|as?|um|uma|r\$|\d[\d.,]*|reais|real|pilas?|pix|valor|dinheiro)){0,5}[ \t]+(?:na|no)[ \t]+(?:a[ \t]+|o[ \t]+)?(?:minha[ \t]+conta|meu[ \t]+pix)|(?:voc[eê][ \t]+|vc[ \t]+|tu[ \t]+)?me[ \t]+(?:deve|devendo|paga|pague|transfere|transferir|deposita|depositar|ressarce|ressarcir))(?![A-Za-zÀ-ÿ0-9])/i;
+  /(?<![A-Za-zÀ-ÿ0-9])(?:(?:para|pra|pro)[ \t]+(?:a[ \t]+|o[ \t]+)?(?:minha[ \t]+(?:conta|chave|carteira)|meu[ \t]+pix)|(?:na|no)[ \t]+(?:a[ \t]+|o[ \t]+)?minha[ \t]+chave|(?:minha[ \t]+chave(?:[ \t]+(?:de[ \t]+)?pix)?|meu[ \t]+pix)[ \t]*(?:[eé](?![A-Za-zÀ-ÿ0-9])|[:=-])|(?:segue|essa[ \t]+[eé]|aqui[ \t]+est[aá])[ \t]+(?:a[ \t]+)?minha[ \t]+chave|(?:mand[ae]|mandar|envi[ae]|enviar|faz|fa[cç]a|fazer|transfere|transferir|deposita|depositar|paga|pague|pagar|cai|cair)(?:[ \t]+(?:os?|as?|um|uma|r\$|\d[\d.,]*|reais|real|contos?|pilas?|pix|valor|dinheiro)){0,5}[ \t]+(?:na|no)[ \t]+(?:a[ \t]+|o[ \t]+)?(?:minha[ \t]+conta|meu[ \t]+pix)|(?:voc[eê][ \t]+|vc[ \t]+|tu[ \t]+)?me[ \t]+(?:deve|devendo|paga|pague|transfere|transferir|deposita|depositar|ressarce|ressarcir|devolve|devolver|reembolsa|reembolsar|estorna|estornar)|(?:me[ \t]+)?emprest(?:ar|a|e|ou))(?![A-Za-zÀ-ÿ0-9])/i;
 
 const PAYMENT_FAILURE_OR_REFUND_RE = new RegExp(
-  `(?<![A-Za-zÀ-ÿ0-9])(?:deu[ \\t]+(?:erro|errad[oa]|falha|problema|ruim)|(?:tive|teve|tivemos|ocorreu|apresentou|apareceu|dando|est[aá][ \\t]+com|t[aá][ \\t]+com)[ \\t]+(?:um[ \\t]+|algum[ \\t]+)?(?:erro|falha|problemas?)|(?<!(?<![A-Za-zÀ-ÿ0-9])sem[ \\t]+)(?:erro|falha|problemas?)[ \\t]+(?:\\d{3}|no|na|ao|em|com|de|do|da|para|pra)(?![A-Za-zÀ-ÿ0-9])|n[aã]o[ \\t]+(?:(?:estou|t[oô]|to|estava|tava)[ \\t]+)?(?:consigo|consegui|conseguindo|deu[ \\t]+pra|d[aá][ \\t]+pra)[ \\t]+${OPT_CLITIC_PRONOUN}(?:abrir|carregar|escanear|ler|copiar|acessar|pagar|fazer|mandar|enviar|passar|transferir|depositar|quitar)|(?:link|qr(?:[ \\t]*code)?|c[oó]digo|chave)(?:[ \\t]+(?:d[eo][ \\t]+)?(?:pix|pagamento|cobran[cç]a|r\\$|\\d[\\d.,]*)){0,4}[ \\t]+(?:n[aã]o[ \\t]+(?:abre|abriu|carrega|carregou|funciona|funcionou|est[aá][ \\t]+funcionando|t[aá][ \\t]+funcionando|l[eê]|escaneia|entra)|(?:deu|est[aá]|t[aá])[ \\t]+(?:inv[aá]lid[oa]|quebrad[oa]|expirad[oa]|vencid[oa]|indispon[ií]vel)|inv[aá]lid[oa]|expirou|venceu)|${EXPIRED_CHARGE_REPORT_CLAUSE}|(?:tentei|tentando)[ \\t]+${OPT_CLITIC_PRONOUN}(?:pagar|fazer|mandar|enviar|passar|transferir|depositar|gerar|abrir|quitar)|(?:app|aplicativo|banco|tela|site)[ \\t]+(?:travou|travando|fechou|caiu|bugou|parou)|em[ \\t]+duplicidade|duplicad[oa]s?|(?:cobrou|cobraram|(?:foi|foram)[ \\t]+(?:cobrad[oa]s?|pag[oa]s?|feit[oa]s?|enviad[oa]s?|transferid[oa]s?|debitad[oa]s?|descontad[oa]s?)|debitou|debitaram|descontou|descontaram|paguei|pagou|pagaram|quitei|depositei|fiz|efetuei|realizei|passou|saiu|sa[ií]ram|caiu|entrou|transferi|transferiu|enviei|enviou|mandei|mandou)(?:[ \\t]+(?:os?|as?|um|uma|esse|essa|meu|minha|me|te|lhe|d[eo]s?|da|no|na|pro|pra|r\\$|\\d[\\d.,]*|reais|real|pilas?|valor|dinheiro|pagamento|pix|cobran[cç]a)){0,6}[ \\t]+(?:[2-9]|\\d{2,})[ \\t]*(?:vezes|x)|falhou|falhando|recusou|recusaram|recusad[oa]s?|recusando|negou|negaram|negad[oa]s?|negando|rejeitou|rejeitaram|rejeitad[oa]s?|rejeitando|bloqueou|bloquearam|bloquead[oa]s?|bloqueando|barrou|barraram|barrad[oa]s?|barrando|cancelou|cancelaram|cancelad[oa]s?|cancelando|${NEGATED_SETTLEMENT_STATUS_CORE}|${OPT_CLITIC_PRONOUN}(?:mandei|enviei|fiz|efetuei|realizei|transferi|passei|depositei|paguei|quitei)(?:[ \\t]+(?:os?|as?|um|uma|esse|essa|meu|minha|d[eo]s?|da|no|na|pro|pra|via|r\\$|\\d[\\d.,]*|reais|real|pilas?|valor|dinheiro|pagamento|pix|cobran[cç]a|transfer[eê]ncia|dep[oó]sito)){0,7}[ \\t]+(?:errad[oa]|por[ \\t]+engano|sem[ \\t]+querer)|saldo[ \\t]+insuficiente|sem[ \\t]+saldo|(?:estourou|atingiu|bateu|excedeu|ultrapassou)[ \\t]+(?:o[ \\t]+|meu[ \\t]+)?limite|limite[ \\t]+(?:excedido|insuficiente|di[aá]rio|noturno)|(?:(?:ficou|est[aá]|t[aá]|caiu|entrou|foi|continua|ainda[ \\t]+est[aá]|ainda[ \\t]+t[aá])[ \\t]+)?(?:em|na|sob)[ \\t]+(?:an[aá]lise|processamento)|analisando|(?:(?:pix|pagamento|transfer[eê]ncia|valor)[ \\t]+pendente|(?:ficou|est[aá]|t[aá]|continua|aparece|consta)[ \\t]+pendente)|retid[oa]s?|reteve|retiveram|retendo|reten[cç][aã]o|segurou|seguraram|segurando|travou|travando|fora[ \\t]+do[ \\t]+ar|agendei|agendad[oa]s?|agendamento|estorno|estornar|estornou|estornaram|estornad[oa]s?|estornando|reembolso|reembolsar|reembolsou|reembolsaram|reembolsad[oa]s?|reembolsando|devolv(?:er|a|e|eu|eram|endo|id[oa]s?)|devolu[cç][aã]o|(?:voltou|voltaram|retornou|retornaram)(?:[ \\t]+(?:os?|as?|r\\$|\\d[\\d.,]*|reais|real|pilas?|valor|dinheiro|pagamento|pix)){0,6}[ \\t]+(?:pra|para|na|[aà])[ \\t]+(?:minha[ \\t]+)?(?:conta|banco|saldo))(?![A-Za-zÀ-ÿ0-9])`,
+  `(?<![A-Za-zÀ-ÿ0-9])(?:deu[ \\t]+(?:erro|errad[oa]|falha|problema|ruim)|(?:tive|teve|tivemos|ocorreu|apresentou|apareceu|dando|est[aá][ \\t]+com|t[aá][ \\t]+com)[ \\t]+(?:um[ \\t]+|algum[ \\t]+)?(?:erro|falha|problemas?)|(?<!(?<![A-Za-zÀ-ÿ0-9])sem[ \\t]+)(?:erro|falha|problemas?)[ \\t]+(?:\\d{3}|no|na|ao|em|com|de|do|da|para|pra)(?![A-Za-zÀ-ÿ0-9])|n[aã]o[ \\t]+(?:(?:estou|t[oô]|to|estava|tava)[ \\t]+)?(?:consigo|consegui|conseguindo|deu[ \\t]+pra|d[aá][ \\t]+pra)[ \\t]+${OPT_CLITIC_PRONOUN}(?:abrir|carregar|escanear|ler|copiar|acessar|pagar|fazer|mandar|enviar|passar|transferir|depositar|quitar)|(?:link|qr(?:[ \\t]*code)?|c[oó]digo|chave)(?:[ \\t]+(?:d[eo][ \\t]+)?(?:pix|pagamento|cobran[cç]a|r\\$|\\d[\\d.,]*)){0,4}[ \\t]+(?:n[aã]o[ \\t]+(?:abre|abriu|carrega|carregou|funciona|funcionou|est[aá][ \\t]+funcionando|t[aá][ \\t]+funcionando|l[eê]|escaneia|entra)|(?:(?:est[aá]|t[aá]|fica|ficou|continua)[ \\t]+)?(?:dando|aparecendo|acusando)[ \\t]+(?:como[ \\t]+)?(?:inv[aá]lid[oa]|erro|falha|quebrad[oa]|expirad[oa]|vencid[oa]|indispon[ií]vel|inexistente)|(?:deu|est[aá]|t[aá]|fica|ficou|aparece|apareceu|consta|diz)[ \\t]+(?:como[ \\t]+)?(?:inv[aá]lid[oa]|quebrad[oa]|expirad[oa]|vencid[oa]|indispon[ií]vel|inexistente)|inv[aá]lid[oa]|expirou|venceu)|${EXPIRED_CHARGE_REPORT_CLAUSE}|(?:tentei|tentando)[ \\t]+${OPT_CLITIC_PRONOUN}(?:pagar|fazer|mandar|enviar|passar|transferir|depositar|gerar|abrir|quitar)|(?:app|aplicativo|banco|tela|site)[ \\t]+(?:travou|travando|fechou|caiu|bugou|parou)|em[ \\t]+duplicidade|duplicad[oa]s?|(?:cobrou|cobraram|(?:foi|foram)[ \\t]+(?:cobrad[oa]s?|pag[oa]s?|feit[oa]s?|enviad[oa]s?|transferid[oa]s?|debitad[oa]s?|descontad[oa]s?)|debitou|debitaram|descontou|descontaram|paguei|pagou|pagaram|quitei|depositei|fiz|efetuei|realizei|passou|saiu|sa[ií]ram|caiu|entrou|transferi|transferiu|enviei|enviou|mandei|mandou)(?:[ \\t]+(?:os?|as?|um|uma|esse|essa|meu|minha|me|te|lhe|d[eo]s?|da|no|na|pro|pra|r\\$|\\d[\\d.,]*|reais|real|contos?|pilas?|valor|dinheiro|pagamento|pix|cobran[cç]a)){0,6}[ \\t]+(?:[2-9]|\\d{2,})[ \\t]*(?:vezes|x)|falhou|falhando|recusou|recusaram|recusad[oa]s?|recusando|negou|negaram|negad[oa]s?|negando|rejeitou|rejeitaram|rejeitad[oa]s?|rejeitando|bloqueou|bloquearam|bloquead[oa]s?|bloqueando|barrou|barraram|barrad[oa]s?|barrando|cancelou|cancelaram|cancelad[oa]s?|cancelando|${NEGATED_SETTLEMENT_STATUS_CORE}|${OPT_CLITIC_PRONOUN}(?:mandei|enviei|fiz|efetuei|realizei|transferi|passei|depositei|paguei|quitei)(?:[ \\t]+(?:os?|as?|um|uma|esse|essa|meu|minha|d[eo]s?|da|no|na|pro|pra|via|a[ \\t]+mais|a[ \\t]+menos|repetid[oa]s?|dobrado|r\\$|\\d[\\d.,]*|reais|real|contos?|pilas?|valor|dinheiro|pagamento|pix|cobran[cç]a|transfer[eê]ncia|dep[oó]sito)){0,8}[ \\t]+(?:errad[oa]|por[ \\t]+engano|sem[ \\t]+querer|repetid[oa]s?|dobrado)|${OPT_CLITIC_PRONOUN}(?:mandei|enviei|fiz|efetuei|realizei|transferi|passei|depositei|paguei|quitei)(?:[ \\t]+(?:os?|as?|r\\$|\\d[\\d.,]*|reais|real|contos?|pilas?)){1,3}[ \\t]+a[ \\t]+mais|saldo[ \\t]+insuficiente|sem[ \\t]+saldo|(?:estourou|atingiu|bateu|excedeu|ultrapassou)[ \\t]+(?:o[ \\t]+|meu[ \\t]+)?limite|limite[ \\t]+(?:excedido|insuficiente|di[aá]rio|noturno)|(?:(?:ficou|est[aá]|t[aá]|caiu|entrou|foi|continua|ainda[ \\t]+est[aá]|ainda[ \\t]+t[aá])[ \\t]+)?(?:em|na|sob)[ \\t]+(?:an[aá]lise|processamento)|analisando|(?:(?:pix|pagamento|transfer[eê]ncia|valor)[ \\t]+pendente|(?:ficou|est[aá]|t[aá]|continua|aparece|consta)[ \\t]+pendente)|retid[oa]s?|reteve|retiveram|retendo|reten[cç][aã]o|segurou|seguraram|segurando|travou|travando|fora[ \\t]+do[ \\t]+ar|agendei|agendad[oa]s?|agendamento|estorno|estornar|estornou|estornaram|estornad[oa]s?|estornando|reembolso|reembolsar|reembolsou|reembolsaram|reembolsad[oa]s?|reembolsando|devolv(?:er|a|e|eu|eram|endo|id[oa]s?)|devolu[cç][aã]o|${FINANCIAL_RETURNED_REPORT_CLAUSE})(?![A-Za-zÀ-ÿ0-9])`,
   'i'
 );
 
 const HAS_PAYMENT_OR_BANK_CONTEXT_RE =
-  /(?<![A-Za-zÀ-ÿ0-9])(?:pix|depix|pagar|pago|paguei|pagamento|cobran[cç]a|transfer[eê]ncia|transferi|transferir|dep[oó]sito|depositei|depositar|transa[cç][aã]o|comprovante|recibo|valor|reais|real|brl|pilas?|r\$|banco|conta|saldo|limite|app|aplicativo|link|qr|chave|c[oó]digo|estorn[oa]|reembols[oa]|devolu[cç][aã]o|nubank|inter|ita[uú]|bradesco|santander|caixa|bb|sicredi|sicoob|picpay|mercadopago|c6|pagbank)(?![A-Za-zÀ-ÿ0-9])/i;
+  /(?<![A-Za-zÀ-ÿ0-9])(?:pix|depix|pagar|pago|paguei|pagamento|cobran[cç]a|transfer[eê]ncia|transferi|transferir|dep[oó]sito|depositei|depositar|transa[cç][aã]o|comprovante|recibo|valor|reais|real|brl|contos?|pilas?|r\$|banco|conta|saldo|limite|app|aplicativo|link|qr|chave|c[oó]digo|estorn[oa]|reembols[oa]|devolu[cç][aã]o|nubank|inter|ita[uú]|bradesco|santander|caixa|bb|sicredi|sicoob|picpay|mercadopago|c6|pagbank)(?![A-Za-zÀ-ÿ0-9])/i;
 
 const UNAMBIGUOUS_FINANCIAL_FAILURE_OR_REFUND_RE = new RegExp(
-  `(?<![A-Za-zÀ-ÿ0-9])(?:(?:link|qr(?:[ \\t]*code)?|c[oó]digo|chave)(?:[ \\t]+(?:d[eo][ \\t]+)?(?:pix|pagamento|cobran[cç]a|r\\$|\\d[\\d.,]*)){0,4}[ \\t]+(?:n[aã]o[ \\t]+(?:abre|abriu|carrega|carregou|funciona|funcionou|est[aá][ \\t]+funcionando|t[aá][ \\t]+funcionando|l[eê]|escaneia|entra)|(?:deu|est[aá]|t[aá])[ \\t]+(?:inv[aá]lid[oa]|quebrad[oa]|expirad[oa]|vencid[oa]|indispon[ií]vel)|inv[aá]lid[oa]|expirou|venceu)|${EXPIRED_CHARGE_REPORT_CLAUSE}|(?:tentei|tentando)[ \\t]+${OPT_CLITIC_PRONOUN}(?:pagar|quitar|transferir|depositar)|(?:app|aplicativo|banco)[ \\t]+(?:travou|travando|fechou|caiu|bugou|parou)|em[ \\t]+duplicidade|(?:cobrou|cobraram|(?:foi|foram)[ \\t]+(?:cobrad[oa]s?|pag[oa]s?|feit[oa]s?)|debitou|debitaram|descontou|descontaram|paguei|pagou|fiz|efetuei|realizei)(?:[ \\t]+(?:os?|as?|um|uma|esse|essa|meu|minha|me|te|lhe|d[eo]s?|da|no|na|pro|pra|r\\$|\\d[\\d.,]*|reais|real|pilas?|valor|dinheiro|pagamento|pix|cobran[cç]a)){0,6}[ \\t]+(?:[2-9]|\\d{2,})[ \\t]*(?:vezes|x)|n[aã]o[ \\t]+(?:j[aá][ \\t]+)?(?:compensou|compensaram|creditou|creditaram|autorizou|autorizaram|efetivou|liquidou|(?:foi|foram|est[aá]|t[aá])[ \\t]+(?:compensad[oa]s?|creditad[oa]s?|autorizad[oa]s?))|(?:saldo[ \\t]+insuficiente|sem[ \\t]+saldo)(?![ \\t]+(?:no|na|do|da)[ \\t]+(?:celular|chip|vivo|claro|tim|oi|linha|internet|pacote|bilhete|vale|vr|va|cart[aã]o)(?![A-Za-zÀ-ÿ0-9]))|(?:(?:estourou|atingiu|bateu|excedeu|ultrapassou)[ \\t]+(?:o[ \\t]+|meu[ \\t]+)?limite|limite[ \\t]+(?:excedido|insuficiente|di[aá]rio|noturno))(?![ \\t]+(?:do|da|no|na|de)[ \\t]+(?:cart[aã]o|cr[eé]dito|internet|dados|franquia|velocidade)(?![A-Za-zÀ-ÿ0-9]))|retid[oa]s?|reteve|retiveram|retendo|reten[cç][aã]o|(?:estorno|estornar|estornou|estornaram|estornad[oa]s?|estornando|reembolso|reembolsar|reembolsou|reembolsaram|reembolsad[oa]s?|reembolsando|devolu[cç][aã]o)(?![ \\t]+(?:d[oa]s?|no|na)[ \\t]+(?:cart[aã]o|cr[eé]dito|fatura|ingresso|passagem|voo|hotel|amazon|shopee|mercado[ \\t]*livre|ifood|uber|shein|aliexpress)(?![A-Za-zÀ-ÿ0-9]))|(?:voltou|voltaram|retornou|retornaram)(?:[ \\t]+(?:os?|as?|r\\$|\\d[\\d.,]*|reais|real|pilas?|valor|dinheiro|pagamento|pix)){0,6}[ \\t]+(?:pra|para|na|[aà])[ \\t]+(?:minha[ \\t]+)?(?:conta|banco|saldo))(?![A-Za-zÀ-ÿ0-9])`,
+  `(?<![A-Za-zÀ-ÿ0-9])(?:(?:link|qr(?:[ \\t]*code)?|c[oó]digo|chave)(?:[ \\t]+(?:d[eo][ \\t]+)?(?:pix|pagamento|cobran[cç]a|r\\$|\\d[\\d.,]*)){0,4}[ \\t]+(?:n[aã]o[ \\t]+(?:abre|abriu|carrega|carregou|funciona|funcionou|est[aá][ \\t]+funcionando|t[aá][ \\t]+funcionando|l[eê]|escaneia|entra)|(?:(?:est[aá]|t[aá]|fica|ficou|continua)[ \\t]+)?(?:dando|aparecendo|acusando)[ \\t]+(?:como[ \\t]+)?(?:inv[aá]lid[oa]|erro|falha|quebrad[oa]|expirad[oa]|vencid[oa]|indispon[ií]vel|inexistente)|(?:deu|est[aá]|t[aá]|fica|ficou|aparece|apareceu|consta|diz)[ \\t]+(?:como[ \\t]+)?(?:inv[aá]lid[oa]|quebrad[oa]|expirad[oa]|vencid[oa]|indispon[ií]vel|inexistente)|inv[aá]lid[oa]|expirou|venceu)|${EXPIRED_CHARGE_REPORT_CLAUSE}|(?:tentei|tentando)[ \\t]+${OPT_CLITIC_PRONOUN}(?:pagar|quitar|transferir|depositar)|(?:app|aplicativo|banco)[ \\t]+(?:travou|travando|fechou|caiu|bugou|parou)|em[ \\t]+duplicidade|(?:cobrou|cobraram|(?:foi|foram)[ \\t]+(?:cobrad[oa]s?|pag[oa]s?|feit[oa]s?)|debitou|debitaram|descontou|descontaram|paguei|pagou|fiz|efetuei|realizei)(?:[ \\t]+(?:os?|as?|um|uma|esse|essa|meu|minha|me|te|lhe|d[eo]s?|da|no|na|pro|pra|r\\$|\\d[\\d.,]*|reais|real|contos?|pilas?|valor|dinheiro|pagamento|pix|cobran[cç]a)){0,6}[ \\t]+(?:[2-9]|\\d{2,})[ \\t]*(?:vezes|x)|n[aã]o[ \\t]+(?:j[aá][ \\t]+)?(?:compensou|compensaram|creditou|creditaram|autorizou|autorizaram|efetivou|liquidou|(?:foi|foram|est[aá]|t[aá])[ \\t]+(?:compensad[oa]s?|creditad[oa]s?|autorizad[oa]s?))|(?:saldo[ \\t]+insuficiente|sem[ \\t]+saldo)(?![ \\t]+(?:no|na|do|da)[ \\t]+(?:celular|chip|vivo|claro|tim|oi|linha|internet|pacote|bilhete|vale|vr|va|cart[aã]o)(?![A-Za-zÀ-ÿ0-9]))|(?:(?:estourou|atingiu|bateu|excedeu|ultrapassou)[ \\t]+(?:o[ \\t]+|meu[ \\t]+)?limite|limite[ \\t]+(?:excedido|insuficiente|di[aá]rio|noturno))(?![ \\t]+(?:do|da|no|na|de)[ \\t]+(?:cart[aã]o|cr[eé]dito|internet|dados|franquia|velocidade)(?![A-Za-zÀ-ÿ0-9]))|retid[oa]s?|reteve|retiveram|retendo|reten[cç][aã]o|(?:estorno|estornar|estornou|estornaram|estornad[oa]s?|estornando|reembolso|reembolsar|reembolsou|reembolsaram|reembolsad[oa]s?|reembolsando|devolu[cç][aã]o)(?![ \\t]+(?:d[oa]s?|no|na)[ \\t]+(?:cart[aã]o|cr[eé]dito|fatura|ingresso|passagem|voo|hotel|amazon|shopee|mercado[ \\t]*livre|ifood|uber|shein|aliexpress)(?![A-Za-zÀ-ÿ0-9]))|${FINANCIAL_RETURNED_REPORT_CLAUSE})(?![A-Za-zÀ-ÿ0-9])`,
   'i'
 );
 
@@ -1199,7 +1288,7 @@ const POLITE_NEW_ORDER_MODAL_RE =
   /(?<!(?<![A-Za-zÀ-ÿ0-9])(?:acabei|terminei|consegui|tentei|desisti|esquece|deixa|parei)[ \t]+(?:de[ \t]+)?|(?<![A-Za-zÀ-ÿ0-9])(?:n[aã]o|nem|se|caso|quando)[ \t]+|(?<![A-Za-zÀ-ÿ0-9])(?:se|caso|quando)[ \t]+(?:eu|voc[eê]|vc|a[ \t]+gente|ele|ela)[ \t]+)(?<![A-Za-zÀ-ÿ0-9])(?:quero|queria|preciso(?:[ \t]+de)?|vou|posso|pode|poderia|gostaria[ \t]+de|me)[ \t]+(?:pagar|fazer[ \t]+(?:(?:um[ \t]+)?(?:novo[ \t]+|outro[ \t]+)?pix|(?:uma[ \t]+)?(?:nova[ \t]+|outra[ \t]+)?cobran[cç]a)|(?:gerar|mandar|mand[ae]|passar|pass[ae]|enviar|envi[ae]|criar|cri[ae]|cobrar|cobr[ae])[ \t]+(?:a[ií][ \t]+|aqui[ \t]+|agora[ \t]+)?(?:(?:um[ \t]+|uma[ \t]+)?(?:outro|outra|novo|nova)|mais[ \t]+um[a]?|(?:um|uma)[ \t]+de[ \t]+(?:r\$[ \t]*\d|\d)|(?:um[ \t]+|uma[ \t]+|o[ \t]+|a[ \t]+)?(?:pix|cobran[cç]a|link|qr(?:[ \t]*code)?|chave)|(?:de[ \t]+)?(?:r\$[ \t]*\d|\d+[ \t]*(?:reais|real|contos?|pilas?|mil|no[ \t]+pix)(?![A-Za-zÀ-ÿ0-9])|mil(?![A-Za-zÀ-ÿ0-9]))))(?![A-Za-zÀ-ÿ0-9])/i;
 
 const FEE_OR_LIMIT_OR_PRICE_INQUIRY_RE =
-  /(?<![A-Za-zÀ-ÿ0-9])(?:(?:(?:por|em|a|de)[ \t]+)?quanto[ \t]+(?:que[ \t]+)?(?:[eé]|s[aã]o|fica|ficou|custa|custou|t[aá]|est[aá]|sai|saiu|d[aá]|deu|seria|seriam|cobra|vale|faz|faria)|(?:[eé]|s[aã]o|fica|ficou|custa|custou|t[aá]|est[aá]|sai|saiu|d[aá]|deu|seria|cobra|vale|faz|fecha|deixa|cai)(?:[ \t]+(?:por|em|a|de|pra|para))?[ \t]+quanto(?![A-Za-zÀ-ÿ0-9])|qual(?:[ \t]+que)?(?:[ \t]+(?:[eé]|seria|fica|ficou))?[ \t]+(?:o[ \t]+|a[ \t]+)?(?:pre[cç]o|valor|custo|total)|(?:(?:quero|queria|gostaria[ \t]+de|preciso)[ \t]+saber|(?:pode|poderia|consegue|sabe)[ \t]+(?:me[ \t]+)?(?:dizer|falar|confirmar|informar)|me[ \t]+(?:diz|diga|fala|fale|confirma|confirme|informa|informe))[ \t]+(?:se|quanto|qual)(?![A-Za-zÀ-ÿ0-9])|(?:a[ \t]+partir[ \t]+de|acima[ \t]+de|abaixo[ \t]+de|menor[ \t]+que|maior[ \t]+que)[ \t]+(?:r\$[ \t]*)?\d|(?:tem|ter[aá]|teria|cobra|cobram|existe|ganha|ganho|tenho|recebo|consigo|consegue|d[aá]|d[aã]o|faz|fazem|rol[ae]|pago|paga|qual(?:[ \t]+que)?(?:[ \t]+[eé])?(?:[ \t]+o|[ \t]+a)?)[ \t]+(?:algum[a]?[ \t]+|um[ \t]+|uma[ \t]+)?(?:taxa|tarifa|juros?|multa|desconto|abatimento|acr[eé]scimo|encargos?|cashback)(?![A-Za-zÀ-ÿ0-9])|parcel(?:ar|a|am|ado|amento)(?![A-Za-zÀ-ÿ0-9])|pix[ \t]+(?:parcelado|cr[eé]dito|troco|saque)(?![A-Za-zÀ-ÿ0-9])|(?:cart[aã]o(?:[ \t]+de[ \t]+(?:cr[eé]dito|d[eé]bito))?|cr[eé]dito|d[eé]bito|boleto)[ \t]+ou[ \t]+(?:(?:no|via|s[oó])[ \t]+)?pix(?![A-Za-zÀ-ÿ0-9])|pix[ \t]+ou[ \t]+(?:no[ \t]+)?(?:cart[aã]o|cr[eé]dito|d[eé]bito|boleto)(?![A-Za-zÀ-ÿ0-9]))/i;
+  /(?<![A-Za-zÀ-ÿ0-9])(?:(?:(?:por|em|a|de)[ \t]+)?quanto[ \t]+(?:que[ \t]+)?(?:[eé]|s[aã]o|fica|ficou|custa|custou|t[aá]|est[aá]|sai|saiu|d[aá]|deu|seria|seriam|cobra|vale|faz|faria)|(?:[eé]|s[aã]o|fica|ficou|custa|custou|t[aá]|est[aá]|sai|saiu|d[aá]|deu|seria|cobra|vale|faz|fecha|deixa|cai)(?:[ \t]+(?:por|em|a|de|pra|para))?[ \t]+quanto(?![A-Za-zÀ-ÿ0-9])|qual(?:[ \t]+que)?(?:[ \t]+(?:[eé]|seria|fica|ficou))?[ \t]+(?:o[ \t]+|a[ \t]+)?(?:pre[cç]o|valor|custo|total)|(?:(?:quero|queria|gostaria[ \t]+de|preciso)[ \t]+saber|(?:pode|poderia|consegue|sabe)[ \t]+(?:me[ \t]+)?(?:dizer|falar|confirmar|informar)|me[ \t]+(?:diz|diga|fala|fale|confirma|confirme|informa|informe))[ \t]+(?:se|quanto|qual)(?![A-Za-zÀ-ÿ0-9])|(?:a[ \t]+partir[ \t]+de|acima[ \t]+de|abaixo[ \t]+de|menor[ \t]+que|maior[ \t]+que)[ \t]+(?:r\$[ \t]*)?\d|(?:tem|ter[aá]|teria|cobra|cobram|existe|ganha|ganho|tenho|recebo|consigo|consegue|d[aá]|d[aã]o|faz|fazem|rol[ae]|pago|paga|qual(?:[ \t]+que)?(?:[ \t]+[eé])?(?:[ \t]+o|[ \t]+a)?)[ \t]+(?:algum[a]?[ \t]+|um[ \t]+|uma[ \t]+)?(?:taxa|tarifa|juros?|multa|desconto|abatimento|acr[eé]scimo|encargos?|cashback)(?![A-Za-zÀ-ÿ0-9])|(?:tem|ter[aá]|teria|preciso[ \t]+de|precisa[ \t]+de|volta|voltar|dar|d[aá]|mandar|manda|levar|leva|trazer|traz|com|sem|pro|para[ \t]+o)[ \t]+troco(?![A-Za-zÀ-ÿ0-9])|troco[ \t]+(?:pra|para|de|em)(?![A-Za-zÀ-ÿ0-9])|parcel(?:ar|a|am|ado|amento)(?![A-Za-zÀ-ÿ0-9])|pix[ \t]+(?:parcelado|cr[eé]dito|troco|saque)(?![A-Za-zÀ-ÿ0-9])|(?:metade|parte|restante|resto)[ \t]+(?:no|na|em|via|pelo|pela)[ \t]+(?:cart[aã]o|cr[eé]dito|d[eé]bito|dinheiro|esp[eé]cie|boleto)(?![A-Za-zÀ-ÿ0-9])|(?:no|na|pelo|pela)[ \t]+(?:meu[ \t]+)?(?:cart[aã]o|cr[eé]dito|d[eé]bito|dinheiro|esp[eé]cie)[ \t]+e[ \t]+(?:(?:o[ \t]+)?(?:resto|restante|outra[ \t]+parte|metade)|(?:r\$[ \t]*)?\d[\d.,]*)[ \t]*(?:reais|real|contos?|pilas?)?[ \t]*(?:no|via|em|de)[ \t]+pix(?![A-Za-zÀ-ÿ0-9])|(?:cart[aã]o(?:[ \t]+de[ \t]+(?:cr[eé]dito|d[eé]bito))?|cr[eé]dito|d[eé]bito|boleto)[ \t]+ou[ \t]+(?:(?:no|via|s[oó])[ \t]+)?pix(?![A-Za-zÀ-ÿ0-9])|pix[ \t]+ou[ \t]+(?:no[ \t]+)?(?:cart[aã]o|cr[eé]dito|d[eé]bito|boleto)(?![A-Za-zÀ-ÿ0-9]))/i;
 
 function isDirectPriceOrFeeQuestion(t: string, hasExplicitNewOrder: boolean): boolean {
   if (FEE_OR_LIMIT_OR_PRICE_INQUIRY_RE.test(t)) return true;
@@ -1217,7 +1306,7 @@ function isDirectPriceOrFeeQuestion(t: string, hasExplicitNewOrder: boolean): bo
   ) {
     return true;
   }
-  return /(?<![A-Za-zÀ-ÿ0-9])(?:custa|custou|fica(?:[ \t]+por|[ \t]+em)?|ficou(?:[ \t]+por|[ \t]+em)?|sai(?:[ \t]+por|[ \t]+a)?|saiu(?:[ \t]+por|[ \t]+a)?|cai(?:[ \t]+(?:por|pra|para|a))?|deu|(?:t[aá]|est[aá]|estava|tava)(?:[ \t]+por|[ \t]+custando|[ \t]+saindo)?|(?:(?:o[ \t]+)?(?:pre[cç]o|valor|total)[ \t]+)?(?:[eé]|s[aã]o|seria|seriam|ficou|deu)(?:[ \t]+(?:mesmo|ent[aã]o|a[ií]|tudo|isso))?|(?:faz|fazer|faria|d[aá][ \t]+pra[ \t]+fazer|consegue[ \t]+fazer|fecha|fechar|deixa|deixar)(?:(?:[ \t]+(?!pix(?![A-Za-zÀ-ÿ0-9])|cobran[cç]a(?![A-Za-zÀ-ÿ0-9]))[A-Za-zÀ-ÿ0-9]+){0,4}[ \t]+(?:por|a)|(?=[ \t]*(?:r\$[ \t]*)?\d)))[ \t]*(?:r\$[ \t]*)?\d/i.test(
+  return /(?<![A-Za-zÀ-ÿ0-9])(?:custa|custou|fica(?:[ \t]+(?:por|em|pra|para|a))?|ficou(?:[ \t]+(?:por|em|pra|para|a))?|sai(?:[ \t]+(?:por|em|pra|para|a))?|saiu(?:[ \t]+(?:por|em|pra|para|a))?|cai(?:[ \t]+(?:por|pra|para|em|a))?|deu|(?:t[aá]|est[aá]|estava|tava)(?:[ \t]+(?:por|em|custando|saindo))?|(?:(?:o[ \t]+)?(?:pre[cç]o|valor|total)[ \t]+)?(?:[eé]|s[aã]o|seria|seriam|ficou|deu)(?:[ \t]+(?:mesmo|ent[aã]o|a[ií]|tudo|isso))?|(?:(?:d[aá][ \t]+pra|consegue|poderia|pode)[ \t]+)?(?:abaixa|abaixar|baixa|baixar|reduz|reduzir|diminui|diminuir|tira|tirar|abate|abater)(?:[ \t]+(?:pra|para|por|em|a|uns?|mais))?|(?:(?:d[aá][ \t]+pra|consegue|poderia|pode)[ \t]+)?(?:faz|fazer|faria|fecha|fechar|deixa|deixar)(?:(?:[ \t]+(?!pix(?![A-Za-zÀ-ÿ0-9])|cobran[cç]a(?![A-Za-zÀ-ÿ0-9]))[A-Za-zÀ-ÿ0-9]+){0,4}[ \t]+(?:por|a|em|pra|para|nos?|nas?)|(?=[ \t]*(?:r\$[ \t]*)?\d)))[ \t]*(?:r\$[ \t]*)?\d/i.test(
     t
   );
 }
@@ -1251,19 +1340,19 @@ function stripDatesAndHours(input: string): string {
       ' '
     )
     .replace(
-      /(?<![\d.,])\d{1,2}(?:[.,]\d+)?[ \t]*(?:h|hs|hr|hrs)(?:[ \t]*[0-5]\d(?![.,]\d|[ \t]*(?:reais|real|brl|contos?|pilas?|centavos?)\b)(?:[ \t]*min(?:utos?)?)?)?(?![A-Za-zÀ-ÿ0-9])/gi,
+      /(?<![\d.,])\d{1,2}(?:[.,]\d+)?[ \t]*(?:h|hs|hr|hrs)(?:[ \t]*[0-5]\d(?![.,]\d|[ \t]*(?:reais|real|brl|contos?|pilas?|centavos?)(?![A-Za-zÀ-ÿ0-9]))(?:[ \t]*min(?:utos?)?)?)?(?![A-Za-zÀ-ÿ0-9])/gi,
       ' '
     )
     .replace(
-      /(?<![\d.,])(?:[0-5]?\d)(?:[ \t]*min(?:utos?)?)?[ \t]+(?:pras|para[ \t]+as|para[ \t]+a(?=[ \t]+0?1\b)|pro(?=[ \t]+meio)|para[ \t]+o(?=[ \t]+meio))[ \t]+(?:[01]?\d|2[0-4]|meio[ \t-]+dia|meia[ \t-]+noite)\b(?:[ \t]+da[ \t]+(?:manh[aã]|tarde|noite|madrugada)(?![A-Za-zÀ-ÿ0-9]))?/gi,
+      /(?<![\d.,])(?:[0-5]?\d)(?:[ \t]*min(?:utos?)?)?[ \t]+(?:pras|para[ \t]+as|(?:para[ \t]+a|pra[ \t]+a|para|pra)(?=[ \t]+(?:0?1(?![.,\d])|meia[ \t-]+noite))|(?:pro|para[ \t]+o|pra)(?=[ \t]+meio[ \t-]+dia))[ \t]+(?:[01]?\d|2[0-4]|meio[ \t-]+dia|meia[ \t-]+noite)(?![A-Za-zÀ-ÿ0-9])(?:[ \t]+da[ \t]+(?:manh[aã]|tarde|noite|madrugada)(?![A-Za-zÀ-ÿ0-9]))?/gi,
       ' '
     )
     .replace(
-      /(?<![A-Za-zÀ-ÿ0-9])(?:(?:ao|[aà])[ \t]+)?(?:meio[ \t-]+dia|meia[ \t-]+noite)(?:[ \t]+e[ \t]+(?:meia|[0-5]?\d|uma?)(?![.,]\d|[ \t]*(?:reais|real|brl|contos?|pilas?|centavos?)\b)(?:[ \t]*min(?:utos?)?)?)?(?![A-Za-zÀ-ÿ0-9])/gi,
+      /(?<![A-Za-zÀ-ÿ0-9])(?:(?:ao|[aà])[ \t]+)?(?:meio[ \t-]+dia|meia[ \t-]+noite)(?:[ \t]+e[ \t]+(?:meia|[0-5]?\d|uma?)(?![.,]\d|[ \t]*(?:reais|real|brl|contos?|pilas?|centavos?)(?![A-Za-zÀ-ÿ0-9]))(?:[ \t]*min(?:utos?)?)?)?(?![A-Za-zÀ-ÿ0-9])/gi,
       ' '
     )
     .replace(
-      /(?<![A-Za-zÀ-ÿ0-9])(?:(?:at[eé]|l[aá])[ \t]+)?(?:(?:[aà]s|pelas|das|pras|umas)[ \t]+(?:[01]?\d|2[0-4])|(?<!\d[ \t]+)[aà][ \t]+0?1)\b(?![.,]\d|[ \t]*(?:reais|real|brl|contos?|pilas?|centavos?)\b)(?:[ \t]+e[ \t]+(?:meia(?![A-Za-zÀ-ÿ0-9])|[0-5]?\d\b)(?:[ \t]*min(?:utos?)?(?![A-Za-zÀ-ÿ0-9]))?)?(?:[ \t]+da[ \t]+(?:manh[aã]|tarde|noite|madrugada)(?![A-Za-zÀ-ÿ0-9]))?/gi,
+      /(?<![A-Za-zÀ-ÿ0-9])(?:(?:at[eé]|l[aá])[ \t]+)?(?:(?:[aà]s|pelas|das|pras|umas)[ \t]+(?:[01]?\d|2[0-4])|(?<!\d[ \t]+)[aà][ \t]+0?1)(?![.,]\d|[A-Za-zÀ-ÿ0-9]|[ \t]*(?:reais|real|brl|contos?|pilas?|centavos?)(?![A-Za-zÀ-ÿ0-9]))(?:[ \t]+e[ \t]+(?:meia(?![A-Za-zÀ-ÿ0-9])|[0-5]?\d(?![A-Za-zÀ-ÿ0-9]))(?:[ \t]*min(?:utos?)?(?![A-Za-zÀ-ÿ0-9]))?)?(?:[ \t]+da[ \t]+(?:manh[aã]|tarde|noite|madrugada)(?![A-Za-zÀ-ÿ0-9]))?/gi,
       ' '
     )
     .replace(
@@ -1301,7 +1390,7 @@ export function parseBrlAmountFromText(text: string): number | null {
   if (typeof text !== 'string' || text.length > MAX_NLU_LEN * 2) return null;
   // Remove payloads EMVCo BRCode Pix Copia e Cola ("000201...br.gov.bcb.pix...6304XXXX") e emojis decorativos antes do split por espaço!
   const cleaned = stripDecorativeEmojis(normalizeHorizontalSpaces(text))
-    .replace(/\b000201[A-Za-z0-9.*+\-/_@ $:]{15,400}6304[0-9A-Fa-f]{4}\b/g, ' ')
+    .replace(/(?<![A-Za-zÀ-ÿ0-9])000201[A-Za-z0-9.*+\-/_@ $:]{15,400}6304[0-9A-Fa-f]{4}(?![A-Za-zÀ-ÿ0-9])/g, ' ')
     .trim();
   if (!cleaned || cleaned.length > MAX_NLU_LEN) return null;
 
@@ -1366,17 +1455,17 @@ export function parseBrlAmountFromText(text: string): number | null {
     )
     .replace(/(?<!\d)\d{3}\.\d{3}\.\d{3}[ \t-]\d{2}(?![.,]\d|\d)/g, ' ')
     .replace(/(?<!\d)\d{2}\.\d{3}[ \t-]\d{3}(?![.,]\d|\d)/g, ' ')
-    .replace(/(?<!\d)\d{1,2}\.\d{3}\.\d{3}[ \t-][\dxX]\b/g, ' ')
+    .replace(/(?<!\d)\d{1,2}\.\d{3}\.\d{3}[ \t-][\dxX](?![A-Za-zÀ-ÿ0-9])/g, ' ')
     .replace(/(?<!\d)(?:\d{4}\/\d{1,2}\/\d{1,2}|\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)(?!\d)/g, ' ')
     .replace(/(?<!\d)(?:\d{4}-\d{1,2}-\d{1,2}|\d{1,2}-\d{1,2}-\d{2,4})(?!\d)/g, ' ')
     .replace(/(?<!\d[.,]|\d)\d+(?:-\d+){2,}(?![.,]\d|\d)/g, ' ')
     // 2) Remove telefones completos COM ou SEM parênteses, DDD, espaço após o 9º dígito, pontos ou fixos 8 dígitos ("3333 3333")
     .replace(
-      /(?<![\d.,])(?:(?:\+\d{1,3}[ \t]*|\b55[ \t]+))?(?:\(0?\d{2}\)[ \t]*|\b0?\d{2}[ \t]*)(?:9[-.\s]?)?\d{4}[-.\s]?\d{4}(?![.,]\d|\d)/g,
+      /(?<![\d.,])(?:(?:\+\d{1,3}[ \t]*|(?<![A-Za-zÀ-ÿ0-9])55[ \t]+))?(?:\(0?\d{2}\)[ \t]*|(?<![A-Za-zÀ-ÿ0-9])0?\d{2}[ \t]*)(?:9[-.\s]?)?\d{4}[-.\s]?\d{4}(?![.,]\d|\d)/g,
       ' '
     )
     .replace(/(?<![\d.,])(?:9[-.\s]?)?\d{4}[-.]\d{4}(?![.,]\d|\d)/g, ' ')
-    .replace(/(?<![\d.,])\b[2-5]\d{3}[ \t]+\d{4}\b(?![.,]\d)/g, ' ')
+    .replace(/(?<![\d.,A-Za-zÀ-ÿ])[2-5]\d{3}[ \t]+\d{4}(?![.,]\d|[A-Za-zÀ-ÿ0-9])/g, ' ')
     // 3) Remove CEPs simples e contas hifenizadas (preservando pontuação final ", "/"."; NUNCA apaga \d{8,} solto para não burlar a trava de token único!)
     .replace(/(?<!\d[.,]|[\d/-])\d+-\d+(?![.,]\d|[\d/-])/g, ' ');
 
@@ -1494,7 +1583,7 @@ export function parseBrlAmountFromText(text: string): number | null {
     )
     // Remove logradouros com ou sem nome da via + número do imóvel ("Rua Tiradentes, 85", "Av. Paulista, 1000", "Rodovia BR-101") sem confundir "TV" ou "largo por 100"!
     .replace(
-      /(?<![A-Za-zÀ-ÿ0-9])(?:(?:rua|avenida|av|travessa|alameda|rodovia|estrada|pra[cç]a|viela|beco)(?![A-Za-zÀ-ÿ0-9])|(?:av|tv|al|rod|est)\.(?![A-Za-zÀ-ÿ0-9])|largo(?=[ \t]+(?:d[oa]s?|de|s[aã]o|santa|santo|nossa)(?![A-Za-zÀ-ÿ0-9])))(?:[ \t]+(?!(?:pix|pagar|pago|pagamento|cobran[cç]a|mand[ae]|mandar|gera|gerar|faz|fazer|envi[ae]|enviar|pass[ae]|passar|cobr[ae]|cobrar|cria|criar|depositar|transferir|transfiro|quero|preciso|valor|total|reais|real|brl|contos?|pilas?|por(?=[ \t]+(?:r\$[ \t]*)?\d))(?![A-Za-zÀ-ÿ0-9]))[A-Za-zÀ-ÿ][-A-Za-zÀ-ÿ.]{0,24}(?![-A-Za-zÀ-ÿ.])){0,5}[ \t,-]*(?:n[º°o.]?[ \t]*)?\d{1,5}(?![.,]\d|\d|[ \t]*(?:reais|real|brl|contos?|pilas?|centavos?|pix)\b)/gi,
+      /(?<![A-Za-zÀ-ÿ0-9])(?:(?:rua|avenida|av|travessa|alameda|rodovia|estrada|pra[cç]a|viela|beco)(?![A-Za-zÀ-ÿ0-9])|(?:av|tv|al|rod|est)\.(?![A-Za-zÀ-ÿ0-9])|largo(?=[ \t]+(?:d[oa]s?|de|s[aã]o|santa|santo|nossa)(?![A-Za-zÀ-ÿ0-9])))(?:[ \t]+(?!(?:pix|pagar|pago|pagamento|cobran[cç]a|mand[ae]|mandar|gera|gerar|faz|fazer|envi[ae]|enviar|pass[ae]|passar|cobr[ae]|cobrar|cria|criar|depositar|transferir|transfiro|quero|preciso|valor|total|reais|real|brl|contos?|pilas?|por(?=[ \t]+(?:r\$[ \t]*)?\d))(?![A-Za-zÀ-ÿ0-9]))[A-Za-zÀ-ÿ][-A-Za-zÀ-ÿ.]{0,24}(?![-A-Za-zÀ-ÿ.])){0,5}[ \t,-]*(?:n[º°o.]?[ \t]*)?\d{1,5}(?![.,]\d|\d|[A-Za-zÀ-ÿ]|[ \t]*(?:reais|real|brl|contos?|pilas?|centavos?|pix)(?![A-Za-zÀ-ÿ0-9]))/gi,
       ' '
     )
     // Remove CEP, CPF, CNPJ, RG e agência/conta mesmo quando o sufixo/dígito verificador vem separado por espaço ("cep 01310 100", "conta 12345 6", "cpf 123456789 50")
@@ -1535,19 +1624,22 @@ export function parseBrlAmountFromText(text: string): number | null {
 
   const sanitized = addressAndIdSanitized
     // Remove contagem inteira "1 pix" / "5 pix" SEM corromper "R$ 1.500 pix" ou "50,75 pix"!
-    .replace(/(?<!(?<![A-Za-zÀ-ÿ])r\$[ \t]*)(?<![\d.,])\d+(?![.,]\d)[ \t]+pix\b/gi, ' pix ')
+    .replace(
+      /(?<!(?<![A-Za-zÀ-ÿ])r\$[ \t]*)(?<![\d.,])\d+(?![.,]\d)[ \t]+pix(?![A-Za-zÀ-ÿ0-9])/gi,
+      ' pix '
+    )
     // Converte milhões para escala exata (caindo no aviso de teto máximo em vez de cobrar R$ 1,00!)
     .replace(
-      /(?:(?<![-\w@/,.])(\d{1,3}(?:[.,]\d{1,2})?)(?![.,]\d|\d)[ \t]*|\b(meio)[ \t]+)milh(?:[aã]o|[oõ]es)\b/gi,
+      /(?:(?<![-\wÀ-ÿ@/,.])(\d{1,3}(?:[.,]\d{1,2})?)(?![.,]\d|\d)[ \t]*|(?<![A-Za-zÀ-ÿ0-9])(meio)[ \t]+)milh(?:[aã]o|[oõ]es)(?![A-Za-zÀ-ÿ0-9])/gi,
       (_m, nStr, halfWord) => {
         const mult = halfWord ? 0.5 : Number(String(nStr).replace(',', '.'));
         return String(Math.round(mult * 1_000_000));
       }
     )
-    // Passagem única determinística para TODAS as composições com "mil":
-    // Aceita tanto "[N] mil e M" quanto gramática padrão sem "e" / com vírgula para centenas ("[N] mil 250", "dois mil, quinhentos")!
+    // Passagem única determinística para TODAS as composições com "mil" (fronteira Unicode estrita: NUNCA casa dentro de "milímetros"/"milésimos"!):
+    // Aceita "[N] mil e M", "[N] mil 250", "dois mil, quinhentos", "dois mil e quinhentos e cinquenta centavos" e "mil reais" em qualquer contexto!
     .replace(
-      /(?:(?<![-\wÀ-ÿºª°@/,.])(\d{1,4}(?:[.,]\d{1,2})?)(?![.,]\d|\d)[ \t]*|(?<=^|[ \t]*[:=(\-,;.!?][ \t]*|r\$[ \t]*|(?<![A-Za-zÀ-ÿ0-9])(?:de|por|para|pra|no|em|com|at[eé]|gera|gerar|gere|mand[ae]|mandar|envi[ae]|enviar|pass[ae]|passar|cobr[ae]|cobrar|faz|fa[cç]a|fazer|cria|criar|quero|queria|preciso|pagar|pago|pague|receber|depositar|transferir|cobran[cç]a|pagamento|pix|valor|total|ser|[eé]|s[aã]o|fica|ficou|deu|d[aá]|oi|ol[aá]|a[ií]|ent[aã]o|agora|hoje|favor)[ \t]+))mil\b(?:[ \t]+(reais|real|brl|contos?|pilas?)\b(?:[ \t]+e[ \t]+(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b)?|(?:[ \t]+e[ \t]+(?:(meio)\b|(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b|(\d{1,3})(?![.,]\d|\d|[ \t]*centavos?\b)(?:[ \t]*(reais|real|brl|contos?|pilas?)\b)?(?:[ \t]+e[ \t]+(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b)?)|(?:[ \t]*,[ \t]*|[ \t]+)(?:(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b|([1-9]\d{2})(?![.,]\d|\d|[ \t]*centavos?\b)(?:[ \t]*(reais|real|brl|contos?|pilas?)\b)?(?:[ \t]+e[ \t]+(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b)?))?)/gi,
+      /(?:(?<![-\wÀ-ÿºª°@/,.])(\d{1,4}(?:[.,]\d{1,2})?)(?![.,]\d|\d)[ \t]*|(?<=^|[ \t]*[:=(\-,;.!?][ \t]*|r\$[ \t]*|(?<![A-Za-zÀ-ÿ0-9])(?:de|por|para|pra|no|em|com|at[eé]|gera|gerar|gere|mand[ae]|mandar|envi[ae]|enviar|pass[ae]|passar|cobr[ae]|cobrar|faz|fa[cç]a|fazer|cria|cri[ae]|criar|quero|queria|gostaria|preciso|pagar|pago|pague|receber|depositar|transferir|cobran[cç]a|pagamento|pix|valor|total|ser|seria|[eé]|s[aã]o|fica|ficou|sai|saiu|custa|custou|fecha|fechou|deu|d[aá]|v[eê]|veja|oi|ol[aá]|opa|dia|tarde|noite|a[ií]|aqui|l[aá]|ali|ent[aã]o|agora|j[aá]|logo|hoje|favor|pfv?|amigo|amiga|chefe|mano|cara|irm[aã]o|outro|outra|novo|nova|mais)[ \t]+))mil(?![A-Za-zÀ-ÿ0-9])(?![ \t]+(?:maravilhas|desculpas|perd[oõ]es|coisas|problemas|motivos|anos[ \t]+luz)(?![A-Za-zÀ-ÿ0-9]))(?:[ \t]+(reais|real|brl|contos?|pilas?)(?![A-Za-zÀ-ÿ0-9])(?:[ \t]+e[ \t]+(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?(?![A-Za-zÀ-ÿ0-9]))?|(?:[ \t]+e[ \t]+(?:(meio)(?![A-Za-zÀ-ÿ0-9])|(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?(?![A-Za-zÀ-ÿ0-9])|(\d{1,3}(?:,\d{1,2})?)(?![.,]\d|\d|[ \t]*centavos?(?![A-Za-zÀ-ÿ0-9]))(?:[ \t]*(reais|real|brl|contos?|pilas?)(?![A-Za-zÀ-ÿ0-9]))?(?:[ \t]+e[ \t]+(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?(?![A-Za-zÀ-ÿ0-9]))?)|(?:[ \t]*,[ \t]*|[ \t]+)(?:(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?(?![A-Za-zÀ-ÿ0-9])|([1-9]\d{2}(?:,\d{1,2})?)(?![.,]\d|\d|[ \t]*centavos?(?![A-Za-zÀ-ÿ0-9]))(?:[ \t]*(reais|real|brl|contos?|pilas?)(?![A-Za-zÀ-ÿ0-9]))?(?:[ \t]+e[ \t]+(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?(?![A-Za-zÀ-ÿ0-9]))?))?)/gi,
       (
         _m,
         multStr,
@@ -1566,7 +1658,11 @@ export function parseBrlAmountFromText(text: string): number | null {
         const mult = multStr ? Number(String(multStr).replace(',', '.')) : 1;
         if (!Number.isFinite(mult) || mult <= 0) return ' ';
         const extraStr = eExtraReais ?? bareHundredsReais;
-        const addReais = halfWord ? 500 : extraStr ? Number(extraStr) : 0;
+        const addReais = halfWord
+          ? 500
+          : extraStr
+            ? Number(String(extraStr).replace(',', '.'))
+            : 0;
         const centsStr =
           unit1Cents ?? eDirectCents ?? eTailCents ?? bareDirectCents ?? bareTailCents;
         const cents = centsStr ? Number(centsStr) : 0;
@@ -1574,7 +1670,7 @@ export function parseBrlAmountFromText(text: string): number | null {
         const formatted = Number.isInteger(total)
           ? String(total)
           : total.toFixed(2).replace('.', ',');
-        const hasUnit = Boolean(unit1 || eUnit2 || bareUnit2 || centsStr);
+        const hasUnit = Boolean(unit1 || eUnit2 || bareUnit2 || centsStr || !Number.isInteger(addReais));
         return hasUnit ? `${formatted} reais` : formatted;
       }
     )
@@ -1592,10 +1688,13 @@ export function parseBrlAmountFromText(text: string): number | null {
       /(?<![-\wÀ-ÿºª°@/,.])(\d{1,3}(?:\.\d{3})+|\d{1,6})[ \t]*(?:reais|real|brl|contos?|pilas?)[ \t]+e[ \t]+(?!r\$)(\d{1,2})(?![.,]\d|\d|[ \t]*(?:reais|real|brl|contos?|pilas?|mil|milh))(?![A-Za-zÀ-ÿ0-9])(?:[ \t]*centavos?(?![A-Za-zÀ-ÿ0-9]))?/gi,
       (_m, r, c) => `R$ ${String(r).replace(/\./g, '')},${String(c).padStart(2, '0')}`
     )
-    .replace(/(?<![-\w@/,.])(\d{1,6})(?![.,]\d|\d)[ \t]*centavos?\b/gi, (_m, c) => {
-      const valFixed = (Number(c) / 100).toFixed(2).replace('.', ',');
-      return `R$ ${valFixed}`;
-    })
+    .replace(
+      /(?<![-\wÀ-ÿ@/,.])(\d{1,6})(?![.,]\d|\d)[ \t]*centavos?(?![A-Za-zÀ-ÿ0-9])/gi,
+      (_m, c) => {
+        const valFixed = (Number(c) / 100).toFixed(2).replace('.', ',');
+        return `R$ ${valFixed}`;
+      }
+    )
     .replace(SUFFIX_UNIT_STRIP_RE, ' ')
     .replace(/(?<![\d.,])\d+(?:[.,]\d+)*(?![.,]\d|\d)ah(?![A-Za-zÀ-ÿ0-9])/gi, ' ')
     .replace(
@@ -1711,14 +1810,19 @@ export interface ActiveMenuParseResult {
   inlineNewAmountBrl: number | null;
 }
 
+const MENU_CONVERSATIONAL_PREFIX_RE =
+  /^(?:(?:oi|ol[aá]|opa|bom[ \t]+dia|boa[ \t]+tarde|boa[ \t]+noite|sim|ok|okay|beleza|blz|certo|combinado|fechado|perfeito|show|top|isso(?:[ \t]+mesmo)?|por[ \t]+favor|pfv?|favor|ent[aã]o|nesse[ \t]+caso)(?![A-Za-zÀ-ÿ0-9])[ \t,;.!\-]*)+/i;
+
 const LEADING_MENU_OPT_RE =
-  /^(?:(?:(?:quero|escolho|prefiro|vou|vai|fico[ \t]+com|pode[ \t]+ser|(?:(?:a|o|minha|meu)[ \t]+)?(?:op[cç][aã]o|escolha|item)[ \t]+(?:[eé]|seria)|[eé]|seria)[ \t]+)?(?:(?:(a|o|na|no)|de)[ \t]+)?|(?:(?:pode|poderia|consegue|favor|por[ \t]+favor)[ \t]+)?(?:me[ \t]+)?(?:mand[ae]|mandar|envi[ae]|enviar|pass[ae]|passar|faz|fa[cç]a|fazer|gera|gere|gerar|cria|cri[ae]|criar)[ \t]+(?=(?:a|o|na|no|op[cç][aã]o|item|n[uú]mero)(?![A-Za-zÀ-ÿ0-9]))(?:(a|o|na|no)[ \t]+)?)([([#][ \t]*)?(?:(op[cç][aã]o|item|n[uú]mero)[ \t#:.-]*)?(?:([12])(\uFE0F?\u20E3|[ªº°])?(?![0-9]|[.,*][0-9])|(um|uma|dois|duas|primeir[oa]|segund[oa])(?![A-Za-zÀ-ÿ0-9]))(?:[ \t]+(op[cç][aã]o|item|escolha)(?![A-Za-zÀ-ÿ0-9]))?(?:([ \t]*[)\].:\-!?]+[ \t]*|[ \t,]+)([\s\S]*))?$/i;
+  /^(?:(?:(?:quero|queria|escolho|prefiro|vou|vai|bora|vamos|fecha|fecho|segue|fico[ \t]+com|fica|pode[ \t]+ser|(?:(?:a|o|minha|meu)[ \t]+)?(?:op[cç][aã]o|escolha|item)[ \t]+(?:[eé]|seria)|[eé]|seria)[ \t]+)?(?:(?:(a|o|na|no|pela|pelo)|de|com)[ \t]+)?|(?:(?:pode|poderia|consegue|favor|por[ \t]+favor)[ \t]+)?(?:me[ \t]+)?(?:mand[ae]|mandar|envi[ae]|enviar|pass[ae]|passar|faz|fa[cç]a|fazer|gera|gere|gerar|cria|cri[ae]|criar)[ \t]+(?=(?:a|o|na|no|pela|pelo|op[cç][aã]o|item|n[uú]mero)(?![A-Za-zÀ-ÿ0-9]))(?:(a|o|na|no|pela|pelo)[ \t]+)?)([([#][ \t]*)?(?:(op[cç][aã]o|item|n[uú]mero)[ \t#:.-]*)?(?:([12])(\uFE0F?\u20E3|[ªº°])?(?![0-9]|[.,*][0-9])|(um|uma|dois|duas|primeir[oa]|segund[oa])(?![A-Za-zÀ-ÿ0-9]))(?:[ \t]+(op[cç][aã]o|item|escolha)(?![A-Za-zÀ-ÿ0-9]))?(?:([ \t]*[)\].:\-!?]+[ \t]*|[ \t,]+)([\s\S]*))?$/i;
 
 function matchLeadingMenuOption(strippedMd: string): {
   optDigit: '1' | '2';
   remainder: string;
 } | null {
-  const leadingOptMatch = strippedMd.match(LEADING_MENU_OPT_RE);
+  const cleanedMenuInput = strippedMd.replace(MENU_CONVERSATIONAL_PREFIX_RE, '').trim();
+  if (!cleanedMenuInput) return null;
+  const leadingOptMatch = cleanedMenuInput.match(LEADING_MENU_OPT_RE);
   if (!leadingOptMatch) return null;
 
   const hasDefiniteArticle = Boolean(leadingOptMatch[1] || leadingOptMatch[2]);
@@ -1743,7 +1847,7 @@ function matchLeadingMenuOption(strippedMd: string): {
     (rawWord === 'um' || rawWord === 'uma') &&
     !hasMenuNoun &&
     remainder.length > 0 &&
-    !/^(?:por[ \t]+favor|pfv?|obrigad[oa]|valeu|agrade[cç]o|agora|a[ií])(?![A-Za-zÀ-ÿ0-9])/i.test(
+    !/^(?:por[ \t]+favor|pfv?|pf|pls|plz|obrigad[oa]|obgd?|valeu|vlw|agrade[cç]o|agora|a[ií]|amigo|amiga|mano|cara|chefe|irm[aã]o)(?![A-Za-zÀ-ÿ0-9])/i.test(
       remainder
     )
   ) {
@@ -1765,7 +1869,7 @@ function matchLeadingMenuOption(strippedMd: string): {
     remainder.length === 0 ||
     hasExplicitBullet ||
     (hasDefiniteArticle && /^(?:de|com|por|para|pra)(?![A-Za-zÀ-ÿ0-9])/i.test(remainder)) ||
-    /^(?:r\$|(?:por[ \t]+favor|pfv?|obrigad[oa]|valeu|agrade[cç]o|agora|a[ií]|quero|preciso|mand[ae]|mandar|envi[ae]|enviar|pode|escolho|prefiro|vai|sim|ok|beleza|blz|fechado|isso|reenvi\w*|manter|mantenha|continu\w*|cancel\w*|gerar|gera|fazer|faz|nov[oa]|outr[oa]|trocar|troca|mudar|muda|substituir|alterar)(?![A-Za-zÀ-ÿ0-9]))/i.test(
+    /^(?:r\$|(?:por[ \t]+favor|pfv?|pf|pls|plz|obrigad[oa]|obgd?|valeu|vlw|agrade[cç]o|agora|a[ií]|amigo|amiga|mano|cara|chefe|irm[aã]o|quero|preciso|mand[ae]|mandar|envi[ae]|enviar|pode|escolho|prefiro|vai|sim|ok|beleza|blz|fechado|isso|reenvi\w*|manter|mantenha|continu\w*|cancel\w*|gerar|gera|fazer|faz|nov[oa]|outr[oa]|trocar|troca|mudar|muda|substituir|alterar)(?![A-Za-zÀ-ÿ0-9]))/i.test(
       remainder
     );
 
@@ -2065,6 +2169,9 @@ export function isPaymentConfirmationMessage(text: string): boolean {
  * só permite despertar o robô sem palavra-chave ("pix"/"pagar") se a mensagem tiver semântica inequívoca de
  * consulta/confirmação financeira pós-pedido — jamais atravessa conversas pessoais do lojista!
  */
+const FOLLOWUP_INTERJECTION_PREFIX_RE =
+  /^(?:(?:pronto|prontinho|feito|certinho|certo|beleza|blz|ok|okay|show|top|perfeito|maravilha|oi|ol[aá]|opa|e[ \t]+a[ií]|bom[ \t]+dia|boa[ \t]+tarde|boa[ \t]+noite|amigo|amiga|chefe|mano|irm[aã]o)(?![A-Za-zÀ-ÿ0-9])[ \t,;.!\-]*)+/i;
+
 export function isPostOrderFollowUpMessage(text: string): boolean {
   if (!isStatusQueryMessage(text) && !isPaymentConfirmationMessage(text)) {
     return false;
@@ -2086,10 +2193,12 @@ export function isPostOrderFollowUpMessage(text: string): boolean {
     return false;
   }
 
-  const cmd = normalizeCommandText(text);
+  const strippedPrefixRaw = rawTrimmed.replace(FOLLOWUP_INTERJECTION_PREFIX_RE, '').trim();
+  const tCore = normalizePortugueseNumberWords(strippedPrefixRaw || rawTrimmed);
+  const cmd = normalizeCommandText(strippedPrefixRaw || text);
   if (
     cmd &&
-    /^(?:status|ver status|qual (?:[eé] )?(?:o )?status|consultar|consultar status|situa[cç][aã]o|recibo|pago|paga|pagos|(?:j[aá] )?(?:t[aá]|est[aá]|foi) pago|(?:j[aá] )?(?:te )?(?:paguei|quitei|depositei|transferi|enviei|mandei|fiz|passei|conclu[ií]|finalizei|completei)(?: (?:a[ií]|aqui|agora|l[aá]|hoje))?|(?:acabei|terminei) de (?:te )?(?:pagar|transferir|depositar|enviar|mandar|fazer|quitar)|(?:j[aá] )?(?:caiu|entrou|bateu|compensou|confirmou|aprovou|recebeu)(?: (?:a[ií]|aqui|na conta))?|estornou|foi estornado|reembolsou|foi reembolsado)$/.test(
+    /^(?:status|ver status|qual (?:[eé] )?(?:o )?status|consultar|consultar status|situa[cç][aã]o|recibo|pago|paga|pagos|(?:j[aá] )?(?:t[aá]|est[aá]|foi) pago(?: (?:j[aá]|a[ií]|aqui|agora|sim))?|(?:j[aá] )?(?:te )?(?:paguei|quitei|depositei|transferi|enviei|mandei|fiz|passei|conclu[ií]|finalizei|completei)(?: (?:j[aá]|a[ií]|aqui|agora|l[aá]|hoje))?|(?:acabei|terminei) de (?:te )?(?:pagar|transferir|depositar|enviar|mandar|fazer|quitar)(?: (?:j[aá]|a[ií]|aqui|agora))?|(?:j[aá] )?(?:caiu|entrou|bateu|compensou|confirmou|aprovou|recebeu)(?: (?:j[aá]|a[ií]|aqui|na conta))?|estornou|foi estornado|reembolsou|foi reembolsado)$/.test(
       cmd
     )
   ) {
@@ -2103,13 +2212,13 @@ export function isPostOrderFollowUpMessage(text: string): boolean {
       t
     ) ||
     /^(?:j[aá][ \t]+)?(?:(?:acabei|terminei)[ \t]+de[ \t]+)?(?:(?:te|lhe|lhes)[ \t]+)?(?:(?:paguei|pagar|quitei|quitar|depositei|depositar|transferi|transferir)(?:[ \t]+(?:j[aá]|agora|a[ií]|aqui|l[aá]|hoje|pra[ \t]+voc[eê]|pra[ \t]+vc|os?|as?|esse|essa|o[ \t]+valor)){0,3}(?:[ \t]+(?:r\$[ \t]*\d[\d.,]*|\d[\d.,]*(?:[ \t]*(?:reais|real|contos?|pilas?))?))?|(?:enviei|enviar|mandei|mandar|passei|passar|fiz|fazer|conclu[ií]|finalizei|completei)(?:[ \t]+(?:j[aá]|agora|a[ií]|aqui|l[aá]|hoje|pra[ \t]+voc[eê]|pra[ \t]+vc|o[ \t]+valor)){0,2}[ \t]+(?:(?:os?|as?|esse|essa)[ \t]+(?:\d[\d.,]*(?:[ \t]*(?:reais|real|contos?|pilas?))?|r\$[ \t]*\d[\d.,]*)|r\$[ \t]*\d[\d.,]*|\d[\d.,]*[ \t]+(?:reais|real|contos?|pilas?)))(?:[ \t]+(?:j[aá]|agora|a[ií]|aqui|l[aá]|hoje|pra[ \t]+voc[eê]|pra[ \t]+vc)){0,2}[ \t.!]*$/i.test(
-      t
+      tCore
     ) ||
-    /^(?:(?:j[aá][ \t]+)?(?:t[aá]|est[aá]|foi|foram|est[aã]o|t[aã]o)[ \t]+pag[oa]s?[ \t]+(?:(?:os?|as?|esse|essa|o[ \t]+valor[ \t]+de)[ \t]+)?(?:r\$[ \t]*\d[\d.,]*|\d[\d.,]*(?:[ \t]*(?:reais|real|contos?|pilas?))?)|(?:(?:os?|as?)[ \t]+)?(?:r\$[ \t]*\d[\d.,]*|\d[\d.,]*(?:[ \t]*(?:reais|real|contos?|pilas?))?)[ \t]+(?:j[aá][ \t]+)?(?:(?:t[aá]|est[aá]|foi|foram|est[aã]o|t[aã]o)[ \t]+)?pag[oa]s?)(?:[ \t]+(?:j[aá]|agora|a[ií]|aqui|l[aá]|hoje)){0,2}[ \t.!]*$/i.test(
-      t
+    /^(?:(?:j[aá][ \t]+)?(?:t[aá]|est[aá]|foi|foram|est[aã]o|t[aã]o)[ \t]+pag[oa]s?(?:[ \t]+j[aá])?[ \t]+(?:(?:os?|as?|esse|essa|o[ \t]+valor[ \t]+de)[ \t]+)?(?:r\$[ \t]*\d[\d.,]*|\d[\d.,]*(?:[ \t]*(?:reais|real|contos?|pilas?))?)|(?:(?:os?|as?)[ \t]+)?(?:r\$[ \t]*\d[\d.,]*|\d[\d.,]*(?:[ \t]*(?:reais|real|contos?|pilas?))?)[ \t]+(?:j[aá][ \t]+)?(?:(?:t[aá]|est[aá]|foi|foram|est[aã]o|t[aã]o)[ \t]+)?pag[oa]s?)(?:[ \t]+(?:j[aá]|agora|a[ií]|aqui|l[aá]|hoje)){0,2}[ \t.!]*$/i.test(
+      tCore
     ) ||
     /^(?:(?:v[eê]|veja|olha|olhe|confere|confira)[ \t]+(?:a[ií][ \t]+)?se[ \t]+)?(?:j[aá][ \t]+)?(?:caiu|ca[ií]ram|entrou|entraram|bateu|bateram|compensou|compensaram|confirmou|confirmaram|aprovou|aprovaram|recebeu|receberam)(?:[ \t]+(?:a[ií]|aqui|na[ \t]+conta|no[ \t]+banco|l[aá]|agora)){0,2}[ \t]+(?:(?:os?|as?|esse|essa|o[ \t]+valor[ \t]+d[eo])[ \t]+)?(?:r\$[ \t]*\d[\d.,]*|\d[\d.,]*(?:[ \t]*(?:reais|real|contos?|pilas?))?)(?:[ \t]+(?:a[ií]|aqui|na[ \t]+conta|no[ \t]+banco|l[aá]|agora)){0,2}[ \t.!?]*$/i.test(
-      t
+      tCore
     )
   );
 }
