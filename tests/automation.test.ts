@@ -918,6 +918,94 @@ test('NLU avançado: cripto/moedas, logradouros, estornos, horários coloquiais,
   assert.equal(formatTimeSaoPaulo('2026-07-01T18:15:00.000Z'), '15:15');
 });
 
+test('NLU Busca #26: infinitivos subordinados, cancelamentos/tentativas/negações plurais, perguntas diretas de preço, cotações telegráficas e menu "Manda a 1"', () => {
+  // Achado 1: orações subordinadas ("ao fazer", "pra gerar", "para enviar", "na hora de fazer", "se eu quiser fazer")
+  assert.equal(isStatusQueryMessage('Deu erro ao fazer o pix de 50'), true);
+  assert.equal(parseBrlAmountFromText('Deu erro ao fazer o pix de 50'), null);
+  assert.equal(isStatusQueryMessage('Deu problema para enviar o pix de 50'), true);
+  assert.equal(parseBrlAmountFromText('Deu problema para enviar o pix de 50'), null);
+  assert.equal(isStatusQueryMessage('Meu banco recusou na hora de fazer o pix de 50'), true);
+  assert.equal(parseBrlAmountFromText('Meu banco recusou na hora de fazer o pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Qual o mínimo pra fazer pix? 5?'), null);
+  assert.equal(parseBrlAmountFromText('Qual o limite para gerar um pix? 5000?'), null);
+  assert.equal(parseBrlAmountFromText('Quanto custa pra fazer um pix de 50?'), null);
+  assert.equal(parseBrlAmountFromText('Tem taxa pra gerar um pix de 100?'), null);
+  assert.equal(parseBrlAmountFromText('Se eu quiser fazer um pix de 50 tem taxa?'), null);
+
+  // Achado 2: cancelamentos no pretérito/passiva, tentativas frustradas ("tentei", "deu errado", "quase fiz") e negações plurais/passivas
+  assert.equal(isStatusQueryMessage('Por que meu pix de 50 foi cancelado?'), true);
+  assert.equal(parseBrlAmountFromText('Por que meu pix de 50 foi cancelado?'), null);
+  assert.equal(isStatusQueryMessage('O pix de 50 foi cancelado'), true);
+  assert.equal(parseBrlAmountFromText('O pix de 50 foi cancelado'), null);
+  assert.equal(isStatusQueryMessage('O banco cancelou meu pix de 50'), true);
+  assert.equal(parseBrlAmountFromText('O banco cancelou meu pix de 50'), null);
+  assert.equal(isStatusQueryMessage('Minha cobrança de 50 apareceu cancelada'), true);
+  assert.equal(parseBrlAmountFromText('Minha cobrança de 50 apareceu cancelada'), null);
+  assert.equal(isStatusQueryMessage('Tentei pagar o pix de 50'), true);
+  assert.equal(parseBrlAmountFromText('Tentei pagar o pix de 50'), null);
+  assert.equal(isStatusQueryMessage('Tentei fazer o pix de 50'), true);
+  assert.equal(parseBrlAmountFromText('Tentei fazer o pix de 50'), null);
+  assert.equal(isStatusQueryMessage('Deu errado o pix de 50'), true);
+  assert.equal(parseBrlAmountFromText('Deu errado o pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Não deu certo o pix de 50'), null);
+  assert.equal(isStatusQueryMessage('Os 50 reais não caíram ainda no pix'), true);
+  assert.equal(parseBrlAmountFromText('Os 50 reais não caíram ainda no pix'), null);
+  assert.equal(isStatusQueryMessage('Os 50 reais não foram aprovados no pix'), true);
+  assert.equal(parseBrlAmountFromText('Os 50 reais não foram aprovados no pix'), null);
+  assert.equal(parseBrlAmountFromText('O pix de 50 não compensou'), null);
+  assert.equal(parseBrlAmountFromText('Não está confirmado o pix de 50'), null);
+  assert.equal(isPaymentConfirmationMessage('Quase fiz o pix de 50'), false);
+  assert.equal(parseBrlAmountFromText('Quase fiz o pix de 50'), null);
+
+  // Achado 3: perguntas diretas de preço/valor e faixas ("Custa R$ 50 no pix?", "Fica 80 no pix?", "a partir de 5?")
+  assert.equal(parseBrlAmountFromText('Custa R$ 50 no pix?'), null);
+  assert.equal(parseBrlAmountFromText('Fica 80 no pix?'), null);
+  assert.equal(parseBrlAmountFromText('Sai por 50 no pix?'), null);
+  assert.equal(parseBrlAmountFromText('Tá 50 no pix?'), null);
+  assert.equal(parseBrlAmountFromText('Está R$ 50 no pix?'), null);
+  assert.equal(parseBrlAmountFromText('O valor é 50 no pix?'), null);
+  assert.equal(parseBrlAmountFromText('O valor é 50 no pix'), 50);
+  assert.equal(parseBrlAmountFromText('Posso pagar R$ 50 no pix?'), 50);
+  assert.equal(parseBrlAmountFromText('Qual o preço no pix? 50?'), null);
+  assert.equal(parseBrlAmountFromText('Qual o valor no pix? 50?'), null);
+  assert.equal(parseBrlAmountFromText('Aceita pix a partir de 5?'), null);
+  assert.equal(parseBrlAmountFromText('Posso fazer pix acima de 5000?'), null);
+  assert.equal(parseBrlAmountFromText('Aceita pix abaixo de 10?'), null);
+
+  // Achado 4: cotações telegráficas sem verbo de ligação
+  assert.equal(parseBrlAmountFromText('Dólar comercial 5,80 no pix?'), null);
+  assert.equal(parseBrlAmountFromText('Dólar hoje 5,80 no pix'), null);
+  assert.equal(parseBrlAmountFromText('Euro comercial R$ 6,20 no pix'), null);
+  assert.equal(parseBrlAmountFromText('Bitcoin hoje 5 mil no pix'), null);
+
+  // Achado 5: menu 1 / 2 com "Manda a 1", "Envia a 1", "Gera a 2", "Faz a 2" sem capturar "Manda 2 mil"
+  assert.deepEqual(parseActiveOrderMenuReply('Manda a 1'), {
+    choice: 'resend',
+    explicitOptionDigit: '1',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('Envia a 1'), {
+    choice: 'resend',
+    explicitOptionDigit: '1',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('Gera a 2'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('Faz a 2'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('Manda 2 mil'), {
+    choice: 'none',
+    explicitOptionDigit: null,
+    inlineNewAmountBrl: 2000,
+  });
+});
+
 test('Concorrência, mensagens pós-pagamento ("já paguei"), estado AWAITING_AMOUNT pós-erro e alerta de FAILED ao Admin', async () => {
   const { repository, engine } = createPrivacyTestSetup();
   const clientPhone = '5511988887777';
