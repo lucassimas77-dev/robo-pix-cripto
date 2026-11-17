@@ -216,17 +216,26 @@ export class ConversationEngine {
       return;
     }
 
-    // 3. Mensagens pós-pagamento ("já paguei", "paguei 50 no pix", "status", "comprovante") NUNCA geram nova cobrança!
+    // 3. Mensagens pós-pagamento ("já paguei", "paguei 50 no pix", "status", "comprovante") NUNCA geram nova cobrança
+    //    e NUNCA reabrem `IDLE -> AWAITING_AMOUNT` (evita sequestrar conversas pessoais subsequentes no modo `keyword_only`)!
     if (isStatusQueryMessage(text) || isPaymentConfirmationMessage(text)) {
+      const keepAwaitingAmount = session.stage === 'AWAITING_AMOUNT';
+      const nextFallbackStage = keepAwaitingAmount ? 'AWAITING_AMOUNT' : 'IDLE';
+      const newOrderPrompt = keepAwaitingAmount
+        ? 'envie apenas o *valor em Reais* (ex: *50,00*):'
+        : 'envie *Pix de [valor]* (ex: *Pix de 50,00*).';
+
       session.pendingNewAmountBrl = undefined;
       session.draftAmountBrl = undefined;
       const recent = this.repository.findMostRecentOrderByPhone(phone);
       if (!recent) {
-        session.stage = 'AWAITING_AMOUNT';
+        if (session.stage !== nextFallbackStage) {
+          session.stage = nextFallbackStage;
+        }
         this.repository.saveSession(session);
         await this.safeSendText(
           phone,
-          `ℹ️ Não encontrei nenhuma cobrança registrada recentemente para este número.\n\nSe desejar gerar um novo Pix, envie apenas o *valor em Reais* (ex: *50,00*):`,
+          `ℹ️ Não encontrei nenhuma cobrança registrada recentemente para este número.\n\nSe desejar gerar um novo Pix, ${newOrderPrompt}`,
           session.customerJid
         );
         return;
@@ -272,21 +281,21 @@ export class ConversationEngine {
       }
 
       if (recent.status === 'EXPIRED' || recent.status === 'PENDING') {
-        session.stage = 'AWAITING_AMOUNT';
+        session.stage = nextFallbackStage;
         this.repository.saveSession(session);
         await this.safeSendText(
           phone,
-          `⏰ Sua última cobrança de *${formatBrl(recent.amountBrl)}* (\`${recent.externalId}\`) consta com o prazo encerrado. Se você pagou antes do vencimento, aguarde alguns instantes pela compensação; caso não tenha pago e queira gerar outra, envie apenas o *valor em Reais*:`,
+          `⏰ Sua última cobrança de *${formatBrl(recent.amountBrl)}* (\`${recent.externalId}\`) consta com o prazo encerrado. Se você pagou antes do vencimento, aguarde alguns instantes pela compensação; caso não tenha pago e queira gerar outra, ${newOrderPrompt}`,
           session.customerJid
         );
         return;
       }
 
-      session.stage = 'AWAITING_AMOUNT';
+      session.stage = nextFallbackStage;
       this.repository.saveSession(session);
       await this.safeSendText(
         phone,
-        `⚠️ Sua última cobrança de *${formatBrl(recent.amountBrl)}* (\`${recent.externalId}\`) consta como *${recent.status === 'FAILED' ? 'cancelada/estornada' : 'cancelada'}*.\n\nSe desejar gerar uma nova cobrança, envie apenas o *valor em Reais*:`,
+        `⚠️ Sua última cobrança de *${formatBrl(recent.amountBrl)}* (\`${recent.externalId}\`) consta como *${recent.status === 'FAILED' ? 'cancelada/estornada' : 'cancelada'}*.\n\nSe desejar gerar uma nova cobrança, ${newOrderPrompt}`,
         session.customerJid
       );
       return;

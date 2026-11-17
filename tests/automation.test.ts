@@ -17,7 +17,9 @@ import {
   hasPixTriggerKeyword,
   isCancelCommand,
   isExitCommand,
+  isHelpCommand,
   isPaymentConfirmationMessage,
+  isPostOrderFollowUpMessage,
   isPublicHttpsWebhookUrl,
   isStatusQueryMessage,
   normalizeCommandText,
@@ -1191,6 +1193,170 @@ test('NLU Busca #28: CEP/conta hifenizados com pontuação, particípios/gerúnd
     explicitOptionDigit: null,
     inlineNewAmountBrl: null,
   });
+});
+
+test('Busca #29: filtro keyword_only pós-pedido sem invadir conversas pessoais, concluí/finalizei e "vê se caiu", perguntas coloquiais/pechincha, gerúndios/posse negativa/câmbio e CEP/conta/DV/tokens inválidos', async () => {
+  // Achado 1: filtro keyword_only + preservação de IDLE em consultas de status pós-erro/expiração
+  const { repository, engine } = createPrivacyTestSetup();
+  try {
+    const baileys = new BaileysDirectManager(repository, 'data/wa_auth_test_29', {
+      filterMode: 'keyword_only',
+    });
+    const friendPhone = '5511966661111';
+
+    await engine.handleIncomingMessage({ phone: friendPhone, text: 'Me manda um Pix de 50' });
+    const ord = repository.findMostRecentOrderByPhone(friendPhone);
+    assert.ok(ord);
+
+    // Liquida o pedido -> sessão fica IDLE
+    await engine.handleSettlementWebhook({
+      provider: 'mock',
+      externalId: ord.externalId,
+      newStatus: 'SETTLED_CRYPTO',
+      rawEventName: 'MOCK_PAID',
+    });
+    assert.equal(repository.getSession(friendPhone).stage, 'IDLE');
+
+    // Mensagens pessoais nas 24h seguintes NUNCA passam pelo filtro keyword_only!
+    for (const personalMsg of [
+      'Você já chegou em casa?',
+      'Deu tudo certo na viagem?',
+      'Meu celular travou',
+      'Ele cancelou o jantar',
+      'Tive um problema hoje',
+      'Me ajuda aqui',
+      'Paguei 50 no mercado hoje',
+      'Parar',
+      'Menu',
+    ]) {
+      assert.equal(
+        baileys.shouldForwardIncomingMessage(friendPhone, personalMsg),
+        false,
+        `Mensagem pessoal "${personalMsg}" deveria ser bloqueada em keyword_only`
+      );
+      assert.equal(isPostOrderFollowUpMessage(personalMsg), false);
+    }
+    assert.equal(isStatusQueryMessage('Você já chegou em casa?'), false);
+    assert.equal(isStatusQueryMessage('Deu tudo certo na viagem?'), false);
+    assert.equal(isStatusQueryMessage('Meu celular travou'), false);
+    assert.equal(isStatusQueryMessage('Ele cancelou o jantar'), false);
+    assert.equal(isStatusQueryMessage('Tive um problema hoje'), false);
+    assert.equal(isHelpCommand('Me ajuda aqui'), false);
+    assert.equal(isPaymentConfirmationMessage('Paguei 50 no mercado hoje'), false);
+    assert.equal(parseBrlAmountFromText('Paguei 50 no mercado hoje'), null);
+
+    // Já consultas/confirmações financeiras reais passam normalmente após pedido liquidado!
+    for (const genuineFollowUp of [
+      'Já paguei!',
+      'Tá pago',
+      'Status',
+      'Já caiu?',
+      'Descontou 50 reais da minha conta',
+      'Foi estornado!',
+    ]) {
+      assert.equal(baileys.shouldForwardIncomingMessage(friendPhone, genuineFollowUp), true);
+    }
+
+    // Se o cliente abrir novo pedido e encerrar com "sair" (CANCELLED + IDLE), nem follow-ups sem "pix" acordam o robô!
+    await engine.handleIncomingMessage({ phone: friendPhone, text: 'Pix de 70' });
+    await engine.handleIncomingMessage({ phone: friendPhone, text: 'sair' });
+    assert.equal(repository.getSession(friendPhone).stage, 'IDLE');
+    assert.equal(repository.findMostRecentOrderByPhone(friendPhone)?.status, 'CANCELLED');
+    assert.equal(baileys.shouldForwardIncomingMessage(friendPhone, 'Status'), false);
+    assert.equal(baileys.shouldForwardIncomingMessage(friendPhone, 'Status do meu pix'), true);
+
+    // E quando o usuário em IDLE envia relato de erro/status com a palavra "pix", a sessão permanece IDLE (não reabre janela de 2h!)
+    await engine.handleIncomingMessage({
+      phone: friendPhone,
+      text: 'O banco cancelou meu pix de 70',
+    });
+    assert.equal(repository.getSession(friendPhone).stage, 'IDLE');
+    assert.equal(baileys.shouldForwardIncomingMessage(friendPhone, 'São 50'), false);
+
+    // Achado 2: concluí/finalizei e consultas de compensação sem "?" nunca geram cobrança duplicada!
+    const ordersBeforeDupCheck = repository.listRecentOrders().length;
+    for (const postPaidMsg of [
+      'Concluí o pix de 50',
+      'Conclui o pix de 50',
+      'Já concluí o pagamento de R$ 50,00',
+      'Finalizei o pix de 50!',
+      'Acabei de concluir o pix de 50',
+      'Consegui finalizar o pagamento de R$ 50',
+      'Vê se o pix de 50 caiu',
+      'Confere se entrou os 50 no pix',
+      'Olha aí se caiu R$ 50 no pix',
+      'Vê se recebeu os 50 do pix',
+      'O pix de 50 caiu aí',
+      'O pagamento de R$ 50 entrou aí',
+    ]) {
+      await engine.handleIncomingMessage({ phone: friendPhone, text: postPaidMsg });
+    }
+    assert.equal(repository.listRecentOrders().length, ordersBeforeDupCheck);
+  } finally {
+    repository.close();
+  }
+
+  assert.equal(isPaymentConfirmationMessage('Concluí o pix de 50'), true);
+  assert.equal(isPaymentConfirmationMessage('Já concluí o pagamento de R$ 50,00'), true);
+  assert.equal(isPaymentConfirmationMessage('Finalizei o pix de 50!'), true);
+  assert.equal(isPaymentConfirmationMessage('Acabei de concluir o pix de 50'), true);
+  assert.equal(isPaymentConfirmationMessage('Não concluí o pix de 50 ainda'), false);
+  assert.equal(parseBrlAmountFromText('Não concluí o pix de 50 ainda'), null);
+  assert.equal(isStatusQueryMessage('Vê se o pix de 50 caiu'), true);
+  assert.equal(isStatusQueryMessage('Confere se entrou os 50 no pix'), true);
+  assert.equal(isStatusQueryMessage('Olha aí se caiu R$ 50 no pix'), true);
+  assert.equal(isStatusQueryMessage('Vê se recebeu os 50 do pix'), true);
+  assert.equal(isStatusQueryMessage('O pix de 50 caiu aí'), true);
+  assert.equal(isStatusQueryMessage('O pagamento de R$ 50 entrou aí'), true);
+
+  // Achado 3: perguntas coloquiais ("quanto que", "qual que", "ganho desconto", "acréscimo", objeto antes de "por") e pechinchas condicionais
+  assert.equal(parseBrlAmountFromText('Quanto que tá o corte no pix? 50?'), null);
+  assert.equal(parseBrlAmountFromText('Quanto que fica com entrega no pix? 80?'), null);
+  assert.equal(parseBrlAmountFromText('Qual que é o preço no pix? 50'), null);
+  assert.equal(parseBrlAmountFromText('Ganho desconto pagando 100 no pix?'), null);
+  assert.equal(parseBrlAmountFromText('Tenho desconto no pix de 100?'), null);
+  assert.equal(parseBrlAmountFromText('Tem acréscimo no pix de 100?'), null);
+  assert.equal(parseBrlAmountFromText('Consegue fazer o serviço por 50 no pix?'), null);
+  assert.equal(parseBrlAmountFromText('Faz esse produto por 50 no pix?'), null);
+  assert.equal(parseBrlAmountFromText('Se fizer por 50 eu pago no pix'), null);
+  assert.equal(parseBrlAmountFromText('Se for 50 eu faço o pix'), null);
+  assert.equal(parseBrlAmountFromText('Pode fazer um pix de 50?'), 50);
+  assert.equal(parseBrlAmountFromText('Se puder, me manda um pix de 50'), 50);
+
+  // Achado 4: gerúndios bancários, negação de posse ("não tenho", "estou sem") e câmbio/cripto em oração separada
+  for (const gerundHold of [
+    'O banco está segurando meu pix de 50',
+    'O banco está analisando meu pix de 50',
+    'O banco está bloqueando meu pix de 50',
+    'O banco está recusando o pix de 50',
+    'Está rejeitando o pix de 50',
+    'Está negando meu pix de 50',
+  ]) {
+    assert.equal(isStatusQueryMessage(gerundHold), true);
+    assert.equal(parseBrlAmountFromText(gerundHold), null);
+  }
+  assert.equal(parseBrlAmountFromText('Não tenho 50 reais pro pix agora'), null);
+  assert.equal(parseBrlAmountFromText('Não tenho os 50 reais do pix'), null);
+  assert.equal(parseBrlAmountFromText('Estou sem 50 reais pro pix agora'), null);
+  assert.equal(parseBrlAmountFromText('Fiquei sem dinheiro pro pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Tô sem dinheiro em espécie, manda um pix de 50'), 50);
+  assert.equal(parseBrlAmountFromText('Comprar dólar no pix, 100 reais'), null);
+  assert.equal(parseBrlAmountFromText('Quero comprar USDT no pix, tenho 100 reais'), null);
+  assert.equal(parseBrlAmountFromText('Tenho 100 reais no pix, quero BTC'), null);
+  assert.equal(parseBrlAmountFromText('Óculos de sol, manda pix de 100'), 100);
+
+  // Achado 5: CEP/conta/agência/CPF com espaço antes do sufixo/DV e não-descarte de `0` ou `> 10_000_000`
+  assert.equal(parseBrlAmountFromText('cep 01310 100 quero fazer pix'), null);
+  assert.equal(parseBrlAmountFromText('cep 01310 100, manda pix de 80'), 80);
+  assert.equal(parseBrlAmountFromText('conta 12345 6 quero pix'), null);
+  assert.equal(parseBrlAmountFromText('ag 1234 cc 56789 5 quero pix'), null);
+  assert.equal(parseBrlAmountFromText('ag 1234 cc 56789 5, manda pix de 80'), 80);
+  assert.equal(parseBrlAmountFromText('meu cpf é 123.456.789 50 quero fazer um pix'), null);
+  assert.equal(parseBrlAmountFromText('meu cpf é 123.456.789 50, manda pix de 80'), 80);
+  assert.equal(parseBrlAmountFromText('meu cpf é 123456789 50 quero fazer um pix'), null);
+  assert.equal(parseBrlAmountFromText('pix de 0 ou 50'), null);
+  assert.equal(parseBrlAmountFromText('pix de 20.000.000 ou 50'), null);
+  assert.equal(parseBrlAmountFromText('pix de 100000000 ou 50'), null);
 });
 
 test('Concorrência, mensagens pós-pagamento ("já paguei"), estado AWAITING_AMOUNT pós-erro e alerta de FAILED ao Admin', async () => {

@@ -14,11 +14,7 @@ import { OrderRepository } from '../database/orderRepository.ts';
 import type { FilterMode } from '../types/domain.ts';
 import {
   hasPixTriggerKeyword,
-  isCancelCommand,
-  isExitCommand,
-  isHelpCommand,
-  isPaymentConfirmationMessage,
-  isStatusQueryMessage,
+  isPostOrderFollowUpMessage,
   onlyDigits,
 } from '../utils/cpfCnpjValidator.ts';
 
@@ -112,6 +108,52 @@ export class BaileysDirectManager {
 
   public isConnected(): boolean {
     return this.state === 'CONNECTED' && this.sock !== null;
+  }
+
+  public shouldForwardIncomingMessage(
+    senderDigits: string,
+    text: string,
+    nowMs = Date.now()
+  ): boolean {
+    if (senderDigits.length < 8) return false;
+
+    if (this.allowedTestPhone) {
+      // Fail-closed: se o filtro está preenchido mas tem menos de 8 dígitos válidos, bloqueia tudo!
+      if (this.allowedTestPhone.length < 8) {
+        return false;
+      }
+      if (this.allowedTestPhone.slice(-8) !== senderDigits.slice(-8)) {
+        return false;
+      }
+    }
+
+    if (this.filterMode === 'keyword_only') {
+      const session = this.repository.getSession(senderDigits);
+      const activeOrder = this.repository.findActivePendingOrderByPhone(
+        senderDigits,
+        new Date(nowMs).toISOString()
+      );
+      const sessionAgeMs = nowMs - new Date(session.updatedAt).getTime();
+      const isFreshSession =
+        session.stage !== 'IDLE' &&
+        Number.isFinite(sessionAgeMs) &&
+        sessionAgeMs < SESSION_FLOW_FRESHNESS_MS;
+
+      if (isFreshSession || activeOrder !== null || hasPixTriggerKeyword(text)) {
+        return true;
+      }
+
+      const recentOrder = this.repository.findMostRecentOrderByPhone(senderDigits);
+      const hasRecentOrderContext =
+        recentOrder !== null &&
+        recentOrder.status !== 'CANCELLED' &&
+        (recentOrder.status === 'PIX_CONFIRMED' ||
+          nowMs - new Date(recentOrder.createdAt).getTime() < RECENT_ORDER_CONTEXT_MS);
+
+      return hasRecentOrderContext && isPostOrderFollowUpMessage(text);
+    }
+
+    return true;
   }
 
   private clearReconnectTimer(): void {
@@ -309,48 +351,8 @@ export class BaileysDirectManager {
 
             this.rememberJid(senderDigits, remoteJid);
 
-            if (this.allowedTestPhone) {
-              // Fail-closed: se o filtro está preenchido mas tem menos de 8 dígitos válidos, bloqueia tudo!
-              if (this.allowedTestPhone.length < 8) {
-                continue;
-              }
-              const last8Allowed = this.allowedTestPhone.slice(-8);
-              const last8Sender = senderDigits.slice(-8);
-              if (last8Allowed !== last8Sender) {
-                continue;
-              }
-            }
-
-            if (this.filterMode === 'keyword_only') {
-              const session = this.repository.getSession(senderDigits);
-              const activeOrder = this.repository.findActivePendingOrderByPhone(senderDigits);
-              const sessionAgeMs = Date.now() - new Date(session.updatedAt).getTime();
-              const isFreshSession =
-                session.stage !== 'IDLE' &&
-                Number.isFinite(sessionAgeMs) &&
-                sessionAgeMs < SESSION_FLOW_FRESHNESS_MS;
-
-              const recentOrder = this.repository.findMostRecentOrderByPhone(senderDigits);
-              const hasRecentOrderContext =
-                recentOrder !== null &&
-                (recentOrder.status === 'PIX_CONFIRMED' ||
-                  Date.now() - new Date(recentOrder.createdAt).getTime() < RECENT_ORDER_CONTEXT_MS);
-
-              const isPostOrderFollowUp =
-                hasRecentOrderContext &&
-                (isPaymentConfirmationMessage(text) ||
-                  isStatusQueryMessage(text) ||
-                  isCancelCommand(text) ||
-                  isExitCommand(text) ||
-                  isHelpCommand(text));
-
-              const isAlreadyInFlow =
-                isFreshSession || activeOrder !== null || isPostOrderFollowUp;
-              const hasPixKeyword = hasPixTriggerKeyword(text);
-
-              if (!isAlreadyInFlow && !hasPixKeyword) {
-                continue;
-              }
+            if (!this.shouldForwardIncomingMessage(senderDigits, text)) {
+              continue;
             }
 
             if (this.onIncomingTextCallback) {
