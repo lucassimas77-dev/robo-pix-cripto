@@ -1004,6 +1004,88 @@ test('NLU Busca #26: infinitivos subordinados, cancelamentos/tentativas/negaçõ
     explicitOptionDigit: null,
     inlineNewAmountBrl: 2000,
   });
+
+  // Cobertura Busca #27: débito passivo/duplicidade, infinitivos após impossibilidade/gerúndio/"na análise",
+  // perguntas diretas/indiretas de preço/desconto/juro/limite, "100 reais de BTC/USDT" (permitindo depix) e menu "Vou na 1"/"Pode mandar a 1"/"2 - Cancelar a atual, quero R$ 80"
+  assert.equal(isStatusQueryMessage('Foi debitado 50 reais da minha conta'), true);
+  assert.equal(isPaymentConfirmationMessage('Foi debitado 50 reais da minha conta'), true);
+  assert.equal(parseBrlAmountFromText('Foi debitado 50 reais da minha conta'), null);
+  assert.equal(isStatusQueryMessage('Foram descontados 50 reais da minha conta'), true);
+  assert.equal(parseBrlAmountFromText('Foi descontado R$ 50,00 da minha conta no pix'), null);
+  assert.equal(isStatusQueryMessage('Cobrou 2 vezes o pix de 50'), true);
+  assert.equal(parseBrlAmountFromText('Cobrou 2 vezes o pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Cobraram duas vezes o pix de 50'), null);
+
+  assert.equal(isStatusQueryMessage('Não deu certo fazer o pix de 50'), true);
+  assert.equal(parseBrlAmountFromText('Não deu certo fazer o pix de 50'), null);
+  assert.equal(isStatusQueryMessage('Não foi possível fazer o pix de 50'), true);
+  assert.equal(parseBrlAmountFromText('Não foi possível fazer o pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Não estou conseguindo fazer o pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Não tô conseguindo pagar o pix de 50'), null);
+  assert.equal(isStatusQueryMessage('Meu banco não deixou fazer o pix de 50'), true);
+  assert.equal(parseBrlAmountFromText('Meu banco não deixou fazer o pix de 50'), null);
+  assert.equal(isStatusQueryMessage('Não foi autorizado o pix de 50'), true);
+  assert.equal(parseBrlAmountFromText('Não foi autorizado o pix de 50'), null);
+  assert.equal(isStatusQueryMessage('Não liberou o pix de 50 no meu banco'), true);
+  assert.equal(parseBrlAmountFromText('Não liberou o pix de 50 no meu banco'), null);
+  assert.equal(isStatusQueryMessage('Estou tentando pagar o pix de 50 e não vai'), true);
+  assert.equal(parseBrlAmountFromText('Estou tentando pagar o pix de 50 e não vai'), null);
+  assert.equal(isStatusQueryMessage('Fui pagar o pix de 50 e o app fechou'), true);
+  assert.equal(parseBrlAmountFromText('Fui pagar o pix de 50 e o app fechou'), null);
+  assert.equal(isStatusQueryMessage('Meu pix de 50 caiu na análise do banco'), true);
+  assert.equal(parseBrlAmountFromText('Meu pix de 50 caiu na análise do banco'), null);
+
+  assert.equal(parseBrlAmountFromText('Quanto é no pix? 50?'), null);
+  assert.equal(parseBrlAmountFromText('Quanto é o frete no pix? 20?'), null);
+  assert.equal(parseBrlAmountFromText('O mínimo pra pagar no pix é 10?'), null);
+  assert.equal(parseBrlAmountFromText('O máximo para pagar no pix é 5000?'), null);
+  assert.equal(parseBrlAmountFromText('O limite para pagar no pix é 2000?'), null);
+  assert.equal(parseBrlAmountFromText('O limite pra transferir no pix é 1000?'), null);
+  assert.equal(parseBrlAmountFromText('Pix de 50 tem desconto?'), null);
+  assert.equal(parseBrlAmountFromText('R$ 50 no pix tem desconto?'), null);
+  assert.equal(parseBrlAmountFromText('Pagando 100 no pix ganha desconto?'), null);
+  assert.equal(parseBrlAmountFromText('Tem juro no pix de 100?'), null);
+  assert.equal(parseBrlAmountFromText('É 50 reais no pix?'), null);
+  assert.equal(parseBrlAmountFromText('Seria 50 reais no pix?'), null);
+  assert.equal(parseBrlAmountFromText('Faz por 50 no pix?'), null);
+  assert.equal(parseBrlAmountFromText('Quero saber se custa 50 no pix'), null);
+  assert.equal(parseBrlAmountFromText('Queria saber se fica 80 no pix'), null);
+  assert.equal(parseBrlAmountFromText('Me diz se o valor é 50 no pix'), null);
+  assert.equal(parseBrlAmountFromText('Me confirma se o preço é 100 no pix'), null);
+  assert.equal(parseBrlAmountFromText('Sabe dizer se fica 80 no pix'), null);
+
+  assert.equal(parseBrlAmountFromText('Comprar 100 reais de BTC no pix'), null);
+  assert.equal(parseBrlAmountFromText('Quero 100 reais de USDT no pix'), null);
+  assert.equal(parseBrlAmountFromText('Quero 100 reais de dólares no pix'), null);
+  assert.equal(parseBrlAmountFromText('Quero 50 reais de depix no pix'), 50);
+
+  assert.deepEqual(parseActiveOrderMenuReply('Pode mandar a 1'), {
+    choice: 'resend',
+    explicitOptionDigit: '1',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('Pode gerar a 2'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('Vou na 1'), {
+    choice: 'resend',
+    explicitOptionDigit: '1',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('Vou de 2'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('2 - Cancelar a atual, quero R$ 80'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: 80,
+  });
+  assert.equal(parseBrlAmountFromText('Cancela a atual, gera um pix de 80'), 80);
+  assert.equal(parseBrlAmountFromText('Cancela, quero um pix de 80'), 80);
 });
 
 test('Concorrência, mensagens pós-pagamento ("já paguei"), estado AWAITING_AMOUNT pós-erro e alerta de FAILED ao Admin', async () => {
