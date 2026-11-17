@@ -15,6 +15,7 @@ import { ExpirationWatcher } from '../src/services/expirationWatcher.ts';
 import {
   formatTimeSaoPaulo,
   hasPixTriggerKeyword,
+  hasUnparsedDigitsInMenuReply,
   isCancelCommand,
   isExitCommand,
   isHelpCommand,
@@ -1357,6 +1358,169 @@ test('Busca #29: filtro keyword_only pós-pedido sem invadir conversas pessoais,
   assert.equal(parseBrlAmountFromText('pix de 0 ou 50'), null);
   assert.equal(parseBrlAmountFromText('pix de 20.000.000 ou 50'), null);
   assert.equal(parseBrlAmountFromText('pix de 100000000 ou 50'), null);
+});
+
+test('Busca #30: numerais por extenso com pontuação final, pronomes proclíticos (te/lhe), duplicidade/engano, dúvidas de parcelamento/cartão/diminutivos e contraste no menu 1 / 2', async () => {
+  // Achado 1: pontuação de frase (".", "...", " - ") NUNCA trunca nem bloqueia numerais por extenso!
+  assert.equal(parseBrlAmountFromText('Me manda um pix de dois mil e quinhentos.'), 2500);
+  assert.equal(parseBrlAmountFromText('Pix de dois mil, quinhentos.'), 2500);
+  assert.equal(parseBrlAmountFromText('Oi. Dois mil e quinhentos reais no pix'), 2500);
+  assert.equal(parseBrlAmountFromText('Pix de vinte e cinco e cinquenta.'), 25.5);
+  assert.equal(parseBrlAmountFromText('Me manda um pix de cinquenta.'), 50);
+  assert.equal(parseBrlAmountFromText('Pix de cem.'), 100);
+  assert.equal(parseBrlAmountFromText('Pix de cento e cinquenta.'), 150);
+  assert.equal(parseBrlAmountFromText('Pix de cinquenta...'), 50);
+  assert.equal(parseBrlAmountFromText('Pix de cinquenta. Obrigado!'), 50);
+  assert.equal(parseBrlAmountFromText('Pix - cinquenta'), 50);
+  assert.equal(parseBrlAmountFromText('segue arquivo cinquenta.pdf quero pix'), null);
+
+  assert.deepEqual(parseActiveOrderMenuReply('2 - cinquenta.'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: 50,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('Quero a 2, manda de cinquenta.'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: 50,
+  });
+  assert.equal(hasUnparsedDigitsInMenuReply('2 - cinquenta.'), true);
+
+  // Achado 2: pronomes proclíticos ("te", "lhe") em confirmações pós-pagamento, tentativas falhas, negações e follow-up keyword_only
+  for (const paidWithTe of [
+    'Acabei de te mandar 50 no pix',
+    'Acabei de te pagar 50 no pix',
+    'Acabei de te enviar o pix de 50',
+    'Consegui te mandar o pix de 50',
+    'Já te mandei 50 no pix',
+    'Te enviei o pix de 50',
+  ]) {
+    assert.equal(isPaymentConfirmationMessage(paidWithTe), true, paidWithTe);
+  }
+
+  for (const failedAttemptWithTe of [
+    'Tentei te mandar o pix de 50',
+    'Tentei te pagar 50 no pix',
+    'Tentei te fazer um pix de 50',
+    'Não tô conseguindo te mandar 50 no pix',
+  ]) {
+    assert.equal(isStatusQueryMessage(failedAttemptWithTe), true, failedAttemptWithTe);
+    assert.equal(parseBrlAmountFromText(failedAttemptWithTe), null, failedAttemptWithTe);
+  }
+
+  for (const negatedWithTe of [
+    'Ainda não te paguei os 50 do pix',
+    'Não te mandei o pix de 50 ainda',
+    'Eu não te paguei os 50 do pix?',
+    'Não te mandei 50 no pix?',
+    'Quase te mandei 50 no pix',
+  ]) {
+    assert.equal(isPaymentConfirmationMessage(negatedWithTe), false, negatedWithTe);
+    assert.equal(parseBrlAmountFromText(negatedWithTe), null, negatedWithTe);
+  }
+
+  for (const shortFollowUp of [
+    'Te paguei!',
+    'Já te paguei!',
+    'Acabei de pagar!',
+    'Acabei de transferir!',
+    'Compensou aí?',
+    'Já entrou aí?',
+    'Caiu na conta?',
+  ]) {
+    assert.equal(isPostOrderFollowUpMessage(shortFollowUp), true, shortFollowUp);
+  }
+
+  // Achado 3: relatos de pagamento duplicado com "fiz"/"efetuei"/"pagou" e pagamento errado/por engano
+  for (const dupOrMistake of [
+    'Fiz 2 vezes o pix de 50',
+    'Fiz 2x o pix de 50',
+    'Efetuei 2 vezes o pix de 50',
+    'Pagou 2 vezes o pix de 50',
+    'Fiz o pix de 50 duas vezes',
+    'Fiz o pix de 50 errado, como faço?',
+    'Enviei 50 no pix por engano, o que faço?',
+  ]) {
+    assert.equal(isStatusQueryMessage(dupOrMistake), true, dupOrMistake);
+    assert.equal(parseBrlAmountFromText(dupOrMistake), null, dupOrMistake);
+  }
+
+  // Achado 4: perguntas no plural/pretérito ("São 50?", "Ficou 80?", "Deu 120?"), parcelamento/cartão/boleto e diminutivos de tempo
+  for (const inquiryOrTime of [
+    'São 50 reais no pix?',
+    'São 50 reais mesmo no pix?',
+    'É mesmo 50 no pix?',
+    'Ficou 80 reais no pix?',
+    'Deu 120 reais no pix?',
+    'Total deu 150 no pix?',
+    'Dá pra parcelar os 500 no pix?',
+    'Parcela 300 no pix?',
+    'Aceita pix parcelado de 500?',
+    'Posso passar 100 no cartão de crédito ou pix?',
+    '50 no débito ou no pix?',
+    'Tem boleto de 100 ou só pix?',
+    'Em 5 minutinhos mando o pix',
+    'Daqui a 2 horinhas faço o pix',
+    'Mando o pix em 10 segundinhos',
+    'Em um minutinho mando o pix',
+  ]) {
+    assert.equal(parseBrlAmountFromText(inquiryOrTime), null, inquiryOrTime);
+  }
+  assert.equal(parseBrlAmountFromText('São 50 reais no pix'), 50);
+  assert.equal(parseBrlAmountFromText('Ficou 80 reais no pix'), 80);
+
+  // Achado 5: bloqueio de conversas pessoais em keyword_only (celular/cartão/Amazon/ingresso/arquivos/pedido/reunião/orçamento) + contraste no menu 1 / 2
+  for (const personalChat of [
+    'Tô sem saldo no celular',
+    'Estourou o limite do cartão',
+    'Fizeram o estorno da Amazon',
+    'Pedi reembolso do ingresso',
+    'Fiz a transferência dos arquivos',
+    'Já chegou o pedido?',
+    'Confirmou a reunião?',
+    'Aprovou o orçamento?',
+  ]) {
+    assert.equal(isPostOrderFollowUpMessage(personalChat), false, personalChat);
+  }
+  assert.equal(isStatusQueryMessage('Já chegou o pedido?'), false);
+  assert.equal(isStatusQueryMessage('Confirmou a reunião?'), false);
+  assert.equal(isStatusQueryMessage('Aprovou o orçamento?'), false);
+  assert.equal(isPaymentConfirmationMessage('Fiz a transferência dos arquivos'), false);
+
+  assert.deepEqual(parseActiveOrderMenuReply('Não quero a 2, manda a 1'), {
+    choice: 'resend',
+    explicitOptionDigit: '1',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('Não quero a 1, quero a 2'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: null,
+  });
+  assert.equal(hasUnparsedDigitsInMenuReply('Não quero a 1, quero a 2'), false);
+  assert.deepEqual(parseActiveOrderMenuReply('Não quero a 1, faz a 2 de 120'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: 120,
+  });
+
+  // Integração E2E no ConversationEngine: "2 - cinquenta." sobrescreve valor pendente de 80 -> 50, e "Não quero a 1, quero a 2" preserva 80!
+  const { repository, engine } = createPrivacyTestSetup();
+  try {
+    const p1 = '5511933331111';
+    await engine.handleIncomingMessage({ phone: p1, text: 'Pix de 60' });
+    await engine.handleIncomingMessage({ phone: p1, text: 'Pix de 80' });
+    await engine.handleIncomingMessage({ phone: p1, text: '2 - cinquenta.' });
+    assert.equal(repository.findMostRecentOrderByPhone(p1)?.amountBrl, 50);
+
+    const p2 = '5511933332222';
+    await engine.handleIncomingMessage({ phone: p2, text: 'Pix de 60' });
+    await engine.handleIncomingMessage({ phone: p2, text: 'Pix de 80' });
+    await engine.handleIncomingMessage({ phone: p2, text: 'Não quero a 1, quero a 2' });
+    assert.equal(repository.findMostRecentOrderByPhone(p2)?.amountBrl, 80);
+  } finally {
+    repository.close();
+  }
 });
 
 test('Concorrência, mensagens pós-pagamento ("já paguei"), estado AWAITING_AMOUNT pós-erro e alerta de FAILED ao Admin', async () => {
