@@ -2983,3 +2983,133 @@ test('13. Busca #33: menu ("01"/"02"/"Opc 2"/"Quero a atual"), sufixo "k", novos
   assert.equal(parseBrlAmountFromText('Hum, manda pix de 50'), 50);
   assert.equal(parseBrlAmountFromText('pix de cinqüenta reais'), 50);
 });
+
+test('Busca #34: menu "2 mesmo"/"Fico na 2"/"Manda 2", bloqueio não-financeiro em keyword_only, gerúndio/errei/deu baixa, "pra mim"/modais e áudios/parênteses', async () => {
+  // Achado 1: Menu 1 / 2 com "2 mesmo", "Fico na 2", "Vou com a 2", "Opto pela 2", "Manda 2", "2 então", "2 por gentileza"
+  for (const reply of [
+    '2 mesmo',
+    'A 2 mesmo',
+    'Quero a 2 mesmo',
+    'Vai na 2 mesmo',
+    'Fico na 2',
+    'Vou com a 2',
+    'Opto pela 2',
+    'Manda 2',
+    'Gera 2',
+    'Faz 2',
+    '2 então',
+    '2 por gentileza',
+  ]) {
+    const parsed = parseActiveOrderMenuReply(reply);
+    assert.deepEqual(
+      parsed,
+      { choice: 'new', explicitOptionDigit: '2', inlineNewAmountBrl: null },
+      `Falha ao escolher Opção 2 em: ${reply}`
+    );
+    assert.equal(hasUnparsedDigitsInMenuReply(reply), false, `Não deveria ter dígitos sobrando em: ${reply}`);
+  }
+
+  for (const reply of ['Manda 1', '1 mesmo', 'A 1 mesmo', 'Fico na 1', '1 então', '1 por gentileza']) {
+    const parsed = parseActiveOrderMenuReply(reply);
+    assert.deepEqual(
+      parsed,
+      { choice: 'resend', explicitOptionDigit: '1', inlineNewAmountBrl: null },
+      `Falha ao escolher Opção 1 em: ${reply}`
+    );
+    assert.equal(hasUnparsedDigitsInMenuReply(reply), false);
+  }
+
+  assert.deepEqual(parseActiveOrderMenuReply('Deixa a atual'), {
+    choice: 'resend',
+    explicitOptionDigit: null,
+    inlineNewAmountBrl: null,
+  });
+
+  for (const reply of ['2 pra R$ 100', '2 para 100 reais', 'Manda a 2 de 100', 'Vou com a 2 de 100']) {
+    const parsed = parseActiveOrderMenuReply(reply);
+    assert.deepEqual(
+      parsed,
+      { choice: 'new', explicitOptionDigit: '2', inlineNewAmountBrl: 100 },
+      `Falha ao extrair novo valor em: ${reply}`
+    );
+  }
+
+  // E2E no ConversationEngine: "Quero a 2 mesmo" mantém e emite os R$ 80,00 pendentes (e não reenvia R$ 60 nem corrompe para R$ 2)
+  {
+    const { engine, repository } = createPrivacyTestSetup();
+    const phone = '5511977770034';
+    await engine.handleIncomingMessage({ phone, text: 'Pix de 60' });
+    await engine.handleIncomingMessage({ phone, text: 'Pix de 80' });
+    await engine.handleIncomingMessage({ phone, text: 'Quero a 2 mesmo' });
+    const active = repository.findActivePendingOrderByPhone(phone);
+    assert.ok(active);
+    assert.equal(active.amountBrl, 80);
+    repository.close();
+  }
+
+  // Achado 2: Filtro keyword_only não vaza para conversas pessoais ou devolução de produto/trânsito
+  for (const msg of [
+    'Ele descontou a raiva em mim',
+    'Fiquei retido no trânsito',
+    'A encomenda ficou retida na alfândega',
+    'Como funciona a devolução da camisa?',
+    'Quero fazer a devolução da peça',
+    'Mandei 2 áudios aí',
+  ]) {
+    assert.equal(isPostOrderFollowUpMessage(msg), false, `Não deveria vazar no keyword_only: ${msg}`);
+    assert.equal(isStatusQueryMessage(msg), false, `Não deveria ser status: ${msg}`);
+  }
+  for (const msg of [
+    'Descontou os 50 da minha conta',
+    'O pagamento ficou retido no banco',
+    'Devolução do pix',
+    'Devolução do pagamento',
+  ]) {
+    assert.equal(isPostOrderFollowUpMessage(msg), true, `Deveria aceitar follow-up financeiro: ${msg}`);
+  }
+
+  // Achado 3: Duplicidade no gerúndio, erro de digitação/cópia e consulta "deu baixa" / "baixou"
+  for (const msg of [
+    'Acabei pagando 2 vezes os 50 no pix',
+    'Pagando 2 vezes o pix de 50 sem querer',
+    'Copiei errado o pix de 50',
+    'Digitei errado o valor de 50 no pix',
+    'Errei o valor do pix de 50',
+    'Coloquei 50 errado no pix',
+    'Deu baixa no pix de 50?',
+    'Vai dar baixa no pix de 50?',
+    'Já deu baixa nos 50 do pix?',
+    'Baixou aí o pix de 50?',
+    'Já baixou os 50 do pix?',
+  ]) {
+    assert.equal(isStatusQueryMessage(msg), true, `Deveria ser status/erro: ${msg}`);
+    assert.equal(parseBrlAmountFromText(msg), null, `Não deveria cobrar: ${msg}`);
+  }
+
+  // Achado 4: Novos pedidos com "pra mim" e modais "consegue" / "tem como" / "dá pra" / "me vê" após confirmação ou erro
+  for (const msg of [
+    'Deu erro no anterior, manda pra mim um pix de 80',
+    'O pix anterior expirou, gera pra mim um de 80',
+    'Já paguei aquele, manda pra mim um pix de 80',
+    'Já paguei aquele, consegue mandar outro de 80?',
+    'Já paguei aquele, tem como gerar outro de 80?',
+    'Já paguei aquele, dá pra mandar outro de 80?',
+    'Já paguei aquele, me vê outro de 80',
+  ]) {
+    assert.equal(isStatusQueryMessage(msg), false, `Não deveria bloquear como status: ${msg}`);
+    assert.equal(isPaymentConfirmationMessage(msg), false, `Não deveria bloquear como confirmação: ${msg}`);
+    assert.equal(parseBrlAmountFromText(msg), 80, `Deveria extrair 80 em: ${msg}`);
+  }
+
+  // Achado 5: Contáveis "áudios" / "mensagens" e valor equivalente por extenso entre parênteses
+  assert.equal(parseBrlAmountFromText('Mandei 2 áudios, quero um pix de 50'), 50);
+  assert.equal(parseBrlAmountFromText('Mandei 2 mensagens antes, quero um pix de 80'), 80);
+  assert.equal(isPaymentConfirmationMessage('Te mandei 2 mensagens pedindo pix de 50'), false);
+  assert.equal(parseBrlAmountFromText('Te mandei 2 mensagens pedindo pix de 50'), 50);
+  assert.equal(isPaymentConfirmationMessage('Mandei 2 áudios aí'), false);
+  assert.equal(parseBrlAmountFromText('R$ 50 (cinquenta reais) no pix'), 50);
+  assert.equal(parseBrlAmountFromText('pix de 50 (cinquenta reais)'), 50);
+  assert.equal(parseBrlAmountFromText('pix de R$ 1.500,00 (mil e quinhentos reais)'), 1500);
+  assert.equal(parseBrlAmountFromText('pix de R$ 10,50 (dez reais e cinquenta centavos)'), 10.5);
+  assert.equal(parseBrlAmountFromText('pix de 50 (80 reais)'), null);
+});
