@@ -1088,6 +1088,111 @@ test('NLU Busca #26: infinitivos subordinados, cancelamentos/tentativas/negaçõ
   assert.equal(parseBrlAmountFromText('Cancela, quero um pix de 80'), 80);
 });
 
+test('NLU Busca #28: CEP/conta hifenizados com pontuação, particípios/gerúndios negados, problemas/processamento/duplicidade, "quanto" posposto e menu "2, 80" / "Quero a 2 de 80"', () => {
+  // Achado 1: CEP, conta/agência hifenizada ou código multi-hífen seguidos de vírgula ou ponto final
+  assert.equal(parseBrlAmountFromText('Entrega no CEP 01310-100, manda o pix de 50'), 50);
+  assert.equal(parseBrlAmountFromText('CEP 01310-100. Pix de 50'), 50);
+  assert.equal(parseBrlAmountFromText('Conta 56789-0, manda pix de 50'), 50);
+  assert.equal(parseBrlAmountFromText('Código 123-456-789, manda pix de 50'), 50);
+  assert.equal(parseBrlAmountFromText('pix de R$ 50,00-10,00'), null);
+
+  // Achado 2: negações participiais sem auxiliar, gerúndios negativos, "não foi" e "negou"/"rejeitou"
+  assert.equal(isStatusQueryMessage('Apareceu transação não autorizada no pix de 50'), true);
+  assert.equal(parseBrlAmountFromText('Apareceu transação não autorizada no pix de 50'), null);
+  assert.equal(isStatusQueryMessage('Pagamento não autorizado de R$ 50 no pix'), true);
+  assert.equal(parseBrlAmountFromText('Pagamento não autorizado de R$ 50 no pix'), null);
+  assert.equal(isStatusQueryMessage('Pix de 50 não aprovado pelo banco'), true);
+  assert.equal(parseBrlAmountFromText('Pix de 50 não aprovado pelo banco'), null);
+  assert.equal(parseBrlAmountFromText('Pix de 50 não confirmado'), null);
+  assert.equal(parseBrlAmountFromText('Pix de 50 não concluído'), null);
+  assert.equal(parseBrlAmountFromText('Pix de 50 não compensado'), null);
+  assert.equal(isStatusQueryMessage('O banco não está aprovando o pix de 50'), true);
+  assert.equal(parseBrlAmountFromText('O banco não está aprovando o pix de 50'), null);
+  assert.equal(isStatusQueryMessage('Não tá passando o pix de 50'), true);
+  assert.equal(parseBrlAmountFromText('Não tá passando o pix de 50'), null);
+  assert.equal(isStatusQueryMessage('Meu pix de 50 não foi'), true);
+  assert.equal(parseBrlAmountFromText('Meu pix de 50 não foi'), null);
+  assert.equal(isStatusQueryMessage('Não foi o pix de 50'), true);
+  assert.equal(isStatusQueryMessage('Meu banco negou o pix de 50'), true);
+  assert.equal(parseBrlAmountFromText('Meu banco negou o pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Pix de 50 negado pelo banco'), null);
+  assert.equal(isStatusQueryMessage('Rejeitou na hora de mandar o pix de 50'), true);
+  assert.equal(parseBrlAmountFromText('Rejeitou na hora de mandar o pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Transação rejeitada no pix de 50'), null);
+
+  // Achado 3: "problema" (preservando "sem problema"), "em processamento"/"pendente", "retendo"/"retenção" e duplicidade flexível
+  assert.equal(isStatusQueryMessage('Tive problema na hora de pagar os 50 no pix'), true);
+  assert.equal(parseBrlAmountFromText('Tive problema na hora de pagar os 50 no pix'), null);
+  assert.equal(isStatusQueryMessage('Tive um problema com o pix de 50'), true);
+  assert.equal(parseBrlAmountFromText('Tive um problema com o pix de 50'), null);
+  assert.equal(isStatusQueryMessage('Está dando problema no pix de 50'), true);
+  assert.equal(parseBrlAmountFromText('Está dando problema no pix de 50'), null);
+  assert.equal(isStatusQueryMessage('Problema no pix de 50'), true);
+  assert.equal(parseBrlAmountFromText('Problema no pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Sem problema, pix de 50'), 50);
+  assert.equal(isStatusQueryMessage('Meu pix de 50 ainda está em processamento no banco'), true);
+  assert.equal(parseBrlAmountFromText('Meu pix de 50 ainda está em processamento no banco'), null);
+  assert.equal(isStatusQueryMessage('O pix de 50 ficou pendente no banco'), true);
+  assert.equal(parseBrlAmountFromText('O pix de 50 ficou pendente no banco'), null);
+  assert.equal(isStatusQueryMessage('Estão retendo meu pix de 50 no banco'), true);
+  assert.equal(parseBrlAmountFromText('Estão retendo meu pix de 50 no banco'), null);
+  assert.equal(parseBrlAmountFromText('Houve retenção no meu pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Caiu em duplicidade o pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Saiu em duplicidade o pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Foi pago em duplicidade o pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Me cobraram 50 reais duas vezes no pix'), null);
+  assert.equal(isStatusQueryMessage('Saiu duas vezes 50 reais da minha conta no pix'), true);
+  assert.equal(parseBrlAmountFromText('Saiu duas vezes 50 reais da minha conta no pix'), null);
+
+  // Achado 4: "quanto" posposto, desconto com plural e conversão/compra inversa de cripto/moeda
+  assert.equal(parseBrlAmountFromText('Custa quanto no pix? 50?'), null);
+  assert.equal(parseBrlAmountFromText('Fica quanto no pix? 80?'), null);
+  assert.equal(parseBrlAmountFromText('Tá quanto no pix? 50?'), null);
+  assert.equal(parseBrlAmountFromText('Sai quanto no pix? 50?'), null);
+  assert.equal(parseBrlAmountFromText('Dá quanto tudo no pix? 150?'), null);
+  assert.equal(parseBrlAmountFromText('Fica quanto com desconto os 100 no pix?'), null);
+  assert.equal(parseBrlAmountFromText('Comprar BTC com 100 reais no pix'), null);
+  assert.equal(parseBrlAmountFromText('Quero comprar USDT com R$ 500 no pix'), null);
+  assert.equal(parseBrlAmountFromText('100 reais dá quantos USDT no pix?'), null);
+
+  // Achado 5: menu 1 / 2 com vírgula ("2, 80 reais") e artigo + preposição ("Quero a 2 de 80", "Gera a 2 de R$ 80") sem capturar "Quero 2 de 50"
+  assert.deepEqual(parseActiveOrderMenuReply('2, 80 reais'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: 80,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('2, 150,00'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: 150,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('1, essa mesma'), {
+    choice: 'resend',
+    explicitOptionDigit: '1',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('Quero a 2 de 80'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: 80,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('Gera a 2 de R$ 80'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: 80,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('Vou na 2 de 100'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: 100,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('Quero 2 de 50'), {
+    choice: 'none',
+    explicitOptionDigit: null,
+    inlineNewAmountBrl: null,
+  });
+});
+
 test('Concorrência, mensagens pós-pagamento ("já paguei"), estado AWAITING_AMOUNT pós-erro e alerta de FAILED ao Admin', async () => {
   const { repository, engine } = createPrivacyTestSetup();
   const clientPhone = '5511988887777';
