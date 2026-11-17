@@ -515,7 +515,9 @@ test('Parsing monetário trata pontuação final, milhar, horários, telefones, 
     explicitOptionDigit: null,
     inlineNewAmountBrl: null,
   });
+});
 
+test('NLU avançado: cripto/moedas, logradouros, estornos, horários coloquiais, unidades, BRCode EMV e fronteiras Unicode', () => {
   // Casos da Busca #19: "Acabei de fazer/mandar/passar o pix de 50", "Consegui pagar", "Me manda o comprovante",
   // "Cancela o pix de 50", negações/desistências, cripto/moedas estrangeiras, medidas/endereços e "50reais" colado
   assert.equal(isPaymentConfirmationMessage('Acabei de fazer o pix de 50'), true);
@@ -851,6 +853,67 @@ test('Parsing monetário trata pontuação final, milhar, horários, telefones, 
   assert.equal(parseBrlAmountFromText('Agendei o pix de 50 sem querer'), null);
   assert.equal(isStatusQueryMessage('Agendei o pix de 50 sem querer'), true);
   assert.equal(parseBrlAmountFromText('Pix agendado de R$ 50,00'), null);
+
+  // Cobertura Busca #25: fronteiras Unicode (tá/está/dá/é/mãe/média), negações no pretérito + falhas de link/QR,
+  // whitelist estrita pós-verbo em isPaymentConfirmationMessage e ordinais 1ª/2ª/1º/2º no menu 1 / 2
+  assert.equal(isPaymentConfirmationMessage('Ainda não está pago o pix de 50'), false);
+  assert.equal(isPaymentConfirmationMessage('Não tá pago o pix de 50'), false);
+  assert.equal(parseBrlAmountFromText('Ainda não está pago o pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Quanto tá o corte no pix? 50?'), null);
+  assert.equal(parseBrlAmountFromText('Quanto está a consulta no pix? 200?'), null);
+  assert.equal(parseBrlAmountFromText('Quanto dá com entrega no pix? 80?'), null);
+  assert.equal(parseBrlAmountFromText('É o limite do pix 5000?'), null);
+  assert.equal(parseBrlAmountFromText('Qual é o máximo no pix? 6000?'), null);
+  assert.equal(parseBrlAmountFromText('Qual é o mínimo no pix? 5?'), null);
+  assert.equal(parseBrlAmountFromText('Quanto é o mínimo? 10 reais no pix?'), null);
+  assert.equal(isStatusQueryMessage('O pix de 50 deu erro, minha mãe faz amanhã'), true);
+  assert.equal(parseBrlAmountFromText('O pix de 50 deu erro, minha mãe faz amanhã'), null);
+  assert.equal(parseBrlAmountFromText('Deu erro no app, minha mãe manda os 50 reais depois'), null);
+  assert.equal(parseBrlAmountFromText('Média 15 no pix'), 15);
+
+  assert.equal(parseBrlAmountFromText('Não paguei o pix de 50 ainda'), null);
+  assert.equal(parseBrlAmountFromText('Ainda não fiz o pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Não mandei os 50 no pix ainda'), null);
+  assert.equal(parseBrlAmountFromText('Ainda não foi pago o pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Paguei não, quero um pix de 50'), 50);
+  assert.equal(parseBrlAmountFromText('Não consegui abrir o pix de 50'), null);
+  assert.equal(isStatusQueryMessage('Não consegui abrir o pix de 50'), true);
+  assert.equal(parseBrlAmountFromText('O link do pix de 50 não abriu'), null);
+  assert.equal(isStatusQueryMessage('O link do pix de 50 não abriu'), true);
+  assert.equal(parseBrlAmountFromText('O QR Code de 50 não funciona'), null);
+  assert.equal(isStatusQueryMessage('O QR Code de 50 não funciona'), true);
+  assert.equal(parseBrlAmountFromText('Link do pix de 50 deu inválido'), null);
+
+  assert.equal(isPaymentConfirmationMessage('Fiz as contas aqui e deu 50 no pix'), false);
+  assert.equal(parseBrlAmountFromText('Fiz as contas aqui e deu 50 no pix'), 50);
+  assert.equal(isPaymentConfirmationMessage('Fiz a soma e deu 120 no pix'), false);
+  assert.equal(parseBrlAmountFromText('Fiz a soma e deu 120 no pix'), 120);
+  assert.equal(isPaymentConfirmationMessage('Mandei os dados aqui pro pix de 50'), false);
+  assert.equal(parseBrlAmountFromText('Mandei os dados aqui pro pix de 50'), 50);
+  assert.equal(isPaymentConfirmationMessage('Mandei mensagem antes querendo pix de 50'), false);
+  assert.equal(parseBrlAmountFromText('Mandei mensagem antes querendo pix de 50'), 50);
+  assert.equal(isPaymentConfirmationMessage('Fiz as contas aqui e deu 50'), false);
+
+  assert.deepEqual(parseActiveOrderMenuReply('1ª opção'), {
+    choice: 'resend',
+    explicitOptionDigit: '1',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('2ª opção'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('Quero a 2ª'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('2º item, gerar 80'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: 80,
+  });
 
   assert.equal(formatTimeSaoPaulo('2026-07-01T18:15:00.000Z'), '15:15');
 });
