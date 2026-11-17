@@ -54,6 +54,19 @@ export const SUPPORTED_PROVIDERS: SupportedProviderName[] = [
 ];
 
 export function clampInt(raw: unknown, fallback: number, min: number, max: number): number {
+  if (
+    raw === undefined ||
+    raw === null ||
+    typeof raw === 'boolean' ||
+    typeof raw === 'object' ||
+    typeof raw === 'symbol' ||
+    typeof raw === 'function'
+  ) {
+    return fallback;
+  }
+  if (typeof raw === 'string' && raw.trim() === '') {
+    return fallback;
+  }
   const n = Number(raw);
   if (!Number.isFinite(n)) return fallback;
   return Math.min(max, Math.max(min, Math.round(n)));

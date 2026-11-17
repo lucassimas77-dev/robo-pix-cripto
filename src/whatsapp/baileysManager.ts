@@ -146,9 +146,9 @@ export class BaileysDirectManager {
     this.intentionalStop = false;
     this.state = 'CONNECTING';
     this.lastError = undefined;
-    fs.mkdirSync(this.authDir, { recursive: true });
 
     try {
+      fs.mkdirSync(this.authDir, { recursive: true });
       const { state: authState, saveCreds } = await useMultiFileAuthState(this.authDir);
       if (this.intentionalStop || gen !== this.connectGeneration) {
         return this.getStatus();
@@ -247,7 +247,9 @@ export class BaileysDirectManager {
               this.reconnectTimer = setTimeout(() => {
                 this.reconnectTimer = null;
                 if (!this.intentionalStop && gen === this.connectGeneration) {
-                  void this.startConnection(false);
+                  this.startConnection(false).catch((err) => {
+                    console.error('[WhatsApp QR] Falha ao reconectar sessão:', err);
+                  });
                 }
               }, 3000);
             } else {
@@ -283,6 +285,10 @@ export class BaileysDirectManager {
             const text = (
               normalized.conversation ||
               normalized.extendedTextMessage?.text ||
+              normalized.imageMessage?.caption ||
+              normalized.videoMessage?.caption ||
+              normalized.documentMessage?.caption ||
+              normalized.documentWithCaptionMessage?.message?.documentMessage?.caption ||
               ''
             ).trim();
 
@@ -337,7 +343,8 @@ export class BaileysDirectManager {
               const isAlreadyInFlow =
                 isFreshSession || activeOrder !== null || isPostOrderFollowUp;
               const hasPixKeyword =
-                /\bpix\b|pagar|pagamento|chave\s*pix|gerar\s*pix|mand[ae]\s*o?\s*pix|comprovante/i.test(
+                text.length <= 2_000 &&
+                /\bpix\b|pagar|pagamento|chave[ \t]*pix|gerar[ \t]*pix|mand[ae][ \t]*(?:o[ \t]*)?pix|comprovante/i.test(
                   text
                 );
 

@@ -8,6 +8,7 @@ import type {
   OrderStatus,
   WebhookSettlementEvent,
 } from '../types/domain.ts';
+import { safeOptionalId, safePrimitiveString } from '../utils/cpfCnpjValidator.ts';
 
 const FETCH_TIMEOUT_MS = 15_000;
 
@@ -88,25 +89,33 @@ export class HodleProvider implements IPixCryptoProvider {
     }
 
     const data = (await response.json()) as Record<string, unknown>;
-    const pixCopyPaste = String(data.pixCopyPaste ?? data.qrCode ?? data.brcode ?? '');
+    const pixCopyPaste = (
+      safeOptionalId(data.pixCopyPaste) ??
+      safeOptionalId(data.qrCode) ??
+      safeOptionalId(data.brcode) ??
+      ''
+    ).trim();
     if (!pixCopyPaste) {
       throw new Error('Resposta da API Hodle não retornou o código Pix Copia e Cola.');
     }
 
-    const expiresAt = data.expiresAt
-      ? String(data.expiresAt)
-      : new Date(Date.now() + input.expirationMinutes * 60_000).toISOString();
+    const expiresAt =
+      safeOptionalId(data.expiresAt) ??
+      new Date(Date.now() + input.expirationMinutes * 60_000).toISOString();
 
-    const pixQrCodeBase64 = data.qrCodeBase64
-      ? String(data.qrCodeBase64)
-      : await QRCode.toDataURL(pixCopyPaste, { width: 320, margin: 2 });
+    const pixQrCodeBase64 =
+      safeOptionalId(data.qrCodeBase64) ??
+      (await QRCode.toDataURL(pixCopyPaste, { width: 320, margin: 2 }));
 
     return {
-      providerChargeId: String(data.id ?? data.depositId ?? input.externalId),
+      providerChargeId:
+        safeOptionalId(data.id) ?? safeOptionalId(data.depositId) ?? input.externalId,
       pixCopyPaste,
       pixQrCodeBase64,
       estimatedCryptoAmount:
-        data.assetAmount != null ? Number(data.assetAmount) : estimatedCryptoAmount,
+        typeof data.assetAmount === 'number' || typeof data.assetAmount === 'string'
+          ? Number(data.assetAmount)
+          : estimatedCryptoAmount,
       expiresAt,
     };
   }
@@ -135,8 +144,11 @@ export class HodleProvider implements IPixCryptoProvider {
   public parseWebhookPayload(payload: unknown): WebhookSettlementEvent | null {
     if (!payload || typeof payload !== 'object') return null;
     const root = payload as Record<string, unknown>;
-    const event = String(root.event || '');
-    const data = (root.data || {}) as Record<string, unknown>;
+    const event = safePrimitiveString(root.event);
+    const data = (typeof root.data === 'object' && root.data ? root.data : {}) as Record<
+      string,
+      unknown
+    >;
 
     let newStatus: OrderStatus | null = null;
     if (event === 'DEPOSIT_PIX_CONFIRMED') {
@@ -151,15 +163,20 @@ export class HodleProvider implements IPixCryptoProvider {
 
     if (!newStatus) return null;
 
+    const amtNum =
+      typeof data.amount === 'number' || typeof data.amount === 'string'
+        ? Number(data.amount)
+        : NaN;
+
     return {
       provider: 'hodle',
-      eventId: root.eventId ? String(root.eventId) : undefined,
-      providerChargeId: data.id ? String(data.id) : undefined,
-      externalId: data.externalId ? String(data.externalId) : undefined,
+      eventId: safeOptionalId(root.eventId),
+      providerChargeId: safeOptionalId(data.id),
+      externalId: safeOptionalId(data.externalId),
       newStatus,
-      txHash: data.txHash ? String(data.txHash) : undefined,
-      endToEndId: data.endToEndId ? String(data.endToEndId) : undefined,
-      cryptoAmount: data.amount != null ? Number(data.amount) : undefined,
+      txHash: safeOptionalId(data.txHash),
+      endToEndId: safeOptionalId(data.endToEndId),
+      cryptoAmount: Number.isFinite(amtNum) ? amtNum : undefined,
       rawEventName: event,
     };
   }
@@ -180,12 +197,16 @@ export class HodleProvider implements IPixCryptoProvider {
       if (res.status === 404) return { status: 'EXPIRED' };
       if (!res.ok) return null;
       const data = (await res.json()) as Record<string, unknown>;
-      const st = String(data.status ?? '').toUpperCase();
+      const st = safePrimitiveString(data.status).toUpperCase();
       if (st === 'COMPLETED' || st === 'ASSET_SUCCESS' || st === 'SETTLED') {
+        const assetAmt =
+          typeof data.assetAmount === 'number' || typeof data.assetAmount === 'string'
+            ? Number(data.assetAmount)
+            : NaN;
         return {
           status: 'SETTLED_CRYPTO',
-          txHash: data.txHash ? String(data.txHash) : undefined,
-          cryptoAmount: data.assetAmount != null ? Number(data.assetAmount) : undefined,
+          txHash: safeOptionalId(data.txHash),
+          cryptoAmount: Number.isFinite(assetAmt) ? assetAmt : undefined,
         };
       }
       if (st === 'PIX_CONFIRMED' || st === 'PAID' || st === 'PROCESSING') {

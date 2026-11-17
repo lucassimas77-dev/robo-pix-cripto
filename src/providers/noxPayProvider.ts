@@ -8,6 +8,7 @@ import type {
   OrderStatus,
   WebhookSettlementEvent,
 } from '../types/domain.ts';
+import { safeOptionalId, safePrimitiveString } from '../utils/cpfCnpjValidator.ts';
 
 const FETCH_TIMEOUT_MS = 15_000;
 
@@ -66,25 +67,33 @@ export class NoxPayProvider implements IPixCryptoProvider {
     }
 
     const data = (await response.json()) as Record<string, unknown>;
-    const pixCopyPaste = String(
-      data.pix_code ?? data.qr_code_text ?? data.brcode ?? data.checkout_url ?? ''
-    );
+    const pixCopyPaste = (
+      safeOptionalId(data.pix_code) ??
+      safeOptionalId(data.qr_code_text) ??
+      safeOptionalId(data.brcode) ??
+      safeOptionalId(data.checkout_url) ??
+      ''
+    ).trim();
     if (!pixCopyPaste) {
       throw new Error('A resposta da NoxPay não retornou código Pix nem link de checkout.');
     }
 
-    const expiresAt = data.expires_at
-      ? String(data.expires_at)
-      : new Date(Date.now() + input.expirationMinutes * 60_000).toISOString();
+    const expiresAt =
+      safeOptionalId(data.expires_at) ??
+      new Date(Date.now() + input.expirationMinutes * 60_000).toISOString();
 
     const pixQrCodeBase64 = await QRCode.toDataURL(pixCopyPaste, { width: 320, margin: 2 });
+    const cryptoNum =
+      typeof data.amount_crypto === 'number' || typeof data.amount_crypto === 'string'
+        ? Number(data.amount_crypto)
+        : NaN;
 
     return {
-      providerChargeId: String(data.txid ?? data.id ?? input.externalId),
+      providerChargeId: safeOptionalId(data.txid) ?? safeOptionalId(data.id) ?? input.externalId,
       pixCopyPaste,
       pixQrCodeBase64,
-      paymentUrl: data.checkout_url ? String(data.checkout_url) : undefined,
-      estimatedCryptoAmount: data.amount_crypto != null ? Number(data.amount_crypto) : undefined,
+      paymentUrl: safeOptionalId(data.checkout_url),
+      estimatedCryptoAmount: Number.isFinite(cryptoNum) ? cryptoNum : undefined,
       expiresAt,
     };
   }
@@ -112,7 +121,7 @@ export class NoxPayProvider implements IPixCryptoProvider {
   public parseWebhookPayload(payload: unknown): WebhookSettlementEvent | null {
     if (!payload || typeof payload !== 'object') return null;
     const obj = payload as Record<string, unknown>;
-    const statusRaw = String(obj.status ?? '').toUpperCase();
+    const statusRaw = safePrimitiveString(obj.status).toUpperCase();
 
     let newStatus: OrderStatus | null = null;
     if (statusRaw === 'PAID' || statusRaw === 'PIX_PAID') {
@@ -127,14 +136,19 @@ export class NoxPayProvider implements IPixCryptoProvider {
 
     if (!newStatus) return null;
 
+    const cryptoNum =
+      typeof obj.amount_crypto === 'number' || typeof obj.amount_crypto === 'string'
+        ? Number(obj.amount_crypto)
+        : NaN;
+
     return {
       provider: 'noxpay',
-      eventId: obj.event_id ? String(obj.event_id) : undefined,
-      providerChargeId: obj.txid ? String(obj.txid) : obj.id ? String(obj.id) : undefined,
-      externalId: obj.external_id ? String(obj.external_id) : undefined,
+      eventId: safeOptionalId(obj.event_id),
+      providerChargeId: safeOptionalId(obj.txid) ?? safeOptionalId(obj.id),
+      externalId: safeOptionalId(obj.external_id),
       newStatus,
-      txHash: obj.tx_hash ? String(obj.tx_hash) : undefined,
-      cryptoAmount: obj.amount_crypto != null ? Number(obj.amount_crypto) : undefined,
+      txHash: safeOptionalId(obj.tx_hash),
+      cryptoAmount: Number.isFinite(cryptoNum) ? cryptoNum : undefined,
       rawEventName: statusRaw,
     };
   }
@@ -155,12 +169,16 @@ export class NoxPayProvider implements IPixCryptoProvider {
       if (res.status === 404) return { status: 'EXPIRED' };
       if (!res.ok) return null;
       const obj = (await res.json()) as Record<string, unknown>;
-      const st = String(obj.status ?? '').toUpperCase();
+      const st = safePrimitiveString(obj.status).toUpperCase();
       if (st === 'COMPLETED' || st === 'SETTLED') {
+        const cryptoNum =
+          typeof obj.amount_crypto === 'number' || typeof obj.amount_crypto === 'string'
+            ? Number(obj.amount_crypto)
+            : NaN;
         return {
           status: 'SETTLED_CRYPTO',
-          txHash: obj.tx_hash ? String(obj.tx_hash) : undefined,
-          cryptoAmount: obj.amount_crypto != null ? Number(obj.amount_crypto) : undefined,
+          txHash: safeOptionalId(obj.tx_hash),
+          cryptoAmount: Number.isFinite(cryptoNum) ? cryptoNum : undefined,
         };
       }
       if (st === 'PAID' || st === 'PIX_PAID') {

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import http from 'node:http';
-import { loadConfig } from '../src/config/env.ts';
+import { clampInt, loadConfig } from '../src/config/env.ts';
 import type { AppConfig } from '../src/config/env.ts';
 import { OrderRepository } from '../src/database/orderRepository.ts';
 import { DePixAppProvider } from '../src/providers/depixAppProvider.ts';
@@ -12,7 +12,13 @@ import { NoxPayProvider } from '../src/providers/noxPayProvider.ts';
 import { createAppHttpServer } from '../src/server/httpServer.ts';
 import { ConversationEngine } from '../src/services/conversationEngine.ts';
 import { ExpirationWatcher } from '../src/services/expirationWatcher.ts';
-import { formatTimeSaoPaulo, parseBrlAmountFromText } from '../src/utils/cpfCnpjValidator.ts';
+import {
+  formatTimeSaoPaulo,
+  isCancelCommand,
+  isPaymentConfirmationMessage,
+  normalizeCommandText,
+  parseBrlAmountFromText,
+} from '../src/utils/cpfCnpjValidator.ts';
 import { BaileysDirectManager } from '../src/whatsapp/baileysManager.ts';
 import { UnifiedWhatsAppGateway } from '../src/whatsapp/whatsappGateway.ts';
 
@@ -72,6 +78,29 @@ test('Parsing monetário trata pontuação final, milhar, horários, telefones, 
   assert.equal(parseBrlAmountFromText('me manda 2 pix'), null);
   assert.equal(parseBrlAmountFromText('divide em 3x no pix?'), null);
   assert.equal(parseBrlAmountFromText('o pix vence em 15 minutos?'), null);
+  assert.equal(parseBrlAmountFromText('quero 2 itens de R$ 50'), null);
+  assert.equal(parseBrlAmountFromText('O pix é de R$ 50 ou R$ 100?'), null);
+  assert.equal(parseBrlAmountFromText('50 reais ou 80 reais?'), null);
+  assert.equal(parseBrlAmountFromText('Pix de R$ 50 ou 100?'), null);
+
+  // Proteção anti-ReDoS O(N) em mensagens gigantes (64 KB) + clampInt seguro
+  const startRedos = performance.now();
+  const adv1 = 'a' + '!'.repeat(60_000) + 'a';
+  const adv2 = 'a' + ' '.repeat(60_000) + 'b';
+  const adv3 = 'a' + ' '.repeat(50_000) + '1 pix '.repeat(1_000);
+  for (const s of [adv1, adv2, adv3]) {
+    assert.equal(parseBrlAmountFromText(s), null);
+    assert.equal(normalizeCommandText(s), '');
+    assert.equal(isCancelCommand(s), false);
+    assert.equal(isPaymentConfirmationMessage(s), false);
+  }
+  assert.ok(performance.now() - startRedos < 50, 'NLU deve executar em tempo O(1)/O(N) < 50ms');
+
+  assert.equal(clampInt('', 3000, 1, 65535), 3000);
+  assert.equal(clampInt('   ', 15, 5, 20), 15);
+  assert.equal(clampInt(null, 15, 5, 20), 15);
+  assert.equal(clampInt(false, 15, 5, 20), 15);
+  assert.equal(clampInt({ toString: null }, 15, 5, 20), 15);
 
   assert.equal(formatTimeSaoPaulo('2026-07-01T18:15:00.000Z'), '15:15');
 });
@@ -344,7 +373,35 @@ test('Servidor HTTP bloqueia Bearer password brute-force, CSRF cross-site, NaN e
     });
     assert.equal(goodPhoneFilter.status, 200);
 
-    // 7. Payload acima de 256 KB recebe HTTP 413 limpo (sem ECONNRESET)!
+    // 7. Tipos JSON adversariais ({}, {"toString": null}), URI malformada e Host inválido retornam 400/200 limpo (zero HTTP 500)!
+    const objApiKeyRes = await fetch(`${url}/api/account`, {
+      method: 'POST',
+      headers: { Cookie: authCookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: 'depixapp', apiKey: {} }),
+    });
+    assert.equal(objApiKeyRes.status, 400);
+
+    const nullProtoProvRes = await fetch(`${url}/api/account`, {
+      method: 'POST',
+      headers: { Cookie: authCookie, 'Content-Type': 'application/json' },
+      body: '{"provider":{"toString":null}}',
+    });
+    assert.equal(nullProtoProvRes.status, 400);
+
+    const badLoginTypeRes = await fetch(`${url}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{"password":{"toString":null}}',
+    });
+    assert.equal(badLoginTypeRes.status, 400);
+
+    const badUriSimRes = await fetch(`${url}/api/simulator/pay/%E0%A4%A`, {
+      method: 'POST',
+      headers: { Cookie: authCookie },
+    });
+    assert.equal(badUriSimRes.status, 400);
+
+    // 8. Payload acima de 256 KB recebe HTTP 413 limpo (sem ECONNRESET)!
     const hugeBody = JSON.stringify({ junk: 'x'.repeat(300 * 1024) });
     const tooLargeRes = await fetch(`${url}/api/account`, {
       method: 'POST',
@@ -570,6 +627,76 @@ test('ExpirationWatcher protege contra 503 transitório, respeita grace window d
     const graceOrd = repository.getOrderById('id_grace');
     assert.equal(graceOrd?.status, 'PENDING');
     assert.equal(deactivatedIds.includes('prd_grace_rail'), false);
+
+    // 3. PIX_CONFIRMED -> FAILED (PAYER_MISMATCH) chama /deactivate e marca remoteDeactivated = true!
+    repository.createOrder({
+      id: 'id_mismatch',
+      externalId: 'ext_mismatch',
+      provider: 'depixapp',
+      providerChargeId: 'prd_mismatch_1',
+      customerPhone: '5511911110088',
+      amountBrl: 90,
+      cryptoAsset: 'DEPIX',
+      cryptoNetwork: 'LIQUID',
+      walletAddress: 'Liquid',
+      pixCopyPaste: 'https://pay.depixapp.com/c/prd_mismatch_1',
+      status: 'PENDING',
+      warningSent: false,
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 600_000).toISOString(),
+    });
+    await engine.handleSettlementWebhook({
+      provider: 'depixapp',
+      externalId: 'ext_mismatch',
+      newStatus: 'PIX_CONFIRMED',
+      rawEventName: 'checkout.processing',
+    });
+    assert.equal(repository.getOrderById('id_mismatch')?.remoteDeactivated, false);
+    await engine.handleSettlementWebhook({
+      provider: 'depixapp',
+      externalId: 'ext_mismatch',
+      newStatus: 'FAILED',
+      rawEventName: 'checkout.cancelled',
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(deactivatedIds.includes('prd_mismatch_1'), true);
+    assert.equal(repository.getOrderById('id_mismatch')?.remoteDeactivated, true);
+
+    // 4. Corrida AWAITING_ACTIVE_ORDER_DECISION + expiração simultânea preserva pendingNewAmountBrl (gera R$ 80, não R$ 2!)
+    const racePhone = '5511922223333';
+    const soonPastIso = new Date(Date.now() + 5_000).toISOString();
+    repository.createOrder({
+      id: 'id_menu_race',
+      externalId: 'ext_menu_race',
+      provider: 'depixapp',
+      providerChargeId: 'prd_menu_race',
+      customerPhone: racePhone,
+      amountBrl: 50,
+      cryptoAsset: 'DEPIX',
+      cryptoNetwork: 'LIQUID',
+      walletAddress: 'Liquid',
+      pixCopyPaste: 'https://pay.depixapp.com/c/prd_menu_race',
+      status: 'PENDING',
+      warningSent: false,
+      createdAt: basePastIso,
+      expiresAt: soonPastIso,
+    });
+    await engine.handleIncomingMessage({ phone: racePhone, text: 'Pix de 80' });
+    assert.equal(repository.getSession(racePhone).stage, 'AWAITING_ACTIVE_ORDER_DECISION');
+    assert.equal(repository.getSession(racePhone).pendingNewAmountBrl, 80);
+
+    // Expira a cobrança de R$ 50 antes de o cliente digitar "2"
+    await watcher.sweepPendingOrders(new Date(Date.now() + 120_000));
+    assert.equal(repository.getOrderById('id_menu_race')?.status, 'EXPIRED');
+    assert.equal(repository.getSession(racePhone).stage, 'AWAITING_AMOUNT');
+    assert.equal(repository.getSession(racePhone).pendingNewAmountBrl, 80);
+
+    // Troca para MockProvider só para testar a geração de R$ 80 e corrida de snapshot em createCharge
+    const mockProv = new MockProvider({ webhookSecret: 'sec' });
+    engine.updateRuntimeAccount({ ...config, cryptoProvider: 'mock' }, mockProv);
+    await engine.handleIncomingMessage({ phone: racePhone, text: '2' });
+    const afterTwo = repository.findMostRecentOrderByPhone(racePhone);
+    assert.equal(afterTwo?.amountBrl, 80);
   } finally {
     fakeServer.close();
     repository.close();

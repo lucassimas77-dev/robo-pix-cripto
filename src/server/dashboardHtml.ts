@@ -298,6 +298,12 @@ export function renderDashboardHtml(): string {
         customWalletFields.classList.remove('hidden');
         apiKeyLabel.classList.remove('hidden');
         webhookFieldWrap.classList.remove('hidden');
+        if (!walletAssetEl.value || walletAssetEl.value.toUpperCase() === 'DEPIX') {
+          walletAssetEl.value = 'USDT';
+        }
+        if (!walletNetworkEl.value || walletNetworkEl.value.toUpperCase() === 'LIQUID') {
+          walletNetworkEl.value = 'POLYGON';
+        }
       }
     }
 

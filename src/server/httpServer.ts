@@ -83,6 +83,9 @@ function validateAllowedPhoneInput(
   if (raw === undefined || raw === null) {
     return { ok: true, cleanDigits: undefined };
   }
+  if (typeof raw !== 'string' && typeof raw !== 'number') {
+    return { ok: false, error: 'Formato inválido para o campo de telefone.' };
+  }
   const trimmed = String(raw).trim();
   if (trimmed === '') {
     return { ok: true, cleanDigits: '' };
@@ -96,6 +99,10 @@ function validateAllowedPhoneInput(
     };
   }
   return { ok: true, cleanDigits: digits };
+}
+
+function isOptionalStringField(val: unknown): val is string | undefined | null {
+  return val === undefined || val === null || typeof val === 'string';
 }
 
 function extractClientIp(req: http.IncomingMessage): string {
@@ -282,13 +289,23 @@ export function createAppHttpServer(params: {
 
   return http.createServer(async (req, res) => {
     try {
-      const urlObj = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-      const pathname = urlObj.pathname;
-      const method = req.method || 'GET';
-
       res.setHeader('X-Content-Type-Options', 'nosniff');
       res.setHeader('X-Frame-Options', 'DENY');
       res.setHeader('Referrer-Policy', 'no-referrer');
+
+      let pathname = '/';
+      try {
+        const rawReqUrl = typeof req.url === 'string' ? req.url : '/';
+        if (!rawReqUrl.startsWith('/')) {
+          sendJson(res, 400, { error: 'URL de requisição inválida.' });
+          return;
+        }
+        pathname = new URL(rawReqUrl, 'http://localhost').pathname;
+      } catch {
+        sendJson(res, 400, { error: 'URL de requisição malformada.' });
+        return;
+      }
+      const method = req.method || 'GET';
 
       if (method === 'GET' && pathname === '/') {
         res.writeHead(200, {
@@ -331,7 +348,11 @@ export function createAppHttpServer(params: {
         setupInProgress = true;
         try {
           const body = parseJsonObject(await readRawBody(req));
-          const newPassword = String(body.password || '').trim();
+          if (typeof body.password !== 'string') {
+            sendJson(res, 400, { error: 'Escolha uma senha em texto entre 4 e 128 caracteres.' });
+            return;
+          }
+          const newPassword = body.password.trim();
           if (newPassword.length < 4 || newPassword.length > 128) {
             sendJson(res, 400, { error: 'Escolha uma senha entre 4 e 128 caracteres.' });
             return;
@@ -379,7 +400,17 @@ export function createAppHttpServer(params: {
         }
 
         const body = parseJsonObject(await readRawBody(req));
-        const password = String(body.password || '').trim();
+        if (typeof body.password !== 'string') {
+          globalLoginFailWindow.count += 1;
+          const prevCount = attempt && now < attempt.resetAt ? attempt.count : 0;
+          loginAttempts.set(clientIp, {
+            count: prevCount + 1,
+            resetAt: now + LOGIN_WINDOW_MS,
+          });
+          sendJson(res, 400, { error: 'Formato de senha inválido.' });
+          return;
+        }
+        const password = body.password.trim();
         const valid = await verifyAdminPasswordAsync(password);
         if (!valid) {
           globalLoginFailWindow.count += 1;
@@ -474,9 +505,25 @@ export function createAppHttpServer(params: {
 
       if (method === 'POST' && pathname === '/api/account') {
         const body = parseJsonObject(await readRawBody(req));
+        if (
+          !isOptionalStringField(body.provider) ||
+          !isOptionalStringField(body.apiKey) ||
+          !isOptionalStringField(body.webhookSecret) ||
+          !isOptionalStringField(body.walletAsset) ||
+          !isOptionalStringField(body.walletNetwork) ||
+          !isOptionalStringField(body.walletAddress) ||
+          (body.adminWhatsappPhone !== undefined &&
+            body.adminWhatsappPhone !== null &&
+            typeof body.adminWhatsappPhone !== 'string' &&
+            typeof body.adminWhatsappPhone !== 'number')
+        ) {
+          sendJson(res, 400, { error: 'Formato inválido nos campos de configuração.' });
+          return;
+        }
+
         const current = getEffectiveAccount();
 
-        const rawProv = String(body.provider || current.provider).toLowerCase();
+        const rawProv = (body.provider ? body.provider.trim() : current.provider).toLowerCase();
         if (!SUPPORTED_PROVIDERS.includes(rawProv as SupportedProviderName)) {
           sendJson(res, 400, { error: 'Provedor inválido.' });
           return;
@@ -485,38 +532,45 @@ export function createAppHttpServer(params: {
 
         const providerChanged = provider !== current.provider;
         const newApiKey =
-          body.apiKey !== undefined && String(body.apiKey).trim() !== ''
-            ? String(body.apiKey).trim()
+          typeof body.apiKey === 'string' && body.apiKey.trim() !== ''
+            ? body.apiKey.trim()
             : providerChanged
               ? getDefaultApiKey(provider)
               : current.apiKey;
 
         const newWebhookSecret =
-          body.webhookSecret !== undefined && String(body.webhookSecret).trim() !== ''
-            ? String(body.webhookSecret).trim()
+          typeof body.webhookSecret === 'string' && body.webhookSecret.trim() !== ''
+            ? body.webhookSecret.trim()
             : providerChanged
               ? getDefaultWebhookSecret(provider)
               : current.webhookSecret;
 
+        const fallbackNonDepixAsset =
+          current.walletAsset && current.walletAsset !== 'DEPIX' ? current.walletAsset : 'USDT';
+        const fallbackNonDepixNetwork =
+          current.walletNetwork && current.walletNetwork !== 'LIQUID'
+            ? current.walletNetwork
+            : 'POLYGON';
+
         const walletAsset =
           provider === 'depixapp'
             ? 'DEPIX'
-            : body.walletAsset !== undefined && String(body.walletAsset).trim() !== ''
-              ? String(body.walletAsset).trim().toUpperCase()
-              : current.walletAsset;
+            : typeof body.walletAsset === 'string' && body.walletAsset.trim() !== ''
+              ? body.walletAsset.trim().toUpperCase()
+              : fallbackNonDepixAsset;
 
         const walletNetwork =
           provider === 'depixapp'
             ? 'LIQUID'
-            : body.walletNetwork !== undefined && String(body.walletNetwork).trim() !== ''
-              ? String(body.walletNetwork).trim().toUpperCase()
-              : current.walletNetwork;
+            : typeof body.walletNetwork === 'string' && body.walletNetwork.trim() !== ''
+              ? body.walletNetwork.trim().toUpperCase()
+              : fallbackNonDepixNetwork;
 
         const walletAddress =
           provider === 'depixapp'
             ? ''
-            : body.walletAddress !== undefined
-              ? String(body.walletAddress).trim()
+            : typeof body.walletAddress === 'string'
+              ? body.walletAddress.trim()
               : current.walletAddress;
 
         const safeExpMinutes = clampInt(
@@ -536,7 +590,7 @@ export function createAppHttpServer(params: {
           walletNetwork,
           pixExpirationMinutes: safeExpMinutes,
           adminWhatsappPhone:
-            body.adminWhatsappPhone !== undefined
+            body.adminWhatsappPhone !== undefined && body.adminWhatsappPhone !== null
               ? String(body.adminWhatsappPhone).replace(/\D/g, '')
               : current.adminWhatsappPhone,
         });
@@ -662,7 +716,13 @@ export function createAppHttpServer(params: {
       }
 
       if (method === 'POST' && pathname.startsWith('/api/simulator/pay/')) {
-        const orderId = decodeURIComponent(pathname.replace('/api/simulator/pay/', ''));
+        let orderId = '';
+        try {
+          orderId = decodeURIComponent(pathname.replace('/api/simulator/pay/', ''));
+        } catch {
+          sendJson(res, 400, { error: 'ID de pedido malformado.' });
+          return;
+        }
         const order = repository.getOrderById(orderId);
         if (!order || order.status !== 'PENDING') {
           sendJson(res, 400, { error: 'Pedido inválido ou já processado.' });

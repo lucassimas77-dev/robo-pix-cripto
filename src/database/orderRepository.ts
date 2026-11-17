@@ -403,8 +403,9 @@ export class OrderRepository {
           ? current.paidAt || new Date().toISOString()
           : (current.paidAt ?? null);
 
-      const markSettledDeact =
-        params.newStatus === 'PIX_CONFIRMED' || params.newStatus === 'SETTLED_CRYPTO' ? 1 : null;
+      // Somente SETTLED_CRYPTO é terminal sem risco de estorno PAYER_MISMATCH;
+      // em PIX_CONFIRMED (processing), mantém remote_deactivated = 0 caso vire FAILED depois!
+      const markSettledDeact = params.newStatus === 'SETTLED_CRYPTO' ? 1 : null;
 
       this.db
         .prepare(`

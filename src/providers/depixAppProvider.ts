@@ -8,6 +8,7 @@ import type {
   OrderStatus,
   WebhookSettlementEvent,
 } from '../types/domain.ts';
+import { safeOptionalId, safePrimitiveString } from '../utils/cpfCnpjValidator.ts';
 
 const FETCH_TIMEOUT_MS = 15_000;
 const WEBHOOK_TOLERANCE_SECONDS = 300; // 5 minutos contra replay attacks
@@ -113,11 +114,12 @@ export class DePixAppProvider implements IPixCryptoProvider {
   }
 
   private computeEffectivePendingExpiresMs(item: Record<string, unknown>): number {
-    if (!item.expires_at) return 0;
-    const baseMs = new Date(String(item.expires_at)).getTime();
+    const expStr = safePrimitiveString(item.expires_at);
+    if (!expStr) return 0;
+    const baseMs = new Date(expStr).getTime();
     if (!Number.isFinite(baseMs)) return 0;
     const isDepixRail =
-      String(item.payment_method ?? '').toLowerCase() === 'depix' ||
+      safePrimitiveString(item.payment_method).toLowerCase() === 'depix' ||
       Boolean(item.depix && typeof item.depix === 'object');
     return baseMs + (isDepixRail ? DEPIX_RAIL_GRACE_MS : 0);
   }
@@ -195,10 +197,10 @@ export class DePixAppProvider implements IPixCryptoProvider {
       typeof data.product === 'object' && data.product
         ? (data.product as Record<string, unknown>)
         : data;
-    const prdId = String(product.id ?? '');
-    const paymentUrl = String(
-      product.payment_url ?? (prdId ? `https://pay.depixapp.com/c/${prdId}` : '')
-    );
+    const prdId = safePrimitiveString(product.id).trim();
+    const paymentUrl =
+      safePrimitiveString(product.payment_url).trim() ||
+      (prdId ? `https://pay.depixapp.com/c/${prdId}` : '');
 
     if (!prdId || !paymentUrl) {
       throw new Error('Resposta da DePix App não retornou o link privado da cobrança.');
@@ -261,7 +263,7 @@ export class DePixAppProvider implements IPixCryptoProvider {
   public parseWebhookPayload(payload: unknown): WebhookSettlementEvent | null {
     if (!payload || typeof payload !== 'object') return null;
     const root = payload as Record<string, unknown>;
-    const eventName = String(root.event ?? '').toLowerCase();
+    const eventName = safePrimitiveString(root.event).toLowerCase();
     const data = (typeof root.data === 'object' && root.data ? root.data : root) as Record<
       string,
       unknown
@@ -271,7 +273,7 @@ export class DePixAppProvider implements IPixCryptoProvider {
       return null;
     }
 
-    const rawStatus = String(data.status ?? eventName).toLowerCase();
+    const rawStatus = (safePrimitiveString(data.status) || eventName).toLowerCase();
     let newStatus: OrderStatus | null = null;
 
     if (
@@ -290,7 +292,7 @@ export class DePixAppProvider implements IPixCryptoProvider {
       newStatus = 'PIX_CONFIRMED';
     } else if (
       (rawStatus === 'expired' || eventName === 'checkout.expired') &&
-      !data.product_id
+      !safeOptionalId(data.product_id)
     ) {
       // Ignora `checkout.expired` de sub-checkout individual quando há `product_id` (`prd_...`),
       // pois um 2º QR pode estar ativo no mesmo link; o `ExpirationWatcher` controla o vencimento de `prd_...`.
@@ -310,37 +312,29 @@ export class DePixAppProvider implements IPixCryptoProvider {
     let metadata: Record<string, unknown> = {};
     if (typeof data.metadata === 'string') {
       try {
-        metadata = JSON.parse(data.metadata) as Record<string, unknown>;
+        const parsedMeta = JSON.parse(data.metadata) as unknown;
+        if (parsedMeta && typeof parsedMeta === 'object' && !Array.isArray(parsedMeta)) {
+          metadata = parsedMeta as Record<string, unknown>;
+        }
       } catch {
         metadata = {};
       }
-    } else if (typeof data.metadata === 'object' && data.metadata) {
+    } else if (typeof data.metadata === 'object' && data.metadata && !Array.isArray(data.metadata)) {
       metadata = data.metadata as Record<string, unknown>;
     }
 
-    const chargeId = data.product_id
-      ? String(data.product_id)
-      : data.id
-        ? String(data.id)
-        : undefined;
+    const chargeId = safeOptionalId(data.product_id) ?? safeOptionalId(data.id);
 
     return {
       provider: 'depixapp',
-      eventId: data.event_id ? String(data.event_id) : undefined,
+      eventId: safeOptionalId(data.event_id),
       providerChargeId: chargeId,
-      externalId: metadata.external_id
-        ? String(metadata.external_id)
-        : data.external_id
-          ? String(data.external_id)
-          : undefined,
+      externalId: safeOptionalId(metadata.external_id) ?? safeOptionalId(data.external_id),
       newStatus,
-      txHash: data.blockchain_tx_id
-        ? String(data.blockchain_tx_id)
-        : data.tx_hash
-          ? String(data.tx_hash)
-          : data.txid
-            ? String(data.txid)
-            : undefined,
+      txHash:
+        safeOptionalId(data.blockchain_tx_id) ??
+        safeOptionalId(data.tx_hash) ??
+        safeOptionalId(data.txid),
       cryptoAmount: this.extractCryptoAmountFromItem(data),
       rawEventName: eventName || rawStatus,
     };
@@ -381,16 +375,15 @@ export class DePixAppProvider implements IPixCryptoProvider {
 
         // 1ª prioridade: `completed`
         const completedItem = validItems.find(
-          (item) => String(item.status ?? '').toLowerCase() === 'completed'
+          (item) => safePrimitiveString(item.status).toLowerCase() === 'completed'
         );
         if (completedItem) {
-          let txHash = completedItem.blockchain_tx_id
-            ? String(completedItem.blockchain_tx_id)
-            : undefined;
+          let txHash = safeOptionalId(completedItem.blockchain_tx_id);
           let cryptoAmount = this.extractCryptoAmountFromItem(completedItem);
+          const completedId = safeOptionalId(completedItem.id);
 
-          if ((!txHash || cryptoAmount === undefined) && completedItem.id) {
-            const details = await this.fetchCheckoutSettlementDetails(String(completedItem.id));
+          if ((!txHash || cryptoAmount === undefined) && completedId) {
+            const details = await this.fetchCheckoutSettlementDetails(completedId);
             if (!txHash && details.txHash) txHash = details.txHash;
             if (cryptoAmount === undefined && details.cryptoAmount !== undefined) {
               cryptoAmount = details.cryptoAmount;
@@ -401,7 +394,7 @@ export class DePixAppProvider implements IPixCryptoProvider {
 
         // 2ª prioridade: `processing` | `approved`
         const processingItem = validItems.find((item) => {
-          const st = String(item.status ?? '').toLowerCase();
+          const st = safePrimitiveString(item.status).toLowerCase();
           return st === 'processing' || st === 'approved';
         });
         if (processingItem) {
@@ -412,7 +405,7 @@ export class DePixAppProvider implements IPixCryptoProvider {
         const nowMs = Date.now();
         let latestPendingExpMs = 0;
         for (const item of validItems) {
-          if (String(item.status ?? '').toLowerCase() !== 'pending') continue;
+          if (safePrimitiveString(item.status).toLowerCase() !== 'pending') continue;
           const effMs = this.computeEffectivePendingExpiresMs(item);
           if (effMs > nowMs && effMs > latestPendingExpMs) {
             latestPendingExpMs = effMs;
@@ -427,12 +420,12 @@ export class DePixAppProvider implements IPixCryptoProvider {
 
         // 4ª prioridade: checkout estornado/cancelado (ex: PAYER_MISMATCH após ter passado por processing!)
         const cancelledItem = validItems.find((item) => {
-          const st = String(item.status ?? '').toLowerCase();
+          const st = safePrimitiveString(item.status).toLowerCase();
           return st === 'cancelled' || st === 'canceled' || st === 'refunded' || st === 'failed';
         });
         if (cancelledItem) {
           const reasons = Array.isArray(cancelledItem.rejection_reasons)
-            ? cancelledItem.rejection_reasons.map(String)
+            ? cancelledItem.rejection_reasons.map(safePrimitiveString).filter(Boolean)
             : undefined;
           return { status: 'FAILED', rejectionReasons: reasons };
         }
@@ -463,11 +456,11 @@ export class DePixAppProvider implements IPixCryptoProvider {
         return { status: 'PENDING' };
       }
 
-      const rawStatus = String(chk.status ?? '').toLowerCase();
+      const rawStatus = safePrimitiveString(chk.status).toLowerCase();
       if (rawStatus === 'completed') {
         return {
           status: 'SETTLED_CRYPTO',
-          txHash: chk.blockchain_tx_id ? String(chk.blockchain_tx_id) : undefined,
+          txHash: safeOptionalId(chk.blockchain_tx_id),
           cryptoAmount: this.extractCryptoAmountFromItem(chk),
         };
       }
@@ -484,7 +477,7 @@ export class DePixAppProvider implements IPixCryptoProvider {
         rawStatus === 'refunded'
       ) {
         const reasons = Array.isArray(chk.rejection_reasons)
-          ? chk.rejection_reasons.map(String)
+          ? chk.rejection_reasons.map(safePrimitiveString).filter(Boolean)
           : undefined;
         return { status: 'FAILED', rejectionReasons: reasons };
       }
@@ -549,7 +542,7 @@ export class DePixAppProvider implements IPixCryptoProvider {
           ? (root.checkout as Record<string, unknown>)
           : root;
       return {
-        txHash: chk.blockchain_tx_id ? String(chk.blockchain_tx_id) : undefined,
+        txHash: safeOptionalId(chk.blockchain_tx_id),
         cryptoAmount: this.extractCryptoAmountFromItem(chk),
       };
     } catch {
@@ -562,14 +555,14 @@ export class DePixAppProvider implements IPixCryptoProvider {
       const parsed = JSON.parse(rawText) as Record<string, unknown>;
       const legacy =
         typeof parsed.response === 'object' && parsed.response
-          ? (parsed.response as Record<string, unknown>).errorMessage
+          ? safeOptionalId((parsed.response as Record<string, unknown>).errorMessage)
           : undefined;
       const errObj =
         typeof parsed.error === 'object' && parsed.error
           ? (parsed.error as Record<string, unknown>)
           : undefined;
-      const code = errObj?.code ? String(errObj.code) : '';
-      const msg = legacy ? String(legacy) : errObj?.message ? String(errObj.message) : rawText;
+      const code = safeOptionalId(errObj?.code) ?? '';
+      const msg = legacy ?? safeOptionalId(errObj?.message) ?? rawText;
       return `DePix App (${status}${code ? ' ' + code : ''}): ${msg}`;
     } catch {
       return `DePix App (HTTP ${status}): ${rawText}`;

@@ -50,11 +50,18 @@ export class ConversationEngine {
 
   private deactivateOrderRemotely(order: PixCryptoOrder): void {
     if (order.remoteDeactivated) return;
-    if (this.cryptoProvider.name !== order.provider || !this.cryptoProvider.expireCharge) {
+    const activeProv = this.cryptoProvider;
+    if (activeProv.name !== order.provider) {
+      if (!(order.provider === 'depixapp' && order.providerChargeId.startsWith('prd_'))) {
+        this.repository.markRemoteDeactivated(order.id);
+      }
+      return;
+    }
+    if (!activeProv.expireCharge) {
       this.repository.markRemoteDeactivated(order.id);
       return;
     }
-    void this.cryptoProvider
+    void activeProv
       .expireCharge(order.providerChargeId)
       .then((ok) => {
         if (ok) {
@@ -152,6 +159,8 @@ export class ConversationEngine {
 
     // 3. Mensagens pós-pagamento ("já paguei", "paguei 50 no pix", "status", "comprovante") NUNCA geram nova cobrança!
     if (isStatusQueryMessage(text) || isPaymentConfirmationMessage(text)) {
+      session.pendingNewAmountBrl = undefined;
+      session.draftAmountBrl = undefined;
       const recent = this.repository.findMostRecentOrderByPhone(phone);
       if (!recent) {
         session.stage = 'AWAITING_AMOUNT';
@@ -165,6 +174,10 @@ export class ConversationEngine {
       }
 
       if (recent.status === 'SETTLED_CRYPTO') {
+        if (session.stage === 'AWAITING_ACTIVE_ORDER_DECISION') {
+          session.stage = 'IDLE';
+          this.repository.saveSession(session);
+        }
         await this.safeSendText(
           phone,
           `✅ Seu pagamento de *${formatBrl(recent.amountBrl)}* (protocolo \`${recent.externalId}\`) já está *100% confirmado*!`,
@@ -174,6 +187,10 @@ export class ConversationEngine {
       }
 
       if (recent.status === 'PIX_CONFIRMED') {
+        if (session.stage === 'AWAITING_ACTIVE_ORDER_DECISION') {
+          session.stage = 'IDLE';
+          this.repository.saveSession(session);
+        }
         await this.safeSendText(
           phone,
           `🎉 Seu pagamento de *${formatBrl(recent.amountBrl)}* já foi recebido pela processadora e está em liquidação final!`,
@@ -183,6 +200,10 @@ export class ConversationEngine {
       }
 
       if (recent.status === 'PENDING' && new Date(recent.expiresAt).getTime() > Date.now()) {
+        if (session.stage === 'AWAITING_ACTIVE_ORDER_DECISION') {
+          session.stage = 'IDLE';
+          this.repository.saveSession(session);
+        }
         await this.safeSendText(
           phone,
           `⏳ Sua cobrança de *${formatBrl(recent.amountBrl)}* (\`${recent.externalId}\`) está aguardando compensação bancária. Assim que confirmar, aviso você automaticamente aqui mesmo!`,
@@ -242,7 +263,9 @@ export class ConversationEngine {
       const wantsNew =
         normChoice === '2' ||
         /\b(?:nov[oa]|outr[oa]|trocar|mudar)\b/.test(normChoice) ||
-        /\bcancelar\b.*\bgerar\b/.test(normChoice);
+        (normChoice.includes('cancelar') &&
+          normChoice.includes('gerar') &&
+          normChoice.indexOf('cancelar') < normChoice.indexOf('gerar'));
 
       if (!active) {
         const prevPendingAmt = session.pendingNewAmountBrl;
@@ -330,6 +353,7 @@ export class ConversationEngine {
 
       session.stage = 'AWAITING_ACTIVE_ORDER_DECISION';
       session.pendingNewAmountBrl = possibleNewAmount ?? undefined;
+      session.draftAmountBrl = undefined;
       this.repository.saveSession(session);
 
       await this.safeSendText(
@@ -340,6 +364,51 @@ export class ConversationEngine {
         session.customerJid
       );
       return;
+    }
+
+    // Se o cliente estava diante do menu 1 / 2 no exato segundo em que a cobrança anterior expirou/falhou:
+    if (session.draftAmountBrl === -1 || session.pendingNewAmountBrl !== undefined) {
+      const normAfterExp = normalizeCommandText(text);
+      const savedPendingAmt = session.pendingNewAmountBrl;
+      const hadExpiredMenu = session.draftAmountBrl === -1;
+
+      session.draftAmountBrl = undefined;
+      session.pendingNewAmountBrl = undefined;
+      this.repository.saveSession(session);
+
+      const choseOption2 =
+        normAfterExp === '2' ||
+        /\b(?:nov[oa]|outr[oa]|trocar|mudar)\b/.test(normAfterExp) ||
+        (normAfterExp.includes('cancelar') &&
+          normAfterExp.includes('gerar') &&
+          normAfterExp.indexOf('cancelar') < normAfterExp.indexOf('gerar'));
+      const choseOption1 =
+        normAfterExp === '1' ||
+        /\b(?:reenviar|reenvia|mesm[oa]|atual|manter)\b/.test(normAfterExp);
+
+      if (choseOption2) {
+        const inlineAmt = normAfterExp !== '2' ? parseBrlAmountFromText(text) : null;
+        const targetAmt = inlineAmt ?? savedPendingAmt;
+        if (targetAmt) {
+          await this.proceedWithAmount(phone, targetAmt, session.customerJid);
+          return;
+        }
+        await this.safeSendText(
+          phone,
+          '⏰ A cobrança anterior já expirou! Qual o *novo valor em Reais* para o Pix? _(Ex: 200,00)_',
+          session.customerJid
+        );
+        return;
+      }
+
+      if (choseOption1 && hadExpiredMenu) {
+        await this.safeSendText(
+          phone,
+          '⏰ A cobrança anterior já expirou! Qual o *valor em Reais* que deseja gerar agora? _(Ex: 50,00)_',
+          session.customerJid
+        );
+        return;
+      }
     }
 
     const detectedAmount = parseBrlAmountFromText(text);
@@ -409,38 +478,42 @@ export class ConversationEngine {
     customerJid?: string;
     amountBrl: number;
   }): Promise<void> {
+    // Captura snapshot imutável do provedor e config antes do `await` contra troca concorrente em `/api/account`!
+    const providerSnapshot = this.cryptoProvider;
+    const configSnapshot = this.config;
+
     const orderId = crypto.randomUUID();
     const externalId = `ord_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
-    const webhookUrl = `${this.config.publicBaseUrl}/webhooks/${this.cryptoProvider.name}`;
+    const webhookUrl = `${configSnapshot.publicBaseUrl}/webhooks/${providerSnapshot.name}`;
 
     const effectiveAsset =
-      this.cryptoProvider.name === 'depixapp' ? 'DEPIX' : this.config.walletAsset;
+      providerSnapshot.name === 'depixapp' ? 'DEPIX' : configSnapshot.walletAsset;
     const effectiveNetwork =
-      this.cryptoProvider.name === 'depixapp' ? 'LIQUID' : this.config.walletNetwork;
+      providerSnapshot.name === 'depixapp' ? 'LIQUID' : configSnapshot.walletNetwork;
     const effectiveWallet =
-      this.cryptoProvider.name === 'depixapp'
+      providerSnapshot.name === 'depixapp'
         ? 'Carteira Liquid (Conta DePix App)'
-        : this.config.walletAddress;
+        : configSnapshot.walletAddress;
 
     try {
-      const charge = await this.cryptoProvider.createCharge({
+      const charge = await providerSnapshot.createCharge({
         externalId,
         amountBrl: params.amountBrl,
         customerPhone: params.phone,
-        walletAddress: this.config.walletAddress,
+        walletAddress: configSnapshot.walletAddress,
         cryptoAsset: effectiveAsset,
         cryptoNetwork: effectiveNetwork,
-        expirationMinutes: this.config.pixExpirationMinutes,
+        expirationMinutes: configSnapshot.pixExpirationMinutes,
         webhookUrl,
       });
 
       const needsRemoteDeactivation =
-        this.cryptoProvider.name === 'depixapp' && charge.providerChargeId.startsWith('prd_');
+        providerSnapshot.name === 'depixapp' && charge.providerChargeId.startsWith('prd_');
 
       const order: PixCryptoOrder = {
         id: orderId,
         externalId,
-        provider: this.cryptoProvider.name,
+        provider: providerSnapshot.name,
         providerChargeId: charge.providerChargeId,
         customerPhone: params.phone,
         customerJid: params.customerJid,
@@ -588,6 +661,21 @@ export class ConversationEngine {
       return { matched: true, changed: false, order: existing };
     }
 
+    if (updatedOrder.status === 'PIX_CONFIRMED' || updatedOrder.status === 'SETTLED_CRYPTO') {
+      const otherActive = this.repository.findActivePendingOrderByPhone(updatedOrder.customerPhone);
+      if (!otherActive) {
+        const sess = this.repository.getSession(updatedOrder.customerPhone);
+        if (sess.stage === 'AWAITING_ACTIVE_ORDER_DECISION' || sess.pendingNewAmountBrl !== undefined) {
+          this.repository.saveSession({
+            phone: updatedOrder.customerPhone,
+            customerJid: updatedOrder.customerJid ?? sess.customerJid,
+            stage: 'IDLE',
+            updatedAt: new Date().toISOString(),
+          });
+        }
+      }
+    }
+
     if (updatedOrder.status === 'PIX_CONFIRMED') {
       await this.safeSendText(
         updatedOrder.customerPhone,
@@ -639,10 +727,13 @@ export class ConversationEngine {
       const otherActive = this.repository.findActivePendingOrderByPhone(updatedOrder.customerPhone);
       if (!otherActive) {
         const sess = this.repository.getSession(updatedOrder.customerPhone);
+        const hadDecisionMenu = sess.stage === 'AWAITING_ACTIVE_ORDER_DECISION';
         this.repository.saveSession({
           phone: updatedOrder.customerPhone,
           customerJid: updatedOrder.customerJid ?? sess.customerJid,
           stage: 'AWAITING_AMOUNT',
+          draftAmountBrl: hadDecisionMenu ? -1 : undefined,
+          pendingNewAmountBrl: hadDecisionMenu ? sess.pendingNewAmountBrl : undefined,
           updatedAt: new Date().toISOString(),
         });
       }
@@ -669,10 +760,13 @@ export class ConversationEngine {
       const otherActive = this.repository.findActivePendingOrderByPhone(updatedOrder.customerPhone);
       if (!otherActive) {
         const sess = this.repository.getSession(updatedOrder.customerPhone);
+        const hadDecisionMenu = sess.stage === 'AWAITING_ACTIVE_ORDER_DECISION';
         this.repository.saveSession({
           phone: updatedOrder.customerPhone,
           customerJid: updatedOrder.customerJid ?? sess.customerJid,
           stage: 'AWAITING_AMOUNT',
+          draftAmountBrl: hadDecisionMenu ? -1 : undefined,
+          pendingNewAmountBrl: hadDecisionMenu ? sess.pendingNewAmountBrl : undefined,
           updatedAt: new Date().toISOString(),
         });
       }

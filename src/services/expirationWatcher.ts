@@ -247,10 +247,13 @@ export class ExpirationWatcher {
             );
             if (!otherActive) {
               const sess = this.repository.getSession(order.customerPhone);
+              const hadDecisionMenu = sess.stage === 'AWAITING_ACTIVE_ORDER_DECISION';
               this.repository.saveSession({
                 phone: order.customerPhone,
                 customerJid: order.customerJid ?? sess.customerJid,
                 stage: 'AWAITING_AMOUNT',
+                draftAmountBrl: hadDecisionMenu ? -1 : undefined,
+                pendingNewAmountBrl: hadDecisionMenu ? sess.pendingNewAmountBrl : undefined,
                 updatedAt: effectiveNowIso,
               });
             }

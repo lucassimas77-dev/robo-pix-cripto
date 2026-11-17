@@ -7,6 +7,7 @@ import type {
   IPixCryptoProvider,
   WebhookSettlementEvent,
 } from '../types/domain.ts';
+import { safeOptionalId, safePrimitiveString } from '../utils/cpfCnpjValidator.ts';
 
 export class MockProvider implements IPixCryptoProvider {
   public readonly name = 'mock' as const;
@@ -73,21 +74,26 @@ export class MockProvider implements IPixCryptoProvider {
   public parseWebhookPayload(payload: unknown): WebhookSettlementEvent | null {
     if (!payload || typeof payload !== 'object') return null;
     const obj = payload as Record<string, unknown>;
-    const event = String(obj.event || '');
-    const data = (obj.data || {}) as Record<string, unknown>;
+    const event = safePrimitiveString(obj.event);
+    const data = (typeof obj.data === 'object' && obj.data ? obj.data : {}) as Record<
+      string,
+      unknown
+    >;
 
     if (event === 'MOCK_SETTLED_CRYPTO') {
+      const cryptoNum =
+        typeof data.cryptoAmount === 'number' || typeof data.cryptoAmount === 'string'
+          ? Number(data.cryptoAmount)
+          : NaN;
       return {
         provider: 'mock',
-        eventId: obj.eventId ? String(obj.eventId) : undefined,
-        providerChargeId: data.providerChargeId ? String(data.providerChargeId) : undefined,
-        externalId: data.externalId ? String(data.externalId) : undefined,
+        eventId: safeOptionalId(obj.eventId),
+        providerChargeId: safeOptionalId(data.providerChargeId),
+        externalId: safeOptionalId(data.externalId),
         newStatus: 'SETTLED_CRYPTO',
-        txHash: data.txHash ? String(data.txHash) : `0x${crypto.randomBytes(32).toString('hex')}`,
-        endToEndId: data.endToEndId
-          ? String(data.endToEndId)
-          : `E00000000${Date.now()}MOCK`,
-        cryptoAmount: data.cryptoAmount != null ? Number(data.cryptoAmount) : undefined,
+        txHash: safeOptionalId(data.txHash) ?? `0x${crypto.randomBytes(32).toString('hex')}`,
+        endToEndId: safeOptionalId(data.endToEndId) ?? `E00000000${Date.now()}MOCK`,
+        cryptoAmount: Number.isFinite(cryptoNum) ? cryptoNum : undefined,
         rawEventName: event,
       };
     }

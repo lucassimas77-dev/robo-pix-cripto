@@ -1,7 +1,36 @@
 /**
  * Utilitários de extração segura de valores monetários em Reais (BRL),
- * detecção de intenções em português e formatação.
+ * coerção segura de primitivos, detecção de intenções em português (O(N), imune a ReDoS) e formatação.
  */
+
+const MAX_COMMAND_LEN = 500;
+const MAX_NLU_LEN = 2_000;
+const EDGE_PUNCT_CHARS = new Set([
+  ' ',
+  '\t',
+  '\n',
+  '\r',
+  '!',
+  '?',
+  '.',
+  '…',
+  ',',
+  ';',
+  ':',
+  '-',
+]);
+
+export function safePrimitiveString(val: unknown): string {
+  if (typeof val === 'string') return val;
+  if (typeof val === 'number' && Number.isFinite(val)) return String(val);
+  if (typeof val === 'boolean') return String(val);
+  return '';
+}
+
+export function safeOptionalId(val: unknown): string | undefined {
+  const s = safePrimitiveString(val).trim();
+  return s ? s : undefined;
+}
 
 export function onlyDigits(value: string): string {
   return value.replace(/\D/g, '');
@@ -40,12 +69,13 @@ const NUM_CORE =
   '(?:\\d{1,3}(?:\\.\\d{3})+,\\d{1,2}|\\d{1,3}(?:\\.\\d{3})+(?![.,]\\d|\\d)|\\d+,\\d{1,2}(?!\\d)|\\d+\\.\\d{1,2}(?![.,]\\d|\\d)|\\d+)';
 
 export function parseBrlAmountFromText(text: string): number | null {
+  if (typeof text !== 'string' || text.length > MAX_NLU_LEN) return null;
   const cleaned = text.trim();
   if (!cleaned) return null;
 
   const withoutContactsAndDates = cleaned
-    // Remove telefones, CPFs/CNPJs, chaves/IDs longos, datas (16/11, 16/11/2026) e horários (10h, 14:30)
-    .replace(/\+?\d{0,3}\s*\(\d{2}\)\s*\d{4,5}[-\s]?\d{4}/g, ' ')
+    // Remove telefones (sem prefixos opcionais vazios antes de \s+ — complexidade estrita O(N)!), CPFs/CNPJs, datas e horários
+    .replace(/(?:\+?\d{1,3}[ \t]+)?\(\d{2}\)[ \t]?\d{4,5}[-\s]?\d{4}/g, ' ')
     .replace(/\b\d{4,5}-\d{4}\b/g, ' ')
     .replace(/\b\d{3}\.\d{3}\.\d{3}-\d{2}\b/g, ' ')
     .replace(/\b\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}\b/g, ' ')
@@ -56,53 +86,76 @@ export function parseBrlAmountFromText(text: string): number | null {
 
   // Rejeita valores negativos explícitos ("-50", "pix de -50", "-50 reais", "R$ -50", "-R$ 50")
   if (
-    /r\$\s*-\s*\d/i.test(withoutContactsAndDates) ||
-    /-\s*r\$\s*\d/i.test(withoutContactsAndDates) ||
+    /r\$[ \t]*-[ \t]*\d/i.test(withoutContactsAndDates) ||
+    /-[ \t]*r\$[ \t]*\d/i.test(withoutContactsAndDates) ||
     /(?:^|[\s(/:=])-\d/.test(withoutContactsAndDates)
   ) {
     return null;
   }
 
-  // Se houver porcentagem na frase (ex: "Tem 10% de desconto no pix?" ou "200 com 10% de desconto"),
-  // não assume valor unilateralmente — pede ao cliente confirmar o valor final exato em Reais.
-  const pctRegex = new RegExp(`(?:${NUM_CORE})\\s*(?:%|por\\s*cento\\b|porcento\\b)`, 'i');
+  // Rejeita porcentagens ("Tem 10% de desconto no pix?", "200 com 10% de desconto")
+  const pctRegex = new RegExp(`(?:${NUM_CORE})[ \\t]*(?:%|por[ \\t]*cento\\b|porcento\\b)`, 'i');
   if (pctRegex.test(withoutContactsAndDates)) {
+    return null;
+  }
+
+  // Rejeita multiplicadores de quantidade ("quero 2 itens de R$ 50", "3 unidades de 50 reais", "2x de R$ 50")
+  if (
+    /\b\d+[ \t]*(?:itens?|unidades?|pe[cç]as?|produtos?|pacotes?|caixas?|kits?|ingressos?|cotas?|x|vezes|parcelas?)[ \t]+(?:de[ \t]+|por[ \t]+|a[ \t]+)?(?:r\$[ \t]*)?\d/i.test(
+      withoutContactsAndDates
+    )
+  ) {
     return null;
   }
 
   const sanitized = withoutContactsAndDates
     // Remove hashtags/códigos (#80, #150) e números de pedido/referência ("pedido 150", "pedido #80", "mesa 12")
-    // Nota: preserva "pedido de 150" (onde há a preposição "de" antes do valor monetário)
-    .replace(/#\s*\d+(?:[.,]\d+)?/g, ' ')
+    .replace(/#[ \t]*\d+(?:[.,]\d+)?/g, ' ')
     .replace(
-      /\b(?:pedido|ordem|protocolo|chamado|fatura|boleto|nota|nf|mesa|quarto|apto|apartamento|id|cod|c[oó]digo|item|op[cç][aã]o)\s*(?:#|n[º°o.]?\s*)?\d+(?:[.,]\d+)?\b/gi,
+      /\b(?:pedido|ordem|protocolo|chamado|fatura|boleto|nota|nf|mesa|quarto|apto|apartamento|id|cod|c[oó]digo|item|op[cç][aã]o)[ \t]*(?:#|n[º°o.]?[ \t]*)?\d+(?:[.,]\d+)?\b/gi,
       ' '
     )
-    // Remove quantidades antes da palavra "pix" ("1 pix", "quero fazer 5 pix", "me manda 2 pix"), exceto quando precedidas por "R$"
-    .replace(/(?<!r\$\s*)\b\d+\s+pix\b/gi, ' pix ')
+    // Remove quantidades antes da palavra "pix" ("1 pix", "quero fazer 5 pix", "me manda 2 pix"), exceto após "R$"
+    .replace(/(?<!r\$[ \t]*)\b\d+[ \t]+pix\b/gi, ' pix ')
     // Remove parcelas ("3x", "2 vezes", "3 parcelas") e durações ("15 min", "2 horas", "30 dias")
-    .replace(/\b\d+\s*(?:x|vezes|parcelas?)\b/gi, ' ')
-    .replace(/\b\d+\s*(?:min|minutos?|seg|segundos?|dias?|horas?|meses|anos?)\b/gi, ' ');
+    .replace(/\b\d+[ \t]*(?:x|vezes|parcelas?)\b/gi, ' ')
+    .replace(/\b\d+[ \t]*(?:min|minutos?|seg|segundos?|dias?|horas?|meses|anos?)\b/gi, ' ');
 
-  // Camada 1: precedido por R$ (ex: "R$ 150,00.", "R$ 10.000")
-  const explicitPrefix = new RegExp(`(?<!-)r\\$\\s*(${NUM_CORE})(?![.,]\\d|\\d|\\s*%)`, 'i');
-  const mPrefix = sanitized.match(explicitPrefix);
-  if (mPrefix) {
-    return parseNumericToken(mPrefix[1]);
+  // Rejeita dúvidas/escolhas entre dois valores ("R$ 50 ou R$ 100?", "50 reais ou 80 reais?", "50 ou 100?")
+  if (
+    /\d+(?:[.,]\d+)?[ \t]*(?:reais|real|brl|conto|contos)?[ \t]+ou[ \t]+(?:r\$[ \t]*)?\d/i.test(
+      sanitized
+    )
+  ) {
+    return null;
   }
 
-  // Camada 2: seguido por reais / real / brl / conto
-  const explicitSuffix = new RegExp(
-    `(?<!-|\\d[.,]|\\d)(${NUM_CORE})\\s*(?:reais|real|brl|conto|contos)\\b`,
-    'i'
+  // Camada 1: precedido por R$ (exige candidato único distinto)
+  const explicitPrefixGlobal = new RegExp(
+    `(?<!-)r\\$[ \\t]*(${NUM_CORE})(?![.,]\\d|\\d|[ \\t]*%)`,
+    'gi'
   );
-  const mSuffix = sanitized.match(explicitSuffix);
-  if (mSuffix) {
-    return parseNumericToken(mSuffix[1]);
-  }
+  const prefixMatches = Array.from(sanitized.matchAll(explicitPrefixGlobal))
+    .map((m) => parseNumericToken(m[1]))
+    .filter((v): v is number => v !== null);
+  const uniquePrefix = Array.from(new Set(prefixMatches));
+  if (uniquePrefix.length > 1) return null;
+  if (uniquePrefix.length === 1) return uniquePrefix[0];
+
+  // Camada 2: seguido por reais / real / brl / conto (exige candidato único distinto)
+  const explicitSuffixGlobal = new RegExp(
+    `(?<!-|\\d[.,]|\\d)(${NUM_CORE})[ \\t]*(?:reais|real|brl|conto|contos)\\b`,
+    'gi'
+  );
+  const suffixMatches = Array.from(sanitized.matchAll(explicitSuffixGlobal))
+    .map((m) => parseNumericToken(m[1]))
+    .filter((v): v is number => v !== null);
+  const uniqueSuffix = Array.from(new Set(suffixMatches));
+  if (uniqueSuffix.length > 1) return null;
+  if (uniqueSuffix.length === 1) return uniqueSuffix[0];
 
   // Camada 3: único número candidato inequívoco na frase
-  const allTokensRegex = new RegExp(`(?<!-|\\d[.,]|\\d)(${NUM_CORE})(?![.,]\\d|\\d|\\s*%)`, 'g');
+  const allTokensRegex = new RegExp(`(?<!-|\\d[.,]|\\d)(${NUM_CORE})(?![.,]\\d|\\d|[ \\t]*%)`, 'g');
   const allMatches = Array.from(sanitized.matchAll(allTokensRegex))
     .map((m) => parseNumericToken(m[1]))
     .filter((v): v is number => v !== null);
@@ -112,38 +165,55 @@ export function parseBrlAmountFromText(text: string): number | null {
   return allMatches[0];
 }
 
+/**
+ * Varredura linear O(N) com dois ponteiros — zero regex backtracking!
+ */
 export function normalizeCommandText(text: string): string {
+  if (typeof text !== 'string' || text.length > MAX_COMMAND_LEN) return '';
+  let start = 0;
+  let end = text.length - 1;
+
+  while (start <= end && EDGE_PUNCT_CHARS.has(text[start])) {
+    start++;
+  }
+  while (end >= start && EDGE_PUNCT_CHARS.has(text[end])) {
+    end--;
+  }
+  if (start > end) return '';
+
   return text
-    .trim()
+    .slice(start, end + 1)
     .toLowerCase()
-    .replace(/^[\s!?.…,;:-]+|[\s!?.…,;:-]+$/g, '')
     .replace(/\s+/g, ' ');
 }
 
 export function isExitCommand(text: string): boolean {
   const n = normalizeCommandText(text);
+  if (!n) return false;
   return /^(?:sair|encerrar|encerrar atendimento|finalizar atendimento|parar)$/.test(n);
 }
 
 export function isCancelCommand(text: string): boolean {
   const n = normalizeCommandText(text);
+  if (!n) return false;
   if (
-    /^(?:cancelar|cancela|reiniciar|reinicia|reset|resetar)(?:\s+(?:o\s+|a\s+|esse\s+|essa\s+|meu\s+|minha\s+)?(?:pix|cobran[cç]a|pedido|tudo|atendimento|agora))?$/.test(
+    /^(?:cancelar|cancela|reiniciar|reinicia|reset|resetar)(?: (?:o |a |esse |essa |meu |minha )?(?:pix|cobran[cç]a|pedido|tudo|atendimento|agora))?$/.test(
       n
     )
   ) {
     return true;
   }
-  return /^(?:quero|pode|favor|por favor|preciso)\s+(?:cancelar|reiniciar)(?:\s+(?:o\s+|a\s+|esse\s+|essa\s+|meu\s+|minha\s+)?(?:pix|cobran[cç]a|pedido|tudo|atendimento|agora))?$/.test(
+  return /^(?:quero|pode|favor|por favor|preciso) (?:cancelar|reiniciar)(?: (?:o |a |esse |essa |meu |minha )?(?:pix|cobran[cç]a|pedido|tudo|atendimento|agora))?$/.test(
     n
   );
 }
 
 export function isHelpCommand(text: string): boolean {
   const n = normalizeCommandText(text);
+  if (!n) return false;
   return (
     /^(?:ajuda|help|menu|op[cç][oõ]es|instru[cç][oõ]es|comandos)$/.test(n) ||
-    /\b(?:como\s+(?:funciona|fa[cç]o\s+para\s+pagar|pagar\s+no\s+pix|usar)|preciso\s+de\s+ajuda|me\s+ajuda)\b/i.test(
+    /\b(?:como (?:funciona|fa[cç]o para pagar|pagar no pix|usar)|preciso de ajuda|me ajuda)\b/i.test(
       n
     )
   );
@@ -151,11 +221,12 @@ export function isHelpCommand(text: string): boolean {
 
 export function isStatusQueryMessage(text: string): boolean {
   const n = normalizeCommandText(text);
+  if (!n) return false;
   return (
-    /^(?:status|comprovante|meu pix|ver status|consultar|situa[cç][aã]o)(?:\s+d[oa]\s+(?:meu\s+)?(?:pix|pagamento|pedido|cobran[cç]a))?$/.test(
+    /^(?:status|comprovante|meu pix|ver status|consultar|situa[cç][aã]o)(?: d[oa] (?:meu )?(?:pix|pagamento|pedido|cobran[cç]a))?$/.test(
       n
     ) ||
-    /\b(?:qual\s+(?:[eé]\s+)?(?:o\s+)?status|status\s+d[oa]\s+(?:meu\s+)?(?:pix|pagamento|cobran[cç]a|pedido)|j[aá]\s+(?:confirmou|caiu|compensou))\b/i.test(
+    /\b(?:qual (?:[eé] )?(?:o )?status|status d[oa] (?:meu )?(?:pix|pagamento|cobran[cç]a|pedido)|j[aá] (?:confirmou|caiu|compensou))\b/i.test(
       n
     )
   );
@@ -163,33 +234,37 @@ export function isStatusQueryMessage(text: string): boolean {
 
 /**
  * Detecta mensagens pós-pagamento ("já paguei o pix de 50", "paguei 50 no pix", "já fiz o pagamento de 50",
- * "pagamento de 50 feito", "tá pago", "segue comprovante") para NUNCA gerar cobrança duplicada!
+ * "pagamento de 50 feito", "tá pago", "segue comprovante") em tempo O(N), sem risco de ReDoS!
  */
 export function isPaymentConfirmationMessage(text: string): boolean {
+  if (typeof text !== 'string' || text.length > MAX_NLU_LEN) return false;
   const t = text.trim();
   if (!t) return false;
 
-  // Se o cliente pede explicitamente outro/novo Pix ("paguei ontem, quero outro pix de 80"), não é mero aviso
-  if (/\b(?:quero|gera|gerar|manda|mandar|preciso|faz|fazer)\s+(?:outro|novo|mais\s+um)\b/i.test(t)) {
+  if (
+    /\b(?:quero|gera|gerar|manda|mandar|preciso|faz|fazer)[ \t]+(?:outro|novo|mais[ \t]+um)\b/i.test(
+      t
+    )
+  ) {
     return false;
   }
 
   return (
     /\bpaguei\b/i.test(t) ||
-    /^\s*pago[!?.…\s]*$/i.test(t) ||
-    /\b(?:t[aá]|est[aá])\s+pago\b/i.test(t) ||
-    /\bpix\s+(?:pago|enviado|feito|realizado|efetuado|conclu[ií]do|transferido)\b/i.test(t) ||
-    /\bpagamento\s+(?:de\s+[^\n]{1,35}?\s+)?(?:feito|realizado|efetuado|enviado|conclu[ií]do|pago)\b/i.test(
+    /^[ \t]*pago[!?.…\s]*$/i.test(t) ||
+    /\b(?:t[aá]|est[aá])[ \t]+pago\b/i.test(t) ||
+    /\bpix[ \t]+(?:pago|enviado|feito|realizado|efetuado|conclu[ií]do|transferido)\b/i.test(t) ||
+    /\bpagamento[ \t]+(?:de[ \t]+(?:r\$[ \t]*)?[\d.,]+[ \t]+(?:reais[ \t]+)?)?(?:feito|realizado|efetuado|enviado|conclu[ií]do|pago)\b/i.test(
       t
     ) ||
-    /\b(?:j[aá]\s+)?fiz\s+(?:o\s+|a\s+|um\s+)?(?:pix|pagamento|dep[oó]sito|transfer[eê]ncia)\b/i.test(
+    /\b(?:j[aá][ \t]+)?fiz[ \t]+(?:o[ \t]+|a[ \t]+|um[ \t]+)?(?:pix|pagamento|dep[oó]sito|transfer[eê]ncia)\b/i.test(
       t
     ) ||
-    /\bacabei\s+de\s+(?:pagar|fazer|enviar|mandar|transferir)\b/i.test(t) ||
-    /\b(?:mandei|enviei|transferi)\s+(?:o\s+|os\s+|a\s+|as\s+|um\s+)?(?:pix|pagamento|valor|comprovante|r\$\s*\d|\d)/i.test(
+    /\bacabei[ \t]+de[ \t]+(?:pagar|fazer|enviar|mandar|transferir)\b/i.test(t) ||
+    /\b(?:mandei|enviei|transferi)[ \t]+(?:o[ \t]+|os[ \t]+|a[ \t]+|as[ \t]+|um[ \t]+)?(?:pix|pagamento|valor|comprovante|r\$[ \t]*\d|\d)/i.test(
       t
     ) ||
-    /\b(?:segue|ta\s+a[ií]|est[aá]\s+a[ií]|envio)\s+(?:o\s+)?comprovante\b/i.test(t)
+    /\b(?:segue|ta[ \t]+a[ií]|est[aá][ \t]+a[ií]|envio)[ \t]+(?:o[ \t]+)?comprovante\b/i.test(t)
   );
 }
 
