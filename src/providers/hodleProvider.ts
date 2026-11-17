@@ -10,6 +10,7 @@ import type {
 } from '../types/domain.ts';
 import {
   asPlainObject,
+  isPublicHttpsWebhookUrl,
   normalizeUtcIsoTimestamp,
   safeOptionalId,
   safePositiveNumber,
@@ -83,7 +84,7 @@ export class HodleProvider implements IPixCryptoProvider {
       destinationAddress: input.walletAddress,
       expirationMinutes: input.expirationMinutes,
     };
-    if (input.webhookUrl.startsWith('https://') && !input.webhookUrl.includes('localhost')) {
+    if (isPublicHttpsWebhookUrl(input.webhookUrl)) {
       bodyPayload.webhookUrl = input.webhookUrl;
     }
 

@@ -10,6 +10,7 @@ import type {
 } from '../types/domain.ts';
 import {
   asPlainObject,
+  isPublicHttpsWebhookUrl,
   safeOptionalId,
   safePositiveNumber,
   safePrimitiveString,
@@ -167,10 +168,9 @@ export class DePixAppProvider implements IPixCryptoProvider {
 
     const expMinutes = Number.isFinite(input.expirationMinutes) ? input.expirationMinutes : 15;
     const expiresInSeconds = Math.min(1200, Math.max(300, Math.round(expMinutes * 60)));
-    const publicHttpsCallback =
-      input.webhookUrl.startsWith('https://') && !input.webhookUrl.includes('localhost')
-        ? input.webhookUrl
-        : undefined;
+    const publicHttpsCallback = isPublicHttpsWebhookUrl(input.webhookUrl)
+      ? input.webhookUrl
+      : undefined;
 
     const estimatedNet = Math.max(0, Math.round((input.amountBrl * 0.98 - 0.99) * 100) / 100);
 

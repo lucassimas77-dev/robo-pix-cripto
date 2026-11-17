@@ -16,7 +16,9 @@ import {
   formatTimeSaoPaulo,
   isCancelCommand,
   isPaymentConfirmationMessage,
+  isPublicHttpsWebhookUrl,
   normalizeCommandText,
+  normalizeUtcIsoTimestamp,
   parseActiveOrderMenuReply,
   parseBrlAmountFromText,
   stripTrailingSlashes,
@@ -95,6 +97,40 @@ test('Parsing monetário trata pontuação final, milhar, horários, telefones, 
   assert.equal(parseBrlAmountFromText('conta 56789-0 quero pix'), null);
   assert.equal(parseBrlAmountFromText('pix de 50 (11) 98888-7777'), 50);
 
+  // Casos da Busca #12: CPF/CNPJ/CEP pontuado/RG/datas ISO, telefones sem hífen, +55 colado, mil/centavos
+  assert.equal(parseBrlAmountFromText('meu cpf é 005.200.789-00 quero fazer um pix'), null);
+  assert.equal(parseBrlAmountFromText('meu cep é 05.310-100 quero fazer um pix'), null);
+  assert.equal(parseBrlAmountFromText('meu rg é 12.345.678-9 quero fazer um pix'), null);
+  assert.equal(parseBrlAmountFromText('meu cpf é 123.456.789-00 manda pix de 50'), 50);
+  assert.equal(parseBrlAmountFromText('vou pagar dia 2026-11-17 R$ 50,00'), 50);
+  assert.equal(parseBrlAmountFromText('agencia 1234 conta 56789-0 quero pix'), null);
+  assert.equal(parseBrlAmountFromText('meu zap é (11) 988887777 quero fazer um pix'), null);
+  assert.equal(parseBrlAmountFromText('meu zap é 11 988887777 quero fazer um pix'), null);
+  assert.equal(parseBrlAmountFromText('meu zap é +55(11)98888-7777 quero fazer um pix'), null);
+  assert.equal(parseBrlAmountFromText('pix de 50 centavos'), 0.5);
+  assert.equal(parseBrlAmountFromText('tem taxa de 99 centavos no pix?'), null);
+  assert.equal(parseBrlAmountFromText('pix de 5 mil'), 5000);
+  assert.equal(parseBrlAmountFromText('pix de 1,5 mil'), 1500);
+  assert.equal(parseBrlAmountFromText('pix de 50 reais e 25 centavos'), 50.25);
+
+  // Confirmações de pagamento com valor antes de "pago" vs "eu pago 50" / "pago 50?"
+  assert.equal(isPaymentConfirmationMessage('R$ 50,00 pago!'), true);
+  assert.equal(isPaymentConfirmationMessage('50 reais pago no pix'), true);
+  assert.equal(isPaymentConfirmationMessage('Pago o pix de 50'), true);
+  assert.equal(isPaymentConfirmationMessage('Feito o pix de 50'), true);
+  assert.equal(isPaymentConfirmationMessage('Eu pago 50 no pix'), false);
+  assert.equal(isPaymentConfirmationMessage('Pago 50 no pix?'), false);
+
+  // Normalização UTC em microssegundos e rejeição de anos > 9999 + URL pública HTTPS sem IPs privados
+  assert.equal(normalizeUtcIsoTimestamp(1763337600000000), '2025-11-17T00:00:00.000Z');
+  assert.equal(normalizeUtcIsoTimestamp('+057847-12-12T00:00:00.000Z', '2026-01-01T00:00:00.000Z'), '2026-01-01T00:00:00.000Z');
+  assert.equal(isPublicHttpsWebhookUrl('https://robo-pix-cripto.onrender.com/webhooks/depixapp'), true);
+  assert.equal(isPublicHttpsWebhookUrl('https://127.0.0.1:3000/webhooks/depixapp'), false);
+  assert.equal(isPublicHttpsWebhookUrl('https://192.168.1.10/webhooks/depixapp'), false);
+  assert.equal(isPublicHttpsWebhookUrl('https://10.0.0.5/webhooks/depixapp'), false);
+  assert.equal(isPublicHttpsWebhookUrl('https://172.16.0.1/webhooks/depixapp'), false);
+  assert.equal(isPublicHttpsWebhookUrl('https://[::1]:3000/webhooks/depixapp'), false);
+
   // Proteção anti-ReDoS O(N) em mensagens gigantes (64 KB) + clampInt seguro
   const startRedos = performance.now();
   const adv1 = 'a' + '!'.repeat(60_000) + 'a';
@@ -102,10 +138,11 @@ test('Parsing monetário trata pontuação final, milhar, horários, telefones, 
   const adv3 = 'a' + ' '.repeat(50_000) + '1 pix '.repeat(1_000);
   const adv4 = '10' + ' '.repeat(1_950) + 'x';
   const adv5 = '1' + '.000'.repeat(495) + 'a';
+  const adv6 = '1.'.repeat(950) + 'a';
   const advSlashes = '/'.repeat(65_536) + 'a';
   assert.equal(stripTrailingSlashes(advSlashes).length, 65_537);
   assert.equal(stripTrailingSlashes('https://api.depixapp.com///'), 'https://api.depixapp.com');
-  for (const s of [adv1, adv2, adv3, adv4, adv5]) {
+  for (const s of [adv1, adv2, adv3, adv4, adv5, adv6]) {
     assert.equal(parseBrlAmountFromText(s), null);
     assert.equal(normalizeCommandText(s), '');
     assert.equal(isCancelCommand(s), false);
@@ -965,6 +1002,16 @@ test('ExpirationWatcher protege contra 503 transitório, respeita grace window d
       text: 'Bom dia! Quero fazer um novo pix',
     });
     assert.equal(repository.listRecentOrders().length, ordersBeforeStaleMsg);
+
+    // 8. Isolamento de provedor em findOrderByWebhookIds por externalId!
+    assert.equal(
+      repository.findOrderByWebhookIds({ provider: 'mock', externalId: 'ext_tz_offset' }),
+      null
+    );
+    assert.equal(
+      repository.findOrderByWebhookIds({ provider: 'hodle', externalId: 'ext_tz_offset' })?.id,
+      'ord_tz_offset'
+    );
   } finally {
     fakeServer.close();
     repository.close();

@@ -1,3 +1,5 @@
+import net from 'node:net';
+
 /**
  * Utilitários de extração segura de valores monetários em Reais (BRL),
  * coerção estrita de tipos/datas UTC, normalização de URLs e detecção de intenções em português
@@ -70,35 +72,93 @@ export function safePositiveNumber(val: unknown): number | undefined {
   return undefined;
 }
 
+function epochNumberToMs(num: number): number {
+  if (num >= 1e17) return num / 1_000_000; // nanossegundos -> ms
+  if (num >= 1e14) return num / 1_000; // microssegundos -> ms
+  if (num < 1e11) return num * 1_000; // segundos -> ms
+  return num; // milissegundos
+}
+
+function toCanonicalSqlIso(d: Date): string | undefined {
+  const ms = d.getTime();
+  if (!Number.isFinite(ms)) return undefined;
+  const year = d.getUTCFullYear();
+  // Restringe a anos de 4 dígitos (2000..9999) para preservar ordenação lexicográfica ASCII no SQLite!
+  if (year < 2000 || year > 9999) return undefined;
+  const iso = d.toISOString();
+  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(iso) ? iso : undefined;
+}
+
 /**
- * Normaliza qualquer timestamp (ISO com offset `-03:00`, UTC `Z` ou epoch numérico)
- * para formato canônico UTC `.toISOString()` (`YYYY-MM-DDTHH:mm:ss.sssZ`), garantindo
- * comparações lexicográficas exatas no SQLite e evitando `Invalid Date`.
+ * Normaliza qualquer timestamp (ISO com offset `-03:00`, UTC `Z` ou epoch em s/ms/us/ns)
+ * para formato canônico UTC de 24 caracteres (`YYYY-MM-DDTHH:mm:ss.sssZ`), garantindo
+ * comparações lexicográficas exatas no SQLite e evitando `+YYYYYY` ou `Invalid Date`.
  */
 export function normalizeUtcIsoTimestamp(raw: unknown, fallbackIso?: string): string | undefined {
   if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
-    const ms = raw < 1e11 ? raw * 1000 : raw;
-    const d = new Date(ms);
-    if (Number.isFinite(d.getTime())) {
-      return d.toISOString();
-    }
+    const iso = toCanonicalSqlIso(new Date(epochNumberToMs(raw)));
+    if (iso) return iso;
   } else if (typeof raw === 'string') {
     const trimmed = raw.trim();
-    if (/^\d{10,13}$/.test(trimmed)) {
-      const num = Number(trimmed);
-      const ms = num < 1e11 ? num * 1000 : num;
-      const d = new Date(ms);
-      if (Number.isFinite(d.getTime())) {
-        return d.toISOString();
-      }
+    if (/^\d{10,19}$/.test(trimmed)) {
+      const iso = toCanonicalSqlIso(new Date(epochNumberToMs(Number(trimmed))));
+      if (iso) return iso;
     } else if (trimmed) {
-      const d = new Date(trimmed);
-      if (Number.isFinite(d.getTime())) {
-        return d.toISOString();
-      }
+      const iso = toCanonicalSqlIso(new Date(trimmed));
+      if (iso) return iso;
     }
   }
   return fallbackIso;
+}
+
+export function isPublicHttpsWebhookUrl(rawUrl: string): boolean {
+  if (typeof rawUrl !== 'string' || !rawUrl.startsWith('https://')) return false;
+  try {
+    const u = new URL(rawUrl);
+    if (u.protocol !== 'https:') return false;
+    const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    if (
+      !host ||
+      host === 'localhost' ||
+      host.endsWith('.localhost') ||
+      host.endsWith('.local') ||
+      host.endsWith('.internal')
+    ) {
+      return false;
+    }
+    if (net.isIPv4(host)) {
+      const [a, b] = host.split('.').map(Number);
+      if (
+        a === 0 ||
+        a === 10 ||
+        a === 127 ||
+        (a === 169 && b === 254) ||
+        (a === 172 && b >= 16 && b <= 31) ||
+        (a === 192 && b === 168) ||
+        (a === 100 && b >= 64 && b <= 127) ||
+        a >= 224
+      ) {
+        return false;
+      }
+      return true;
+    }
+    if (net.isIPv6(host)) {
+      if (
+        host === '::1' ||
+        host === '::' ||
+        host.startsWith('fe80:') ||
+        host.startsWith('fc') ||
+        host.startsWith('fd') ||
+        host.startsWith('::ffff:')
+      ) {
+        return false;
+      }
+      return true;
+    }
+    return host.includes('.');
+  } catch {
+    return false;
+  }
 }
 
 export function onlyDigits(value: string): string {
@@ -168,14 +228,22 @@ export function parseBrlAmountFromText(text: string): number | null {
   if (!filteredWords) return null;
 
   const withoutContactsAndDates = filteredWords
-    // Remove telefones completos COM ou SEM parênteses no DDD (ex: "(11) 98888-7777", "11 98888-7777", "+55 21 98888-7777")
-    .replace(/(?:(?:\+\d{1,3}|\b55)[ \t]+)?(?:\(\d{2}\)|\b\d{2}\b)[ \t]*\d{4,5}[-\s]\d{4}\b/g, ' ')
-    // Remove CEPs, telefones sem DDD e contas/códigos hifenizados ("01310-100", "98888-7777", "56789-0")
-    .replace(/\b\d+-\d+\b/g, ' ')
-    .replace(/\b\d{3}\.\d{3}\.\d{3}-\d{2}\b/g, ' ')
-    .replace(/\b\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}\b/g, ' ')
-    .replace(/\b\d{8,}\b/g, ' ')
+    // 1) Remove documentos estruturados (CPF, CNPJ, CEP pontuado, RG) e datas ANTES de pares hifenizados!
+    .replace(/(?<!\d)\d{3}\.\d{3}\.\d{3}-\d{2}(?!\d)/g, ' ')
+    .replace(/(?<!\d)\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}(?!\d)/g, ' ')
+    .replace(/(?<!\d)\d{2}\.\d{3}-\d{3}(?!\d)/g, ' ')
+    .replace(/(?<!\d)\d{1,2}\.\d{3}\.\d{3}-[\dxX]\b/g, ' ')
     .replace(/\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/g, ' ')
+    .replace(/(?<!\d)(?:\d{4}-\d{1,2}-\d{1,2}|\d{1,2}-\d{1,2}-\d{2,4})(?!\d)/g, ' ')
+    .replace(/(?<![\d.,])\d+(?:-\d+){2,}(?![\d.,])/g, ' ')
+    // 2) Remove telefones completos COM ou SEM parênteses no DDD, com ou sem hífen central e com ou sem espaço após +55
+    .replace(
+      /(?:(?:\+\d{1,3}[ \t]*|\b55[ \t]+))?(?:\(\d{2}\)[ \t]*|\b\d{2}[ \t]+)\d{4,5}[-\s]?\d{4}\b/g,
+      ' '
+    )
+    // 3) Remove CEPs simples, telefones curtos e contas hifenizadas ("01310-100", "98888-7777", "56789-0") sem mutilar pontos/barras
+    .replace(/(?<![\d.,/-])\d+-\d+(?![\d.,/-])/g, ' ')
+    .replace(/\b\d{8,}\b/g, ' ')
     .replace(/\b\d{1,2}:\d{2}\b/g, ' ')
     .replace(/\b\d{1,2}h(?:\d{2})?\b/gi, ' ');
 
@@ -188,8 +256,13 @@ export function parseBrlAmountFromText(text: string): number | null {
     return null;
   }
 
-  // Rejeita expressões de soma/multiplicação ("R$ 50 + 30", "50 + 50") para não cobrar parcela parcial
-  if (/\d[ \t]*[+*][ \t]*(?:r\$[ \t]*)?\d/i.test(withoutContactsAndDates)) {
+  // Rejeita expressões de soma/multiplicação ("R$ 50 + 30", "50 + 50") e dúvidas sobre taxas/descontos
+  if (
+    /\d[ \t]*[+*][ \t]*(?:r\$[ \t]*)?\d/i.test(withoutContactsAndDates) ||
+    /\b(?:tem[ \t]+|qual[ \t]+(?:a[ \t]+)?|cobra[ \t]+)?(?:taxa|tarifa|juros|multa|desconto)[ \t]+d[eo][ \t]+(?:r\$[ \t]*)?\d/i.test(
+      withoutContactsAndDates
+    )
+  ) {
     return null;
   }
 
@@ -212,12 +285,25 @@ export function parseBrlAmountFromText(text: string): number | null {
   }
 
   const sanitized = withoutContactsAndDates
-    // Remove hashtags/códigos (#80, #150) e números de pedido/referência ("pedido 150", "pedido #80", "mesa 12")
+    // Remove hashtags/códigos (#80, #150), dados bancários (agência/conta) e números de pedido/referência ("pedido 150", "mesa 12")
     .replace(/#[ \t]*\d+(?:[.,]\d+)?/g, ' ')
     .replace(
-      /\b(?:pedido|ordem|protocolo|chamado|fatura|boleto|nota|nf|mesa|quarto|apto|apartamento|id|cod|c[oó]digo|item|op[cç][aã]o)(?:[ \t]+(?:#|n[º°o.]?[ \t]*)?|[ \t]*#[ \t]*)\d+(?:[.,]\d+)?\b/gi,
+      /\b(?:pedido|ordem|protocolo|chamado|fatura|boleto|nota|nf|mesa|quarto|apto|apartamento|id|cod|c[oó]digo|item|op[cç][aã]o|ag[eê]ncia|ag|conta|cc|banco|cpf|cnpj|cep|rg)(?:[ \t]+(?:#|n[º°o.]?[ \t]*)?|[ \t]*#[ \t]*)\d+(?:[.,]\d+)?\b/gi,
       ' '
     )
+    // Converte expressões monetárias com "reais e N centavos", "N centavos" e "N mil" para escala exata em Reais!
+    .replace(
+      /(?<![-\w@/.])(\d{1,6})[ \t]*(?:reais|real)[ \t]+e[ \t]+(\d{1,2})[ \t]*centavos?\b/gi,
+      (_m, r, c) => `R$ ${r},${String(c).padStart(2, '0')}`
+    )
+    .replace(
+      /(?<![-\w@/.])(\d{1,2})[ \t]*centavos?\b/gi,
+      (_m, c) => `R$ 0,${String(c).padStart(2, '0')}`
+    )
+    .replace(/(?<![-\w@/.])(\d{1,4}(?:[.,]\d{1,2})?)[ \t]*mil\b/gi, (_m, nStr) => {
+      const val = Number(String(nStr).replace(',', '.')) * 1000;
+      return Number.isFinite(val) ? String(Math.round(val * 100) / 100).replace('.', ',') : ' ';
+    })
     // Remove quantidades antes da palavra "pix" ("1 pix", "quero fazer 5 pix", "me manda 2 pix"), exceto após "R$"
     .replace(/(?<!r\$[ \t]*)\b\d+[ \t]+pix\b/gi, ' pix ')
     // Remove parcelas ("3x", "2 vezes", "3 parcelas") e durações ("15 min", "2 horas", "30 dias")
@@ -466,6 +552,20 @@ export function isPaymentConfirmationMessage(text: string): boolean {
   }
 
   if (normalizeCommandText(t) === 'pago') {
+    return true;
+  }
+
+  const isQuestion = t.endsWith('?');
+
+  if (
+    !isQuestion &&
+    (/^[ \t]*(?:pago|feito|realizado|efetuado|enviado|transferido)[ \t]+(?:o[ \t]+|meu[ \t]+)?(?:pix|pagamento|valor|r\$[ \t]*\d)/i.test(
+      t
+    ) ||
+      /(?:(?<!\w)r\$[ \t]*\d[\d.,]*|(?<![-\w.,])\d[\d.,]*)[ \t]*(?:reais[ \t]+)?(?:j[aá][ \t]+)?(?:foi[ \t]+|est[aá][ \t]+|t[aá][ \t]+)?pago\b/i.test(
+        t
+      ))
+  ) {
     return true;
   }
 

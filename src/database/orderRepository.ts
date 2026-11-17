@@ -245,8 +245,8 @@ export class OrderRepository {
   }): PixCryptoOrder | null {
     if (params.externalId) {
       const byExt = this.db
-        .prepare(`SELECT * FROM orders WHERE external_id = ?`)
-        .get(params.externalId) as Record<string, unknown> | undefined;
+        .prepare(`SELECT * FROM orders WHERE provider = ? AND external_id = ?`)
+        .get(params.provider, params.externalId) as Record<string, unknown> | undefined;
       if (byExt) return this.mapRowToOrder(byExt);
     }
 

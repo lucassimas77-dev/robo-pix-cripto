@@ -10,6 +10,7 @@ import type {
 } from '../types/domain.ts';
 import {
   asPlainObject,
+  isPublicHttpsWebhookUrl,
   normalizeUtcIsoTimestamp,
   safeOptionalId,
   safePositiveNumber,
@@ -59,7 +60,7 @@ export class NoxPayProvider implements IPixCryptoProvider {
       wallet_address: input.walletAddress,
       external_id: input.externalId,
     };
-    if (input.webhookUrl.startsWith('https://') && !input.webhookUrl.includes('localhost')) {
+    if (isPublicHttpsWebhookUrl(input.webhookUrl)) {
       bodyPayload.webhook = input.webhookUrl;
     }
 
