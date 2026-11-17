@@ -2555,3 +2555,193 @@ test('ExpirationWatcher protege contra 503 transitório, respeita grace window d
     repository.close();
   }
 });
+
+test('11. Busca #31: emojis WhatsApp, menu 1/2 ("É a 2", "2 🙏"), "e meio", "50pila", endereços compostos e falsos positivos', async () => {
+  // Bug 1: Menu 1 / 2 com emojis, verbos de ligação ("É a 2", "A opção é a 2", "Não é a 1, é a 2") e infinitivo ("Pode mandar a atual")
+  const menuResendCases: Array<[string, '1' | null]> = [
+    ['1 👍', '1'],
+    ['1✅', '1'],
+    ['1️⃣ 🙏', '1'],
+    ['É a 1', '1'],
+    ['Seria a 1', '1'],
+    ['A opção é a 1', '1'],
+    ['Não é a 2, é a 1', '1'],
+    ['Pode mandar a atual', null],
+    ['Mandar a atual', null],
+    ['Pode enviar o pix atual', null],
+  ];
+  for (const [msg, expectedDigit] of menuResendCases) {
+    assert.deepEqual(
+      parseActiveOrderMenuReply(msg),
+      { choice: 'resend', explicitOptionDigit: expectedDigit, inlineNewAmountBrl: null },
+      `Falha menu resend em: ${msg}`
+    );
+    assert.equal(hasUnparsedDigitsInMenuReply(msg), false, `Dígito extra falso em: ${msg}`);
+  }
+
+  const menuNewCases: Array<[string, '2' | null, number | null]> = [
+    ['2 🙏', '2', null],
+    ['2 👍', '2', null],
+    ['2✅', '2', null],
+    ['*2*✅', '2', null],
+    ['2️⃣ 🙏', '2', null],
+    ['É a 2', '2', null],
+    ['É 2', '2', null],
+    ['Seria a 2', '2', null],
+    ['A opção é a 2', '2', null],
+    ['Minha escolha é a 2', '2', null],
+    ['Não é a 1, é a 2', '2', null],
+    ['Não é 1, é 2', '2', null],
+  ];
+  for (const [msg, expectedDigit, expectedAmt] of menuNewCases) {
+    assert.deepEqual(
+      parseActiveOrderMenuReply(msg),
+      { choice: 'new', explicitOptionDigit: expectedDigit, inlineNewAmountBrl: expectedAmt },
+      `Falha menu new em: ${msg}`
+    );
+    assert.equal(hasUnparsedDigitsInMenuReply(msg), false, `Dígito extra falso em: ${msg}`);
+  }
+
+  // Bug 2: Comandos e acompanhamento pós-pedido com emojis e valores sem repetir "pix"
+  assert.equal(isExitCommand('sair 🙏'), true);
+  assert.equal(isCancelCommand('cancelar 👍'), true);
+  assert.equal(isHelpCommand('ajuda 🙏'), true);
+  assert.equal(isStatusQueryMessage('status 🙏'), true);
+  assert.equal(isStatusQueryMessage('Já caiu? 🙏'), true);
+  assert.equal(isPaymentConfirmationMessage('pago ✅'), true);
+  assert.equal(isPaymentConfirmationMessage('Já paguei ✅'), true);
+
+  const validFollowUps = [
+    'Já paguei ✅',
+    'Já paguei! 🙏',
+    'Tá pago ✅',
+    'pago ✅',
+    'status 🙏',
+    'Já tá pago!',
+    'Tá pago os 50!',
+    'Já foi pago os 50',
+    'Enviei os 50 reais',
+    'Mandei os 50 reais aí',
+    'Transferi os 50 reais agora',
+    'Já caiu os 50?',
+    'Caiu aí os 50 reais?',
+    'Entrou aí os 50?',
+    'Confirmou aí os 50?',
+  ];
+  for (const msg of validFollowUps) {
+    assert.equal(isPostOrderFollowUpMessage(msg), true, `Deveria aceitar follow-up: ${msg}`);
+  }
+
+  const invalidFollowUps = [
+    'Mandei 50 mensagens',
+    'Enviei 50 fotos',
+    'Paguei 50 no mercado hoje',
+    'Já chegou o pedido?',
+    'Confirmou a reunião?',
+    '🙏🙏',
+  ];
+  for (const msg of invalidFollowUps) {
+    assert.equal(isPostOrderFollowUpMessage(msg), false, `Não deveria aceitar follow-up: ${msg}`);
+  }
+
+  // Bug 3 & Bug 4: "e meio", "50pila", emojis colados ao valor e endereços compostos
+  const validAmounts: Array<[string, number]> = [
+    ['pix de dez reais e meio', 10.5],
+    ['pix de 50 reais e meio', 50.5],
+    ['pix de 15 e meio', 15.5],
+    ['pix de um e meio', 1.5],
+    ['pix de vinte contos e meio', 20.5],
+    ['pix de uma pila e meia', 1.5],
+    ['pix de 50pila', 50],
+    ['Pix de 50🚀', 50],
+    ['50,00✅', 50],
+    ['Quadra 10 Lote 5, manda pix de 80', 80],
+    ['Bloco 2 Sala 204, manda pix de 80', 80],
+    ['Andar 3 Sala 12, manda pix de 80', 80],
+    ['Av. Brasil 500 Sala 10, manda pix de 80', 80],
+    ['Torre 1 Apto 502, manda pix de 80', 80],
+  ];
+  for (const [msg, expected] of validAmounts) {
+    assert.equal(parseBrlAmountFromText(msg), expected, `Valor esperado ${expected} em: ${msg}`);
+  }
+
+  // Bug 5: Horários coloquiais, pechincha/preço, relatos de Pix expirado e transferências saintes
+  const blockedFalsePositives = [
+    '10 e meia mando o pix',
+    'Cinco e meia faço o pix',
+    'À 1 mando o pix',
+    'À 1 e meia mando o pix',
+    '15 pras 4 mando o pix',
+    '10 para as 5 mando o pix',
+    'Três e vinte faço o pix',
+    'À vista no pix sai por quanto? 80?',
+    'Faz 80 no pix?',
+    'No pix faz 80?',
+    'Fecha 80 no pix?',
+    'Deixa 80 no pix?',
+    'Dá pra fazer 80 no pix?',
+    'Consegue fazer 80 no pix?',
+    'Se eu pagar à vista no pix faz 80?',
+    'Pagando à vista no pix cai pra 80?',
+    'O pix de 50 expirou',
+    'Venceu o pix de 50',
+    'Expirou a cobrança de 50',
+    'Minha cobrança de 50 está vencida',
+    'Manda 50 na minha chave pix',
+    'Envia 50 pra minha chave pix',
+    'Faz um pix de 50 pra minha conta',
+    'Transfere 50 pro meu pix',
+    'Deposita 50 na minha conta bancária',
+    'Você me deve 50 no pix',
+    '2 e meio kg',
+    '2 quilos e meio por 50',
+  ];
+  for (const msg of blockedFalsePositives) {
+    assert.equal(parseBrlAmountFromText(msg), null, `Deveria bloquear falso positivo: ${msg}`);
+  }
+
+  for (const expMsg of [
+    'O pix de 50 expirou',
+    'Venceu o pix de 50',
+    'Expirou a cobrança de 50',
+    'Minha cobrança de 50 está vencida',
+  ]) {
+    assert.equal(isStatusQueryMessage(expMsg), true, `Deveria ser consulta de status: ${expMsg}`);
+  }
+
+  // Fluxo E2E no ConversationEngine + BaileysDirectManager (garante que "2 🙏" / "É a 2" gera R$ 80,00 e NUNCA R$ 2,00!)
+  const { repository, engine } = createPrivacyTestSetup();
+  try {
+    const baileys = new BaileysDirectManager(repository, 'data/test_wa_auth_unused', {
+      filterMode: 'keyword_only',
+    });
+    const phone = '5511944445555';
+
+    await engine.handleIncomingMessage({ phone, text: 'Pix de 60' });
+    assert.equal(repository.findActivePendingOrderByPhone(phone)?.amountBrl, 60);
+
+    await engine.handleIncomingMessage({ phone, text: 'Pix de 80' });
+    assert.equal(repository.getSession(phone).stage, 'AWAITING_ACTIVE_ORDER_DECISION');
+    assert.equal(repository.getSession(phone).pendingNewAmountBrl, 80);
+
+    await engine.handleIncomingMessage({ phone, text: '2 🙏' });
+    assert.equal(repository.findActivePendingOrderByPhone(phone)?.amountBrl, 80);
+
+    await engine.handleIncomingMessage({ phone, text: 'Pix de 95' });
+    await engine.handleIncomingMessage({ phone, text: 'É a 2' });
+    const settledTarget = repository.findActivePendingOrderByPhone(phone);
+    assert.equal(settledTarget?.amountBrl, 95);
+
+    // Após liquidar a cobrança, sessão fica IDLE e keyword_only aceita "Já paguei ✅" / "Já caiu os 95?" sem invadir "Mandei 50 mensagens"
+    repository.applySettlementUpdate({
+      orderId: settledTarget!.id,
+      newStatus: 'SETTLED_CRYPTO',
+    });
+    repository.saveSession({ phone, stage: 'IDLE', updatedAt: new Date().toISOString() });
+    assert.equal(baileys.shouldForwardIncomingMessage(phone, 'Já paguei ✅'), true);
+    assert.equal(baileys.shouldForwardIncomingMessage(phone, 'Já caiu os 95?'), true);
+    assert.equal(baileys.shouldForwardIncomingMessage(phone, 'Mandei 50 mensagens'), false);
+  } finally {
+    repository.close();
+  }
+});
