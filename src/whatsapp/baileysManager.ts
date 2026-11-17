@@ -12,7 +12,14 @@ import {
 import type { WASocket } from '@whiskeysockets/baileys';
 import { OrderRepository } from '../database/orderRepository.ts';
 import type { FilterMode } from '../types/domain.ts';
-import { onlyDigits } from '../utils/cpfCnpjValidator.ts';
+import {
+  isCancelCommand,
+  isExitCommand,
+  isHelpCommand,
+  isPaymentConfirmationMessage,
+  isStatusQueryMessage,
+  onlyDigits,
+} from '../utils/cpfCnpjValidator.ts';
 
 export type { FilterMode };
 
@@ -28,6 +35,7 @@ export interface BaileysStatusSnapshot {
 const MAX_UNSCANNED_QR_CYCLES = 3;
 const MAX_JID_MAP_ENTRIES = 5_000;
 const SESSION_FLOW_FRESHNESS_MS = 2 * 60 * 60 * 1000; // 2 horas
+const RECENT_ORDER_CONTEXT_MS = 24 * 60 * 60 * 1000; // 24 horas para comandos pós-pagamento ("já paguei", "status")
 
 export class BaileysDirectManager {
   private sock: WASocket | null = null;
@@ -293,9 +301,13 @@ export class BaileysDirectManager {
             this.rememberJid(senderDigits, remoteJid);
 
             if (this.allowedTestPhone) {
+              // Fail-closed: se o filtro está preenchido mas tem menos de 8 dígitos válidos, bloqueia tudo!
+              if (this.allowedTestPhone.length < 8) {
+                continue;
+              }
               const last8Allowed = this.allowedTestPhone.slice(-8);
               const last8Sender = senderDigits.slice(-8);
-              if (last8Allowed.length >= 8 && last8Allowed !== last8Sender) {
+              if (last8Allowed !== last8Sender) {
                 continue;
               }
             }
@@ -308,7 +320,22 @@ export class BaileysDirectManager {
                 session.stage !== 'IDLE' &&
                 Number.isFinite(sessionAgeMs) &&
                 sessionAgeMs < SESSION_FLOW_FRESHNESS_MS;
-              const isAlreadyInFlow = isFreshSession || activeOrder !== null;
+
+              const recentOrder = this.repository.findMostRecentOrderByPhone(senderDigits);
+              const hasRecentOrderContext =
+                recentOrder !== null &&
+                Date.now() - new Date(recentOrder.createdAt).getTime() < RECENT_ORDER_CONTEXT_MS;
+
+              const isPostOrderFollowUp =
+                hasRecentOrderContext &&
+                (isPaymentConfirmationMessage(text) ||
+                  isStatusQueryMessage(text) ||
+                  isCancelCommand(text) ||
+                  isExitCommand(text) ||
+                  isHelpCommand(text));
+
+              const isAlreadyInFlow =
+                isFreshSession || activeOrder !== null || isPostOrderFollowUp;
               const hasPixKeyword =
                 /\bpix\b|pagar|pagamento|chave\s*pix|gerar\s*pix|mand[ae]\s*o?\s*pix|comprovante/i.test(
                   text

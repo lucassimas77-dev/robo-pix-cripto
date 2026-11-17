@@ -3,8 +3,8 @@ import type { IWhatsAppGateway, PixCryptoOrder } from '../types/domain.ts';
 import { formatBrl } from '../utils/cpfCnpjValidator.ts';
 import type { ConversationEngine } from './conversationEngine.ts';
 
-const MAX_API_POLLS_PER_SWEEP = 3;
-const MAX_TOTAL_API_CALLS_PER_SWEEP = 5; // Teto global estrito (máx 20 req/min < 30 req/min da DePix)
+const MAX_API_POLLS_PER_SWEEP = 2;
+const MAX_TOTAL_API_CALLS_PER_SWEEP = 5; // Teto global estrito (máx 20 req/min < 30 req/min da DePix App)
 const PENDING_POLL_COOLDOWN_MS = 14_000;
 const CONFIRMED_POLL_COOLDOWN_MS = 120_000;
 
@@ -62,6 +62,7 @@ export class ExpirationWatcher {
       let warnedCount = 0;
       let apiCallsUsed = 0;
       const provider = this.engine?.getCryptoProvider();
+      const verifiedUnpaidIds = new Set<string>();
 
       const activeIds = new Set(activeOrders.map((o) => o.id));
       for (const cachedId of this.lastPolledAt.keys()) {
@@ -71,7 +72,7 @@ export class ExpirationWatcher {
       }
 
       const eligibleForPoll: PixCryptoOrder[] = [];
-      if (provider) {
+      if (provider && provider.name !== 'mock') {
         for (const order of activeOrders) {
           if (order.provider !== provider.name) continue;
           const lastMs = this.lastPolledAt.get(order.id) ?? 0;
@@ -91,7 +92,7 @@ export class ExpirationWatcher {
       );
 
       for (const order of activeOrders) {
-        // 1. Consulta ativa respeitando orçamento global por ciclo
+        // 1. Consulta periódica respeitando orçamento global por ciclo
         if (
           provider &&
           pollIdsThisCycle.has(order.id) &&
@@ -100,6 +101,13 @@ export class ExpirationWatcher {
           apiCallsUsed++;
           this.lastPolledAt.set(order.id, nowMs);
           const remote = await provider.checkChargeStatus(order.providerChargeId);
+          if (
+            remote?.status === 'SETTLED_CRYPTO' &&
+            order.providerChargeId.startsWith('prd_')
+          ) {
+            apiCallsUsed++;
+          }
+
           if (remote) {
             if (
               this.engine &&
@@ -119,11 +127,20 @@ export class ExpirationWatcher {
               continue;
             }
 
-            if (remote.status === 'PENDING' && remote.activePendingExpiresAt) {
-              this.repository.extendOrderExpiration(order.id, remote.activePendingExpiresAt);
-              if (remote.activePendingExpiresAt > order.expiresAt) {
-                order.expiresAt = remote.activePendingExpiresAt;
+            if (remote.status === 'PENDING') {
+              if (remote.activePendingExpiresAt) {
+                this.repository.extendOrderExpiration(order.id, remote.activePendingExpiresAt);
+                if (remote.activePendingExpiresAt > order.expiresAt) {
+                  order.expiresAt = remote.activePendingExpiresAt;
+                }
+                if (new Date(remote.activePendingExpiresAt).getTime() <= nowMs) {
+                  verifiedUnpaidIds.add(order.id);
+                }
+              } else {
+                verifiedUnpaidIds.add(order.id);
               }
+            } else if (remote.status === 'EXPIRED') {
+              verifiedUnpaidIds.add(order.id);
             }
           }
         }
@@ -138,21 +155,41 @@ export class ExpirationWatcher {
         const diffMs = expiresMs - nowMs;
 
         if (diffMs <= 0) {
-          // Se o provedor suporta consulta remota e não foi checado neste ciclo, exige 1 checagem final dentro do orçamento!
-          if (
-            provider &&
-            order.provider === provider.name &&
-            order.provider !== 'mock' &&
-            !pollIdsThisCycle.has(order.id)
-          ) {
-            if (apiCallsUsed >= MAX_TOTAL_API_CALLS_PER_SWEEP) {
-              // Adia 15s para o próximo ciclo em vez de expirar às cegas sem checar na API!
-              continue;
-            }
-            apiCallsUsed++;
-            this.lastPolledAt.set(order.id, nowMs);
-            const lastChance = await provider.checkChargeStatus(order.providerChargeId);
-            if (lastChance) {
+          const isRemoteProvider =
+            Boolean(provider) &&
+            order.provider === provider?.name &&
+            order.provider !== 'mock';
+          const needsRemoteDeactivate =
+            isRemoteProvider && Boolean(provider?.expireCharge) && !order.remoteDeactivated;
+
+          if (isRemoteProvider && provider) {
+            if (!verifiedUnpaidIds.has(order.id)) {
+              // Se já consultamos neste ciclo e veio `null` (429/503/timeout), nunca expira às cegas!
+              if (pollIdsThisCycle.has(order.id)) {
+                continue;
+              }
+
+              const callsNeeded = needsRemoteDeactivate ? 2 : 1;
+              if (apiCallsUsed + callsNeeded > MAX_TOTAL_API_CALLS_PER_SWEEP) {
+                // Adia 15s para o próximo ciclo garantindo poll + deactivate dentro do orçamento!
+                continue;
+              }
+
+              apiCallsUsed++;
+              this.lastPolledAt.set(order.id, nowMs);
+              const lastChance = await provider.checkChargeStatus(order.providerChargeId);
+              if (
+                lastChance?.status === 'SETTLED_CRYPTO' &&
+                order.providerChargeId.startsWith('prd_')
+              ) {
+                apiCallsUsed++;
+              }
+
+              // Em erro transitório de rede / 429 / 503 (`null`), preserva `PENDING` para o próximo ciclo!
+              if (!lastChance) {
+                continue;
+              }
+
               if (
                 this.engine &&
                 (lastChance.status === 'SETTLED_CRYPTO' ||
@@ -170,6 +207,7 @@ export class ExpirationWatcher {
                 });
                 continue;
               }
+
               if (
                 lastChance.status === 'PENDING' &&
                 lastChance.activePendingExpiresAt &&
@@ -178,6 +216,11 @@ export class ExpirationWatcher {
                 this.repository.extendOrderExpiration(order.id, lastChance.activePendingExpiresAt);
                 continue;
               }
+            } else if (
+              needsRemoteDeactivate &&
+              apiCallsUsed >= MAX_TOTAL_API_CALLS_PER_SWEEP
+            ) {
+              continue;
             }
           }
 
@@ -187,14 +230,14 @@ export class ExpirationWatcher {
           const updated = this.repository.updateOrderStatus(order.id, 'EXPIRED', effectiveNowIso);
           if (updated) {
             expiredCount++;
-            if (
-              provider &&
-              provider.name === order.provider &&
-              provider.expireCharge &&
-              apiCallsUsed < MAX_TOTAL_API_CALLS_PER_SWEEP
-            ) {
-              apiCallsUsed++;
-              await provider.expireCharge(order.providerChargeId);
+            if (needsRemoteDeactivate && provider?.expireCharge) {
+              if (apiCallsUsed < MAX_TOTAL_API_CALLS_PER_SWEEP) {
+                apiCallsUsed++;
+                const ok = await provider.expireCharge(order.providerChargeId);
+                if (ok) {
+                  this.repository.markRemoteDeactivated(order.id);
+                }
+              }
             }
 
             // Coloca sessão em `AWAITING_AMOUNT` para que o cliente possa responder o valor direto no modo `keyword_only`!
@@ -236,6 +279,23 @@ export class ExpirationWatcher {
             } catch (err) {
               console.error('[ExpirationWatcher] Erro ao notificar aviso prévio:', err);
             }
+          }
+        }
+      }
+
+      // 4. Fila persistente de retentativa de `/deactivate` para cobranças EXPIRED / CANCELLED / FAILED
+      if (provider && provider.expireCharge && apiCallsUsed < MAX_TOTAL_API_CALLS_PER_SWEEP) {
+        const remainingBudget = MAX_TOTAL_API_CALLS_PER_SWEEP - apiCallsUsed;
+        const pendingDeactivations = this.repository.listPendingRemoteDeactivations(
+          provider.name,
+          remainingBudget
+        );
+        for (const staleOrder of pendingDeactivations) {
+          if (apiCallsUsed >= MAX_TOTAL_API_CALLS_PER_SWEEP) break;
+          apiCallsUsed++;
+          const ok = await provider.expireCharge(staleOrder.providerChargeId);
+          if (ok) {
+            this.repository.markRemoteDeactivated(staleOrder.id);
           }
         }
       }

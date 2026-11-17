@@ -152,6 +152,7 @@ export class NoxPayProvider implements IPixCryptoProvider {
           signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
         }
       );
+      if (res.status === 404) return { status: 'EXPIRED' };
       if (!res.ok) return null;
       const obj = (await res.json()) as Record<string, unknown>;
       const st = String(obj.status ?? '').toUpperCase();
@@ -171,7 +172,7 @@ export class NoxPayProvider implements IPixCryptoProvider {
       if (st === 'EXPIRED') {
         return { status: 'EXPIRED' };
       }
-      return null;
+      return { status: 'PENDING' };
     } catch {
       return null;
     }

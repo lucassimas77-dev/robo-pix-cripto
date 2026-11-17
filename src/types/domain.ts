@@ -35,6 +35,7 @@ export interface PixCryptoOrder {
   paymentUrl?: string;
   status: OrderStatus;
   warningSent: boolean;
+  remoteDeactivated?: boolean;
   txHash?: string;
   endToEndId?: string;
   createdAt: string; // ISO 8601
@@ -111,7 +112,7 @@ export interface IPixCryptoProvider {
   ): boolean;
   parseWebhookPayload(payload: unknown): WebhookSettlementEvent | null;
   checkChargeStatus(providerChargeId: string): Promise<ChargePollResult | null>;
-  expireCharge?(providerChargeId: string): Promise<void>;
+  expireCharge?(providerChargeId: string): Promise<boolean>;
 }
 
 export interface RuntimeAccountSettings {

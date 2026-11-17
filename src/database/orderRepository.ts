@@ -43,6 +43,7 @@ export class OrderRepository {
         payment_url TEXT,
         status TEXT NOT NULL,
         warning_sent INTEGER NOT NULL DEFAULT 0,
+        remote_deactivated INTEGER NOT NULL DEFAULT 0,
         tx_hash TEXT,
         end_to_end_id TEXT,
         created_at TEXT NOT NULL,
@@ -52,6 +53,7 @@ export class OrderRepository {
 
       CREATE INDEX IF NOT EXISTS idx_orders_phone_status ON orders(customer_phone, status);
       CREATE INDEX IF NOT EXISTS idx_orders_provider_charge ON orders(provider, provider_charge_id);
+      CREATE INDEX IF NOT EXISTS idx_orders_deactivation ON orders(provider, status, remote_deactivated);
 
       CREATE TABLE IF NOT EXISTS chat_sessions (
         phone TEXT PRIMARY KEY,
@@ -89,6 +91,7 @@ export class OrderRepository {
     const safeAlter = [
       `ALTER TABLE orders ADD COLUMN customer_jid TEXT`,
       `ALTER TABLE orders ADD COLUMN payment_url TEXT`,
+      `ALTER TABLE orders ADD COLUMN remote_deactivated INTEGER NOT NULL DEFAULT 0`,
       `ALTER TABLE chat_sessions ADD COLUMN customer_jid TEXT`,
     ];
     for (const sql of safeAlter) {
@@ -135,16 +138,54 @@ export class OrderRepository {
     return settings;
   }
 
+  /**
+   * Grava `adminPinHash` de forma atômica apenas se ainda não houver senha configurada no banco.
+   * Impede condições de corrida (TOCTOU) em `/api/auth/setup`.
+   */
+  public trySetupInitialAdminPinHash(
+    pinHash: string,
+    defaults: RuntimeAccountSettings
+  ): boolean {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const current = this.getRuntimeSettings(defaults);
+      if (current.adminPinHash) {
+        this.db.exec('COMMIT');
+        return false;
+      }
+      this.saveRuntimeSettings({
+        ...current,
+        adminPinHash: pinHash,
+      });
+      this.db.exec('COMMIT');
+      return true;
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        // Ignora
+      }
+      throw err;
+    }
+  }
+
   public createOrder(order: PixCryptoOrder): void {
+    const needsRemoteDeactivation =
+      order.provider === 'depixapp' && order.providerChargeId.startsWith('prd_');
+    const remoteDeactivatedFlag =
+      order.remoteDeactivated !== undefined
+        ? order.remoteDeactivated
+        : !needsRemoteDeactivation;
+
     const stmt = this.db.prepare(`
       INSERT INTO orders (
         id, external_id, provider, provider_charge_id, customer_phone, customer_jid,
         customer_name, payer_document, amount_brl, estimated_crypto_amount,
         crypto_asset, crypto_network, wallet_address, pix_copy_paste,
         pix_qr_code_base64, pix_qr_code_url, payment_url, status, warning_sent,
-        tx_hash, end_to_end_id, created_at, expires_at, paid_at
+        remote_deactivated, tx_hash, end_to_end_id, created_at, expires_at, paid_at
       ) VALUES (
-        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
       )
     `);
 
@@ -168,6 +209,7 @@ export class OrderRepository {
       order.paymentUrl ?? null,
       order.status,
       order.warningSent ? 1 : 0,
+      remoteDeactivatedFlag ? 1 : 0,
       order.txHash ?? null,
       order.endToEndId ?? null,
       order.createdAt,
@@ -259,6 +301,29 @@ export class OrderRepository {
     return Number(result.changes) > 0;
   }
 
+  public markRemoteDeactivated(orderId: string): void {
+    this.db
+      .prepare(`UPDATE orders SET remote_deactivated = 1 WHERE id = ?`)
+      .run(orderId);
+  }
+
+  public listPendingRemoteDeactivations(
+    provider: SupportedProviderName,
+    limit = 5
+  ): PixCryptoOrder[] {
+    const rows = this.db
+      .prepare(`
+        SELECT * FROM orders
+        WHERE provider = ?
+          AND status IN ('EXPIRED', 'CANCELLED', 'FAILED')
+          AND remote_deactivated = 0
+        ORDER BY expires_at ASC
+        LIMIT ?
+      `)
+      .all(provider, limit) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.mapRowToOrder(r));
+  }
+
   public extendOrderExpiration(orderId: string, newExpiresAtIso: string): void {
     this.db
       .prepare(
@@ -338,6 +403,9 @@ export class OrderRepository {
           ? current.paidAt || new Date().toISOString()
           : (current.paidAt ?? null);
 
+      const markSettledDeact =
+        params.newStatus === 'PIX_CONFIRMED' || params.newStatus === 'SETTLED_CRYPTO' ? 1 : null;
+
       this.db
         .prepare(`
           UPDATE orders
@@ -345,6 +413,7 @@ export class OrderRepository {
               tx_hash = COALESCE(?, tx_hash),
               end_to_end_id = COALESCE(?, end_to_end_id),
               estimated_crypto_amount = COALESCE(?, estimated_crypto_amount),
+              remote_deactivated = COALESCE(?, remote_deactivated),
               paid_at = ?
           WHERE id = ?
         `)
@@ -353,6 +422,7 @@ export class OrderRepository {
           params.txHash ?? null,
           params.endToEndId ?? null,
           params.cryptoAmount ?? null,
+          markSettledDeact,
           paidAt,
           params.orderId
         );
@@ -493,6 +563,7 @@ export class OrderRepository {
       paymentUrl: row.payment_url != null ? String(row.payment_url) : undefined,
       status: row.status as OrderStatus,
       warningSent: Number(row.warning_sent) === 1,
+      remoteDeactivated: Number(row.remote_deactivated) === 1,
       txHash: row.tx_hash != null ? String(row.tx_hash) : undefined,
       endToEndId: row.end_to_end_id != null ? String(row.end_to_end_id) : undefined,
       createdAt: String(row.created_at),

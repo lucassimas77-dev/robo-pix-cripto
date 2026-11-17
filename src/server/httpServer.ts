@@ -62,6 +62,42 @@ function maskPhoneForUi(phone: string): string {
   return `${phone.slice(0, 4)}****${phone.slice(-4)}`;
 }
 
+/**
+ * Mascara chaves secretas sem vazar entropia de chaves curtas.
+ * Chaves com menos de 20 caracteres exibem apenas marcador opaco.
+ */
+function maskSecretKeyPreview(rawKey: string): string {
+  const k = rawKey.trim();
+  if (!k) return '';
+  if (k.startsWith('sk_test_') || k.startsWith('sk_live_')) {
+    if (k.length < 24) return '•••••••• (Chave salva)';
+    return `${k.slice(0, 8)}••••${k.slice(-4)}`;
+  }
+  if (k.length < 20) return '•••••••• (Chave salva)';
+  return `${k.slice(0, 4)}••••${k.slice(-4)}`;
+}
+
+function validateAllowedPhoneInput(
+  raw: unknown
+): { ok: true; cleanDigits?: string } | { ok: false; error: string } {
+  if (raw === undefined || raw === null) {
+    return { ok: true, cleanDigits: undefined };
+  }
+  const trimmed = String(raw).trim();
+  if (trimmed === '') {
+    return { ok: true, cleanDigits: '' };
+  }
+  const digits = trimmed.replace(/\D/g, '');
+  if (digits.length < 10 || digits.length > 15) {
+    return {
+      ok: false,
+      error:
+        'Informe o telefone completo com DDI/DDD (10 a 15 dígitos, ex: 5511999998888) ou deixe o campo em branco.',
+    };
+  }
+  return { ok: true, cleanDigits: digits };
+}
+
 function extractClientIp(req: http.IncomingMessage): string {
   // No Render/Cloudflare, o ÚLTIMO IP em X-Forwarded-For é o anexado pelo proxy reverso confiável
   const xff = req.headers['x-forwarded-for'];
@@ -107,6 +143,20 @@ export function createAppHttpServer(params: {
   const sessionSigningSecret = crypto.randomBytes(32).toString('hex');
   const loginAttempts = new Map<string, { count: number; resetAt: number }>();
   let globalLoginFailWindow = { count: 0, resetAt: 0 };
+  let setupInProgress = false;
+
+  const getRuntimeDefaults = (): RuntimeAccountSettings => ({
+    provider: config.cryptoProvider,
+    apiKey: getDefaultApiKey(config.cryptoProvider),
+    webhookSecret: getDefaultWebhookSecret(config.cryptoProvider),
+    walletAddress: config.walletAddress,
+    walletAsset: config.walletAsset,
+    walletNetwork: config.walletNetwork,
+    pixExpirationMinutes: config.pixExpirationMinutes,
+    adminWhatsappPhone: config.adminWhatsappPhone,
+    waFilterMode: 'keyword_only',
+    waAllowedTestPhone: '',
+  });
 
   const pruneLoginAttempts = (now: number): void => {
     for (const [ip, entry] of loginAttempts) {
@@ -136,18 +186,7 @@ export function createAppHttpServer(params: {
   };
 
   const getEffectiveAccount = (): RuntimeAccountSettings => {
-    const saved = repository.getRuntimeSettings({
-      provider: config.cryptoProvider,
-      apiKey: getDefaultApiKey(config.cryptoProvider),
-      webhookSecret: getDefaultWebhookSecret(config.cryptoProvider),
-      walletAddress: config.walletAddress,
-      walletAsset: config.walletAsset,
-      walletNetwork: config.walletNetwork,
-      pixExpirationMinutes: config.pixExpirationMinutes,
-      adminWhatsappPhone: config.adminWhatsappPhone,
-      waFilterMode: 'keyword_only',
-      waAllowedTestPhone: '',
-    });
+    const saved = repository.getRuntimeSettings(getRuntimeDefaults());
     return {
       ...saved,
       apiKey: saved.apiKey?.trim() || getDefaultApiKey(saved.provider),
@@ -285,28 +324,38 @@ export function createAppHttpServer(params: {
       }
 
       if (method === 'POST' && pathname === '/api/auth/setup') {
-        if (isPasswordConfigured()) {
+        if (isPasswordConfigured() || setupInProgress) {
           sendJson(res, 403, { error: 'A senha do painel já foi configurada.' });
           return;
         }
-        const body = parseJsonObject(await readRawBody(req));
-        const newPassword = String(body.password || '').trim();
-        if (newPassword.length < 4 || newPassword.length > 128) {
-          sendJson(res, 400, { error: 'Escolha uma senha entre 4 e 128 caracteres.' });
+        setupInProgress = true;
+        try {
+          const body = parseJsonObject(await readRawBody(req));
+          const newPassword = String(body.password || '').trim();
+          if (newPassword.length < 4 || newPassword.length > 128) {
+            sendJson(res, 400, { error: 'Escolha uma senha entre 4 e 128 caracteres.' });
+            return;
+          }
+
+          if (config.adminPassword) {
+            sendJson(res, 403, { error: 'A senha do painel já foi configurada.' });
+            return;
+          }
+
+          const pinHash = await hashPasswordAsync(newPassword);
+          const created = repository.trySetupInitialAdminPinHash(pinHash, getRuntimeDefaults());
+          if (!created) {
+            sendJson(res, 403, { error: 'A senha do painel já foi configurada.' });
+            return;
+          }
+
+          const token = createSessionToken();
+          res.setHeader('Set-Cookie', buildSessionCookie(req, token, SESSION_TTL_SECONDS));
+          sendJson(res, 200, { ok: true, token });
           return;
+        } finally {
+          setupInProgress = false;
         }
-
-        const pinHash = await hashPasswordAsync(newPassword);
-        const current = getEffectiveAccount();
-        repository.saveRuntimeSettings({
-          ...current,
-          adminPinHash: pinHash,
-        });
-
-        const token = createSessionToken();
-        res.setHeader('Set-Cookie', buildSessionCookie(req, token, SESSION_TTL_SECONDS));
-        sendJson(res, 200, { ok: true, token });
-        return;
       }
 
       if (method === 'POST' && pathname === '/api/auth/login') {
@@ -418,12 +467,7 @@ export function createAppHttpServer(params: {
           hasApiKey: hasKey,
           hasWebhookSecret,
           isTestKey: hasKey && acc.apiKey.trim().startsWith('sk_test_'),
-          apiKeyPreview:
-            hasKey && acc.apiKey.length >= 10
-              ? `${acc.apiKey.slice(0, 7)}...${acc.apiKey.slice(-4)}`
-              : hasKey
-                ? 'Chave salva'
-                : '',
+          apiKeyPreview: hasKey ? maskSecretKeyPreview(acc.apiKey) : '',
         });
         return;
       }
@@ -533,13 +577,19 @@ export function createAppHttpServer(params: {
         const rawBody = await readRawBody(req);
         if (rawBody.trim()) {
           const body = parseJsonObject(rawBody);
+          const phoneCheck = validateAllowedPhoneInput(body.allowedTestPhone);
+          if (!phoneCheck.ok) {
+            sendJson(res, 400, { error: phoneCheck.error });
+            return;
+          }
           const filterMode: FilterMode | undefined =
             body.filterMode === 'all' || body.filterMode === 'keyword_only'
               ? body.filterMode
               : undefined;
-          const allowedTestPhone =
-            body.allowedTestPhone != null ? String(body.allowedTestPhone) : undefined;
-          const updatedWa = baileys.updateFilterSettings({ filterMode, allowedTestPhone });
+          const updatedWa = baileys.updateFilterSettings({
+            filterMode,
+            allowedTestPhone: phoneCheck.cleanDigits,
+          });
 
           const currentAcc = getEffectiveAccount();
           repository.saveRuntimeSettings({
@@ -559,13 +609,19 @@ export function createAppHttpServer(params: {
           return;
         }
         const body = parseJsonObject(await readRawBody(req));
+        const phoneCheck = validateAllowedPhoneInput(body.allowedTestPhone);
+        if (!phoneCheck.ok) {
+          sendJson(res, 400, { error: phoneCheck.error });
+          return;
+        }
         const filterMode: FilterMode | undefined =
           body.filterMode === 'all' || body.filterMode === 'keyword_only'
             ? body.filterMode
             : undefined;
-        const allowedTestPhone =
-          body.allowedTestPhone != null ? String(body.allowedTestPhone) : undefined;
-        const status = baileys.updateFilterSettings({ filterMode, allowedTestPhone });
+        const status = baileys.updateFilterSettings({
+          filterMode,
+          allowedTestPhone: phoneCheck.cleanDigits,
+        });
 
         const currentAcc = getEffectiveAccount();
         repository.saveRuntimeSettings({

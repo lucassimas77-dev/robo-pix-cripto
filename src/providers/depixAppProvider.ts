@@ -11,8 +11,15 @@ import type {
 
 const FETCH_TIMEOUT_MS = 15_000;
 const WEBHOOK_TOLERANCE_SECONDS = 300; // 5 minutos contra replay attacks
+const DEPIX_RAIL_GRACE_MS = 15 * 60_000; // Janela de graça oficial de 15 min do rail Liquid (depix_docs.md:1223)
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const MAX_INTERACTIVE_REQ_PER_MIN = 28; // Estritamente abaixo do limite de 30 req/min por lojista da DePix App
+const MAX_BACKGROUND_REQ_PER_MIN = 20; // Reserva margem garantida para novas cobranças no WhatsApp
+const MAX_TRACKED_API_KEYS = 100;
 
 export class DePixAppProvider implements IPixCryptoProvider {
+  private static readonly requestWindows = new Map<string, number[]>();
+
   public readonly name = 'depixapp' as const;
   public readonly minAmountBrl = 5;
   public readonly maxAmountBrl = 6_000;
@@ -38,6 +45,39 @@ export class DePixAppProvider implements IPixCryptoProvider {
     };
   }
 
+  public static clearRateLimitWindows(): void {
+    DePixAppProvider.requestWindows.clear();
+  }
+
+  private tryAcquireRateSlot(priority: 'interactive' | 'background'): boolean {
+    const bucketKey = this.config.apiKey || '__default__';
+    const now = Date.now();
+    const cutoff = now - RATE_LIMIT_WINDOW_MS;
+
+    const existing = DePixAppProvider.requestWindows.get(bucketKey) ?? [];
+    const active = existing.filter((ts) => ts > cutoff);
+
+    const cap =
+      priority === 'interactive' ? MAX_INTERACTIVE_REQ_PER_MIN : MAX_BACKGROUND_REQ_PER_MIN;
+    if (active.length >= cap) {
+      DePixAppProvider.requestWindows.set(bucketKey, active);
+      return false;
+    }
+
+    active.push(now);
+    if (
+      !DePixAppProvider.requestWindows.has(bucketKey) &&
+      DePixAppProvider.requestWindows.size >= MAX_TRACKED_API_KEYS
+    ) {
+      const oldestKey = DePixAppProvider.requestWindows.keys().next().value;
+      if (oldestKey !== undefined) {
+        DePixAppProvider.requestWindows.delete(oldestKey);
+      }
+    }
+    DePixAppProvider.requestWindows.set(bucketKey, active);
+    return true;
+  }
+
   public isTestKey(): boolean {
     return this.config.apiKey.startsWith('sk_test_');
   }
@@ -49,6 +89,37 @@ export class DePixAppProvider implements IPixCryptoProvider {
   private shouldRejectSandboxItem(isLiveField: unknown): boolean {
     if (this.isTestKey()) return false;
     return isLiveField === false || isLiveField === 0;
+  }
+
+  private extractCryptoAmountFromItem(item: Record<string, unknown>): number | undefined {
+    const depixBlock =
+      typeof item.depix === 'object' && item.depix
+        ? (item.depix as Record<string, unknown>)
+        : undefined;
+
+    if (item.depix_due_cents != null && Number.isFinite(Number(item.depix_due_cents))) {
+      return Number(item.depix_due_cents) / 100;
+    }
+    if (depixBlock?.amount_cents != null && Number.isFinite(Number(depixBlock.amount_cents))) {
+      return Number(depixBlock.amount_cents) / 100;
+    }
+    if (item.amount_received != null && Number.isFinite(Number(item.amount_received))) {
+      return Number(item.amount_received) / 100;
+    }
+    if (item.net_amount != null && Number.isFinite(Number(item.net_amount))) {
+      return Number(item.net_amount) / 100;
+    }
+    return undefined;
+  }
+
+  private computeEffectivePendingExpiresMs(item: Record<string, unknown>): number {
+    if (!item.expires_at) return 0;
+    const baseMs = new Date(String(item.expires_at)).getTime();
+    if (!Number.isFinite(baseMs)) return 0;
+    const isDepixRail =
+      String(item.payment_method ?? '').toLowerCase() === 'depix' ||
+      Boolean(item.depix && typeof item.depix === 'object');
+    return baseMs + (isDepixRail ? DEPIX_RAIL_GRACE_MS : 0);
   }
 
   public async createCharge(input: CreateChargeInput): Promise<CreateChargeOutput> {
@@ -64,6 +135,12 @@ export class DePixAppProvider implements IPixCryptoProvider {
     }
     if (amountInCents > 600_000) {
       throw new Error('MAX_AMOUNT: O valor máximo por cobrança na DePix App é de R$ 6.000,00.');
+    }
+
+    if (!this.tryAcquireRateSlot('interactive')) {
+      throw new Error(
+        'RATE_LIMITED: Limite de segurança de requisições por minuto atingido. Aguarde alguns segundos e tente novamente.'
+      );
     }
 
     const expMinutes = Number.isFinite(input.expirationMinutes) ? input.expirationMinutes : 15;
@@ -264,18 +341,18 @@ export class DePixAppProvider implements IPixCryptoProvider {
           : data.txid
             ? String(data.txid)
             : undefined,
-      cryptoAmount:
-        data.amount_received != null
-          ? Number(data.amount_received) / 100
-          : data.net_amount != null
-            ? Number(data.net_amount) / 100
-            : undefined,
+      cryptoAmount: this.extractCryptoAmountFromItem(data),
       rawEventName: eventName || rawStatus,
     };
   }
 
+  /**
+   * Retorna `null` APENAS em falhas transitórias/rede/rate-limit/credenciais (nunca expira às cegas!).
+   * Quando a API responde HTTP 200 sem pagamentos ainda, retorna `{ status: 'PENDING' }`.
+   */
   public async checkChargeStatus(providerChargeId: string): Promise<ChargePollResult | null> {
     if (!this.config.apiKey || !providerChargeId) return null;
+    if (!this.tryAcquireRateSlot('background')) return null;
 
     try {
       if (providerChargeId.startsWith('prd_')) {
@@ -289,14 +366,18 @@ export class DePixAppProvider implements IPixCryptoProvider {
             signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
           }
         );
+        if (res.status === 404) return { status: 'EXPIRED' };
         if (!res.ok) return null;
+
         const root = (await res.json()) as Record<string, unknown>;
         const rawList = Array.isArray(root.checkouts)
           ? (root.checkouts as Array<Record<string, unknown>>)
           : [];
 
         const validItems = rawList.filter((item) => !this.shouldRejectSandboxItem(item.is_live));
-        if (validItems.length === 0) return null;
+        if (validItems.length === 0) {
+          return { status: 'PENDING' };
+        }
 
         // 1ª prioridade: `completed`
         const completedItem = validItems.find(
@@ -306,10 +387,16 @@ export class DePixAppProvider implements IPixCryptoProvider {
           let txHash = completedItem.blockchain_tx_id
             ? String(completedItem.blockchain_tx_id)
             : undefined;
-          if (!txHash && completedItem.id) {
-            txHash = await this.fetchCheckoutBlockchainTxId(String(completedItem.id));
+          let cryptoAmount = this.extractCryptoAmountFromItem(completedItem);
+
+          if ((!txHash || cryptoAmount === undefined) && completedItem.id) {
+            const details = await this.fetchCheckoutSettlementDetails(String(completedItem.id));
+            if (!txHash && details.txHash) txHash = details.txHash;
+            if (cryptoAmount === undefined && details.cryptoAmount !== undefined) {
+              cryptoAmount = details.cryptoAmount;
+            }
           }
-          return { status: 'SETTLED_CRYPTO', txHash };
+          return { status: 'SETTLED_CRYPTO', txHash, cryptoAmount };
         }
 
         // 2ª prioridade: `processing` | `approved`
@@ -321,17 +408,20 @@ export class DePixAppProvider implements IPixCryptoProvider {
           return { status: 'PIX_CONFIRMED' };
         }
 
-        // 3ª prioridade: `pending` ainda válido
+        // 3ª prioridade: `pending` ainda válido (respeitando a grace window de 15 min no rail `depix`)
         const nowMs = Date.now();
-        const activePending = validItems.find((item) => {
-          if (String(item.status ?? '').toLowerCase() !== 'pending') return false;
-          if (!item.expires_at) return false;
-          return new Date(String(item.expires_at)).getTime() > nowMs;
-        });
-        if (activePending && activePending.expires_at) {
+        let latestPendingExpMs = 0;
+        for (const item of validItems) {
+          if (String(item.status ?? '').toLowerCase() !== 'pending') continue;
+          const effMs = this.computeEffectivePendingExpiresMs(item);
+          if (effMs > nowMs && effMs > latestPendingExpMs) {
+            latestPendingExpMs = effMs;
+          }
+        }
+        if (latestPendingExpMs > nowMs) {
           return {
             status: 'PENDING',
-            activePendingExpiresAt: String(activePending.expires_at),
+            activePendingExpiresAt: new Date(latestPendingExpMs).toISOString(),
           };
         }
 
@@ -347,7 +437,7 @@ export class DePixAppProvider implements IPixCryptoProvider {
           return { status: 'FAILED', rejectionReasons: reasons };
         }
 
-        return null;
+        return { status: 'PENDING' };
       }
 
       const res = await fetch(
@@ -360,7 +450,9 @@ export class DePixAppProvider implements IPixCryptoProvider {
           signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
         }
       );
+      if (res.status === 404) return { status: 'EXPIRED' };
       if (!res.ok) return null;
+
       const root = (await res.json()) as Record<string, unknown>;
       const chk =
         typeof root.checkout === 'object' && root.checkout
@@ -368,7 +460,7 @@ export class DePixAppProvider implements IPixCryptoProvider {
           : root;
 
       if (this.shouldRejectSandboxItem(chk.is_live)) {
-        return null;
+        return { status: 'PENDING' };
       }
 
       const rawStatus = String(chk.status ?? '').toLowerCase();
@@ -376,6 +468,7 @@ export class DePixAppProvider implements IPixCryptoProvider {
         return {
           status: 'SETTLED_CRYPTO',
           txHash: chk.blockchain_tx_id ? String(chk.blockchain_tx_id) : undefined,
+          cryptoAmount: this.extractCryptoAmountFromItem(chk),
         };
       }
       if (rawStatus === 'processing' || rawStatus === 'approved') {
@@ -384,22 +477,37 @@ export class DePixAppProvider implements IPixCryptoProvider {
       if (rawStatus === 'expired') {
         return { status: 'EXPIRED' };
       }
-      if (rawStatus === 'cancelled' || rawStatus === 'failed' || rawStatus === 'refunded') {
+      if (
+        rawStatus === 'cancelled' ||
+        rawStatus === 'canceled' ||
+        rawStatus === 'failed' ||
+        rawStatus === 'refunded'
+      ) {
         const reasons = Array.isArray(chk.rejection_reasons)
           ? chk.rejection_reasons.map(String)
           : undefined;
         return { status: 'FAILED', rejectionReasons: reasons };
       }
-      return null;
+      if (rawStatus === 'pending') {
+        const effMs = this.computeEffectivePendingExpiresMs(chk);
+        return {
+          status: 'PENDING',
+          activePendingExpiresAt: effMs > Date.now() ? new Date(effMs).toISOString() : undefined,
+        };
+      }
+      return { status: 'PENDING' };
     } catch {
       return null;
     }
   }
 
-  public async expireCharge(providerChargeId: string): Promise<void> {
-    if (!this.config.apiKey || !providerChargeId.startsWith('prd_')) return;
+  public async expireCharge(providerChargeId: string): Promise<boolean> {
+    if (!providerChargeId.startsWith('prd_')) return true;
+    if (!this.config.apiKey) return false;
+    if (!this.tryAcquireRateSlot('background')) return false;
+
     try {
-      await fetch(
+      const res = await fetch(
         `${this.config.apiUrl}/products/${encodeURIComponent(providerChargeId)}/deactivate`,
         {
           method: 'POST',
@@ -410,12 +518,19 @@ export class DePixAppProvider implements IPixCryptoProvider {
           signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
         }
       );
+      return res.ok || res.status === 404;
     } catch {
-      // Silencioso
+      return false;
     }
   }
 
-  private async fetchCheckoutBlockchainTxId(checkoutId: string): Promise<string | undefined> {
+  private async fetchCheckoutSettlementDetails(checkoutId: string): Promise<{
+    txHash?: string;
+    cryptoAmount?: number;
+  }> {
+    if (!this.tryAcquireRateSlot('background')) {
+      return {};
+    }
     try {
       const res = await fetch(
         `${this.config.apiUrl}/checkouts/${encodeURIComponent(checkoutId)}`,
@@ -427,15 +542,18 @@ export class DePixAppProvider implements IPixCryptoProvider {
           signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
         }
       );
-      if (!res.ok) return undefined;
+      if (!res.ok) return {};
       const root = (await res.json()) as Record<string, unknown>;
       const chk =
         typeof root.checkout === 'object' && root.checkout
           ? (root.checkout as Record<string, unknown>)
           : root;
-      return chk.blockchain_tx_id ? String(chk.blockchain_tx_id) : undefined;
+      return {
+        txHash: chk.blockchain_tx_id ? String(chk.blockchain_tx_id) : undefined,
+        cryptoAmount: this.extractCryptoAmountFromItem(chk),
+      };
     } catch {
-      return undefined;
+      return {};
     }
   }
 

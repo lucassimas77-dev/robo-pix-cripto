@@ -10,7 +10,12 @@ import type {
 import {
   formatBrl,
   formatTimeSaoPaulo,
+  isCancelCommand,
+  isExitCommand,
+  isHelpCommand,
   isPaymentConfirmationMessage,
+  isStatusQueryMessage,
+  normalizeCommandText,
   onlyDigits,
   parseBrlAmountFromText,
 } from '../utils/cpfCnpjValidator.ts';
@@ -41,6 +46,24 @@ export class ConversationEngine {
   public updateRuntimeAccount(newConfig: AppConfig, newProvider: IPixCryptoProvider): void {
     this.config = newConfig;
     this.cryptoProvider = newProvider;
+  }
+
+  private deactivateOrderRemotely(order: PixCryptoOrder): void {
+    if (order.remoteDeactivated) return;
+    if (this.cryptoProvider.name !== order.provider || !this.cryptoProvider.expireCharge) {
+      this.repository.markRemoteDeactivated(order.id);
+      return;
+    }
+    void this.cryptoProvider
+      .expireCharge(order.providerChargeId)
+      .then((ok) => {
+        if (ok) {
+          this.repository.markRemoteDeactivated(order.id);
+        }
+      })
+      .catch(() => {
+        // Permanece `remote_deactivated = 0` para retentativa automática pelo ExpirationWatcher
+      });
   }
 
   public async handleIncomingMessage(params: {
@@ -80,23 +103,17 @@ export class ConversationEngine {
       createdAt: new Date().toISOString(),
     });
 
-    const lower = text.toLowerCase();
     const session = this.repository.getSession(phone);
     if (customerJid) {
       session.customerJid = customerJid;
     }
 
-    // Comando de encerrar atendimento (volta para IDLE)
-    if (lower === 'sair') {
+    // 1. Comando de encerrar atendimento (volta para IDLE)
+    if (isExitCommand(text)) {
       const activeOrder = this.repository.findActivePendingOrderByPhone(phone);
       if (activeOrder) {
         this.repository.updateOrderStatus(activeOrder.id, 'CANCELLED');
-        if (
-          this.cryptoProvider.name === activeOrder.provider &&
-          this.cryptoProvider.expireCharge
-        ) {
-          void this.cryptoProvider.expireCharge(activeOrder.providerChargeId);
-        }
+        this.deactivateOrderRemotely(activeOrder);
       }
       this.repository.saveSession({
         phone,
@@ -112,17 +129,12 @@ export class ConversationEngine {
       return;
     }
 
-    // Comando de reiniciar/cancelar mantendo escuta ativa (`AWAITING_AMOUNT`) para o próximo número enviado!
-    if (['cancelar', 'reiniciar', 'reset'].includes(lower)) {
+    // 2. Comando de reiniciar/cancelar mantendo escuta ativa (`AWAITING_AMOUNT`)
+    if (isCancelCommand(text)) {
       const activeOrder = this.repository.findActivePendingOrderByPhone(phone);
       if (activeOrder) {
         this.repository.updateOrderStatus(activeOrder.id, 'CANCELLED');
-        if (
-          this.cryptoProvider.name === activeOrder.provider &&
-          this.cryptoProvider.expireCharge
-        ) {
-          void this.cryptoProvider.expireCharge(activeOrder.providerChargeId);
-        }
+        this.deactivateOrderRemotely(activeOrder);
       }
       this.repository.saveSession({
         phone,
@@ -132,17 +144,14 @@ export class ConversationEngine {
       });
       await this.safeSendText(
         phone,
-        '✅ Cobrança reiniciada.\n\nEnvie agora o *novo valor em Reais* desejado (ex: *150,00*):',
+        '✅ Cobrança cancelada.\n\nEnvie agora o *novo valor em Reais* desejado (ex: *150,00*) ou envie *sair* para encerrar:',
         session.customerJid
       );
       return;
     }
 
-    // Mensagens pós-pagamento ("já paguei o pix de 50", "fiz o pix", "status", "comprovante") NUNCA geram nova cobrança!
-    if (
-      ['status', 'comprovante', 'meu pix'].includes(lower) ||
-      isPaymentConfirmationMessage(text)
-    ) {
+    // 3. Mensagens pós-pagamento ("já paguei", "paguei 50 no pix", "status", "comprovante") NUNCA geram nova cobrança!
+    if (isStatusQueryMessage(text) || isPaymentConfirmationMessage(text)) {
       const recent = this.repository.findMostRecentOrderByPhone(phone);
       if (!recent) {
         session.stage = 'AWAITING_AMOUNT';
@@ -176,7 +185,7 @@ export class ConversationEngine {
       if (recent.status === 'PENDING' && new Date(recent.expiresAt).getTime() > Date.now()) {
         await this.safeSendText(
           phone,
-          `⏳ Recebemos seu aviso! Assim que o banco compensar sua cobrança de *${formatBrl(recent.amountBrl)}*, enviarei a confirmação automática aqui mesmo em instantes.`,
+          `⏳ Sua cobrança de *${formatBrl(recent.amountBrl)}* (\`${recent.externalId}\`) está aguardando compensação bancária. Assim que confirmar, aviso você automaticamente aqui mesmo!`,
           session.customerJid
         );
         return;
@@ -203,44 +212,85 @@ export class ConversationEngine {
       return;
     }
 
-    // Decisão sobre cobrança ativa
+    // 4. Comando de ajuda / instruções
+    if (isHelpCommand(text) && parseBrlAmountFromText(text) === null) {
+      const minStr = formatBrl(this.cryptoProvider.minAmountBrl);
+      const maxStr = formatBrl(this.cryptoProvider.maxAmountBrl);
+      const activeForHelp = this.repository.findActivePendingOrderByPhone(phone);
+      if (!activeForHelp) {
+        session.stage = 'AWAITING_AMOUNT';
+        this.repository.saveSession(session);
+      }
+      await this.safeSendText(
+        phone,
+        `ℹ️ *Como funciona o Pix Automático:*\n\n` +
+          `1️⃣ Envie o *valor em Reais* desejado (de *${minStr}* a *${maxStr}*, ex: *Pix de 50*)\n` +
+          `2️⃣ Você recebe na hora o link seguro único + QR Code para pagar\n` +
+          `3️⃣ Assim que o Pix compensar, envio a confirmação automática aqui!\n\n` +
+          `_Comandos úteis:_ *status* (consultar pagamento), *cancelar* (trocar valor) ou *sair*.`,
+        session.customerJid
+      );
+      return;
+    }
+
+    // 5. Decisão sobre cobrança ativa
     if (session.stage === 'AWAITING_ACTIVE_ORDER_DECISION') {
       const active = this.repository.findActivePendingOrderByPhone(phone);
+      const normChoice = normalizeCommandText(text);
+      const wantsResend =
+        normChoice === '1' || /\b(?:reenviar|reenvia|mesm[oa]|atual|manter)\b/.test(normChoice);
+      const wantsNew =
+        normChoice === '2' ||
+        /\b(?:nov[oa]|outr[oa]|trocar|mudar)\b/.test(normChoice) ||
+        /\bcancelar\b.*\bgerar\b/.test(normChoice);
 
       if (!active) {
+        const prevPendingAmt = session.pendingNewAmountBrl;
         session.stage = 'AWAITING_AMOUNT';
         session.pendingNewAmountBrl = undefined;
         this.repository.saveSession(session);
 
-        if (lower === '1' || lower === '2') {
-          await this.safeSendText(
-            phone,
-            '⏰ A cobrança anterior já expirou! Qual o *valor em Reais* que deseja gerar agora? _(Ex: 50,00)_',
-            session.customerJid
-          );
+        const inlineAmt =
+          normChoice !== '1' && normChoice !== '2' ? parseBrlAmountFromText(text) : null;
+        if (inlineAmt !== null) {
+          await this.proceedWithAmount(phone, inlineAmt, session.customerJid);
           return;
         }
-      } else if (lower === '1' || lower.includes('reenviar') || lower.includes('mesmo')) {
+        if (wantsNew && prevPendingAmt) {
+          await this.proceedWithAmount(phone, prevPendingAmt, session.customerJid);
+          return;
+        }
+
+        await this.safeSendText(
+          phone,
+          '⏰ A cobrança anterior já expirou! Qual o *valor em Reais* que deseja gerar agora? _(Ex: 50,00)_',
+          session.customerJid
+        );
+        return;
+      }
+
+      if (wantsResend) {
         session.stage = 'IDLE';
         session.pendingNewAmountBrl = undefined;
         this.repository.saveSession(session);
         await this.resendActiveOrder(active);
         return;
-      } else if (lower === '2' || lower.includes('novo') || lower.includes('outro')) {
+      }
+
+      if (wantsNew) {
         this.repository.updateOrderStatus(active.id, 'CANCELLED');
-        if (
-          this.cryptoProvider.name === active.provider &&
-          this.cryptoProvider.expireCharge
-        ) {
-          void this.cryptoProvider.expireCharge(active.providerChargeId);
-        }
-        const pendingAmt = session.pendingNewAmountBrl;
+        this.deactivateOrderRemotely(active);
+
+        // Prioriza eventual valor novo presente na própria resposta ("quero novo valor de 150")
+        const inlineAmt = normChoice !== '2' ? parseBrlAmountFromText(text) : null;
+        const targetAmt = inlineAmt ?? session.pendingNewAmountBrl;
+
         session.pendingNewAmountBrl = undefined;
         session.stage = 'AWAITING_AMOUNT';
         this.repository.saveSession(session);
 
-        if (pendingAmt) {
-          await this.proceedWithAmount(phone, pendingAmt, session.customerJid);
+        if (targetAmt) {
+          await this.proceedWithAmount(phone, targetAmt, session.customerJid);
           return;
         }
 
@@ -250,23 +300,24 @@ export class ConversationEngine {
           session.customerJid
         );
         return;
-      } else {
-        const newCandidateAmount = parseBrlAmountFromText(text);
-        if (newCandidateAmount !== null) {
-          session.pendingNewAmountBrl = newCandidateAmount;
-          this.repository.saveSession(session);
-        }
-        const remainingMin = Math.max(
-          1,
-          Math.ceil((new Date(active.expiresAt).getTime() - Date.now()) / 60_000)
-        );
-        await this.safeSendText(
-          phone,
-          `⚠️ Você já tem uma cobrança Pix ativa de *${formatBrl(active.amountBrl)}* (vence em ${remainingMin} min).\n\nResponda apenas:\n*1* - Reenviar a cobrança atual\n*2* - Cancelar a atual e gerar ${newCandidateAmount ? formatBrl(newCandidateAmount) : 'um novo valor'}`,
-          session.customerJid
-        );
-        return;
       }
+
+      const newCandidateAmount = parseBrlAmountFromText(text);
+      if (newCandidateAmount !== null) {
+        session.pendingNewAmountBrl = newCandidateAmount;
+        this.repository.saveSession(session);
+      }
+      const effectiveCandidate = newCandidateAmount ?? session.pendingNewAmountBrl;
+      const remainingMin = Math.max(
+        1,
+        Math.ceil((new Date(active.expiresAt).getTime() - Date.now()) / 60_000)
+      );
+      await this.safeSendText(
+        phone,
+        `⚠️ Você já tem uma cobrança Pix ativa de *${formatBrl(active.amountBrl)}* (vence em ${remainingMin} min).\n\nResponda apenas:\n*1* - Reenviar a cobrança atual\n*2* - Cancelar a atual e gerar ${effectiveCandidate ? formatBrl(effectiveCandidate) : 'um novo valor'}`,
+        session.customerJid
+      );
+      return;
     }
 
     const activeOrder = this.repository.findActivePendingOrderByPhone(phone);
@@ -317,7 +368,6 @@ export class ConversationEngine {
     const maxBrl = this.cryptoProvider.maxAmountBrl;
 
     if (amountBrl < minBrl) {
-      // Mantém AWAITING_AMOUNT para o modo `keyword_only` aceitar o próximo número enviado!
       this.repository.saveSession({
         phone,
         customerJid,
@@ -384,6 +434,9 @@ export class ConversationEngine {
         webhookUrl,
       });
 
+      const needsRemoteDeactivation =
+        this.cryptoProvider.name === 'depixapp' && charge.providerChargeId.startsWith('prd_');
+
       const order: PixCryptoOrder = {
         id: orderId,
         externalId,
@@ -402,6 +455,7 @@ export class ConversationEngine {
         paymentUrl: charge.paymentUrl,
         status: 'PENDING',
         warningSent: false,
+        remoteDeactivated: !needsRemoteDeactivation,
         createdAt: new Date().toISOString(),
         expiresAt: charge.expiresAt,
       };
@@ -456,6 +510,15 @@ export class ConversationEngine {
         await this.safeSendText(
           params.phone,
           `⚠️ A conta recebedora ainda está sendo configurada no painel. Tente novamente em instantes.`,
+          params.customerJid
+        );
+        return;
+      }
+
+      if (msg.includes('RATE_LIMITED')) {
+        await this.safeSendText(
+          params.phone,
+          `⏳ Estamos processando muitas solicitações simultâneas neste instante. Envie o valor novamente em alguns segundos!`,
           params.customerJid
         );
         return;
@@ -571,12 +634,7 @@ export class ConversationEngine {
         );
       }
     } else if (updatedOrder.status === 'FAILED') {
-      if (
-        this.cryptoProvider.name === updatedOrder.provider &&
-        this.cryptoProvider.expireCharge
-      ) {
-        void this.cryptoProvider.expireCharge(updatedOrder.providerChargeId);
-      }
+      this.deactivateOrderRemotely(updatedOrder);
 
       const otherActive = this.repository.findActivePendingOrderByPhone(updatedOrder.customerPhone);
       if (!otherActive) {
@@ -606,12 +664,7 @@ export class ConversationEngine {
         );
       }
     } else if (updatedOrder.status === 'EXPIRED') {
-      if (
-        this.cryptoProvider.name === updatedOrder.provider &&
-        this.cryptoProvider.expireCharge
-      ) {
-        void this.cryptoProvider.expireCharge(updatedOrder.providerChargeId);
-      }
+      this.deactivateOrderRemotely(updatedOrder);
 
       const otherActive = this.repository.findActivePendingOrderByPhone(updatedOrder.customerPhone);
       if (!otherActive) {

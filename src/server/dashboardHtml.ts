@@ -220,6 +220,7 @@ export function renderDashboardHtml(): string {
               Opcional: Restringir teste apenas a 1 telefone (ex: 5511999998888)
               <input id="allowedPhone" placeholder="Deixe vazio para atender qualquer cliente que pedir Pix" />
             </label>
+            <span id="waFilterErr" class="err-msg"></span>
             <div style="display:flex;gap:10px;flex-wrap:wrap;">
               <button id="connectWaBtn" class="btn" type="button">📲 Gerar QR Code do WhatsApp</button>
               <button id="disconnectWaBtn" class="btn btn-red" type="button">Desconectar WhatsApp</button>
@@ -269,6 +270,7 @@ export function renderDashboardHtml(): string {
     const waBadge = document.getElementById('waBadge');
     const qrBox = document.getElementById('qrBox');
     const waHint = document.getElementById('waHint');
+    const waFilterErr = document.getElementById('waFilterErr');
     const filterModeEl = document.getElementById('filterMode');
     const allowedPhoneEl = document.getElementById('allowedPhone');
     const connectWaBtn = document.getElementById('connectWaBtn');
@@ -453,8 +455,9 @@ export function renderDashboardHtml(): string {
     });
 
     async function saveWaFilter() {
+      waFilterErr.textContent = '';
       try {
-        await fetch('/api/whatsapp/settings', {
+        const res = await fetch('/api/whatsapp/settings', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -462,6 +465,10 @@ export function renderDashboardHtml(): string {
             allowedTestPhone: allowedPhoneEl.value
           })
         });
+        if (!res.ok) {
+          const out = await res.json();
+          waFilterErr.textContent = out.error || 'Telefone inválido.';
+        }
       } catch {
         // Ignora
       }
@@ -471,9 +478,10 @@ export function renderDashboardHtml(): string {
     allowedPhoneEl.addEventListener('change', saveWaFilter);
 
     connectWaBtn.addEventListener('click', async () => {
+      waFilterErr.textContent = '';
       qrBox.textContent = 'Gerando QR Code...';
       try {
-        await fetch('/api/whatsapp/connect', {
+        const res = await fetch('/api/whatsapp/connect', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -481,6 +489,12 @@ export function renderDashboardHtml(): string {
             allowedTestPhone: allowedPhoneEl.value
           })
         });
+        if (!res.ok) {
+          const out = await res.json();
+          waFilterErr.textContent = out.error || 'Configuração inválida.';
+          qrBox.textContent = 'Corrija o telefone ao lado.';
+          return;
+        }
         await pollStatus();
       } catch {
         qrBox.textContent = 'Erro de conexão. Tente novamente.';

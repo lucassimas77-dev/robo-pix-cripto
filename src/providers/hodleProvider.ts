@@ -177,6 +177,7 @@ export class HodleProvider implements IPixCryptoProvider {
           signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
         }
       );
+      if (res.status === 404) return { status: 'EXPIRED' };
       if (!res.ok) return null;
       const data = (await res.json()) as Record<string, unknown>;
       const st = String(data.status ?? '').toUpperCase();
@@ -190,13 +191,13 @@ export class HodleProvider implements IPixCryptoProvider {
       if (st === 'PIX_CONFIRMED' || st === 'PAID' || st === 'PROCESSING') {
         return { status: 'PIX_CONFIRMED' };
       }
-      if (st === 'FAILED' || st === 'REFUNDED') {
+      if (st === 'FAILED' || st === 'REFUNDED' || st === 'CANCELLED') {
         return { status: 'FAILED' };
       }
       if (st === 'EXPIRED') {
         return { status: 'EXPIRED' };
       }
-      return null;
+      return { status: 'PENDING' };
     } catch {
       return null;
     }

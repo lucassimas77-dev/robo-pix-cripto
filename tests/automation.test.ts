@@ -13,6 +13,7 @@ import { createAppHttpServer } from '../src/server/httpServer.ts';
 import { ConversationEngine } from '../src/services/conversationEngine.ts';
 import { ExpirationWatcher } from '../src/services/expirationWatcher.ts';
 import { formatTimeSaoPaulo, parseBrlAmountFromText } from '../src/utils/cpfCnpjValidator.ts';
+import { BaileysDirectManager } from '../src/whatsapp/baileysManager.ts';
 import { UnifiedWhatsAppGateway } from '../src/whatsapp/whatsappGateway.ts';
 
 function createPrivacyTestSetup() {
@@ -56,6 +57,22 @@ test('Parsing monetário trata pontuação final, milhar, horários, telefones, 
   assert.equal(parseBrlAmountFromText('vou pagar dia 16/11 ate 10h R$ 150,00'), 150);
   assert.equal(parseBrlAmountFromText('meu tel é (11) 98888-7777 quero pix de R$ 50'), 50);
   assert.equal(parseBrlAmountFromText('manda pix de 80 reais.'), 80);
+  assert.equal(parseBrlAmountFromText('R$ 50 pix'), 50);
+  assert.equal(parseBrlAmountFromText('Pix - 50'), 50);
+
+  // Proteções contra negativos, porcentagens, IDs de pedido, quantidades de pix e parcelas
+  assert.equal(parseBrlAmountFromText('-50'), null);
+  assert.equal(parseBrlAmountFromText('pix de -50'), null);
+  assert.equal(parseBrlAmountFromText('-50 reais'), null);
+  assert.equal(parseBrlAmountFromText('R$ -50'), null);
+  assert.equal(parseBrlAmountFromText('Tem 10% de desconto no pix?'), null);
+  assert.equal(parseBrlAmountFromText('Quero pagar o pedido 150 no pix'), null);
+  assert.equal(parseBrlAmountFromText('Pix pedido #80'), null);
+  assert.equal(parseBrlAmountFromText('quero fazer 5 pix'), null);
+  assert.equal(parseBrlAmountFromText('me manda 2 pix'), null);
+  assert.equal(parseBrlAmountFromText('divide em 3x no pix?'), null);
+  assert.equal(parseBrlAmountFromText('o pix vence em 15 minutos?'), null);
+
   assert.equal(formatTimeSaoPaulo('2026-07-01T18:15:00.000Z'), '15:15');
 });
 
@@ -125,12 +142,49 @@ test('Concorrência, mensagens pós-pagamento ("já paguei"), estado AWAITING_AM
   });
   assert.equal(repository.listRecentOrders().length, 1);
 
-  // Número novo nunca visto mandando "Fiz o pix de 80" também não gera cobrança fantasma!
+  // Número novo nunca visto mandando "Fiz o pix de 80" ou "Paguei 50 no pix" não gera cobrança fantasma!
   await engine.handleIncomingMessage({
     phone: '5511955554444',
     text: 'Fiz o pix de 80',
   });
+  await engine.handleIncomingMessage({
+    phone: '5511955554444',
+    text: 'Paguei 50 no pix',
+  });
+  await engine.handleIncomingMessage({
+    phone: '5511955554444',
+    text: 'Já fiz o pagamento de 50',
+  });
+  await engine.handleIncomingMessage({
+    phone: '5511955554444',
+    text: 'Pagamento de 50 feito',
+  });
   assert.equal(repository.listRecentOrders().length, 1);
+
+  // Comandos naturais ("Quero cancelar o pix", "Ajuda", "Novo valor de 150" sobrescrevendo valor pendente antigo)
+  const phoneMenu = '5511944443333';
+  await engine.handleIncomingMessage({ phone: phoneMenu, text: 'Pix de 60' });
+  assert.equal(repository.listRecentOrders().length, 2);
+
+  // Envia outro valor ("80") -> entra em AWAITING_ACTIVE_ORDER_DECISION com pendingNewAmountBrl = 80
+  await engine.handleIncomingMessage({ phone: phoneMenu, text: '80' });
+  assert.equal(repository.getSession(phoneMenu).stage, 'AWAITING_ACTIVE_ORDER_DECISION');
+  assert.equal(repository.getSession(phoneMenu).pendingNewAmountBrl, 80);
+
+  // Responde "Quero um novo valor de 150" -> cancela R$ 60 e gera R$ 150 (não R$ 80!)
+  await engine.handleIncomingMessage({ phone: phoneMenu, text: 'Quero um novo valor de 150' });
+  const latestMenuOrder = repository.findMostRecentOrderByPhone(phoneMenu);
+  assert.equal(latestMenuOrder?.amountBrl, 150);
+  assert.equal(latestMenuOrder?.status, 'PENDING');
+
+  // "Quero cancelar o pix!" cancela a cobrança ativa sem cair em loop
+  await engine.handleIncomingMessage({ phone: phoneMenu, text: 'Quero cancelar o pix!' });
+  assert.equal(repository.findMostRecentOrderByPhone(phoneMenu)?.status, 'CANCELLED');
+  assert.equal(repository.getSession(phoneMenu).stage, 'AWAITING_AMOUNT');
+
+  // Comando de ajuda funciona e mantém AWAITING_AMOUNT
+  await engine.handleIncomingMessage({ phone: phoneMenu, text: 'Como funciona?' });
+  assert.equal(repository.getSession(phoneMenu).stage, 'AWAITING_AMOUNT');
 
   // Valor acima do máximo mantém sessão em AWAITING_AMOUNT para aceitar próximo número puro!
   await engine.handleIncomingMessage({
@@ -145,20 +199,30 @@ test('Concorrência, mensagens pós-pagamento ("já paguei"), estado AWAITING_AM
 
 test('Servidor HTTP bloqueia Bearer password brute-force, CSRF cross-site, NaN em minutos e processa Webhook DePix com X-DePix-Event-Id == data.event_id', async () => {
   const { config, repository, engine } = createPrivacyTestSetup();
-  const server = createAppHttpServer({ config, repository, engine });
+  const baileys = new BaileysDirectManager(repository);
+  const server = createAppHttpServer({ config, repository, engine, baileys });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const port = (server.address() as { port: number }).port;
   const url = `http://127.0.0.1:${port}`;
 
   try {
-    // 1. Setup inicial da senha
-    const setupRes = await fetch(`${url}/api/auth/setup`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ password: 'minha_senha_segura' }),
-    });
-    assert.equal(setupRes.status, 200);
-    const authCookie = (setupRes.headers.get('set-cookie') || '').split(';')[0];
+    // 1. Setup inicial da senha (corrida concorrente permite apenas 1 vencedor com 200 e rejeita a outra com 403!)
+    const [setupA, setupB] = await Promise.all([
+      fetch(`${url}/api/auth/setup`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: 'minha_senha_segura' }),
+      }),
+      fetch(`${url}/api/auth/setup`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: 'senha_invasor_concorrente' }),
+      }),
+    ]);
+    const statuses = [setupA.status, setupB.status].sort();
+    assert.deepEqual(statuses, [200, 403]);
+    const winnerRes = setupA.status === 200 ? setupA : setupB;
+    const authCookie = (winnerRes.headers.get('set-cookie') || '').split(';')[0];
 
     // 2. Enviar a senha crua em Authorization: Bearer NÃO autentica (força uso de /api/auth/login com rate-limit!)
     const rawPwdBearer = await fetch(`${url}/api/account`, {
@@ -178,18 +242,22 @@ test('Servidor HTTP bloqueia Bearer password brute-force, CSRF cross-site, NaN e
     });
     assert.equal(csrfAttempt.status, 403);
 
-    // 4. pixExpirationMinutes inválido ("abc" -> NaN) é sanitizado para inteiro seguro sem quebrar!
+    // 4. pixExpirationMinutes inválido ("abc" -> NaN) é sanitizado e chave curta não vaza em apiKeyPreview!
     const nanUpdate = await fetch(`${url}/api/account`, {
       method: 'POST',
       headers: { Cookie: authCookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         provider: 'depixapp',
-        apiKey: 'sk_live_key1234567890',
+        apiKey: 'shortkey123',
         webhookSecret: 'whsec_e2e_depix',
         pixExpirationMinutes: 'abc',
       }),
     });
     assert.equal(nanUpdate.status, 200);
+    const accCheck = await fetch(`${url}/api/account`, { headers: { Cookie: authCookie } });
+    const accJson = (await accCheck.json()) as Record<string, unknown>;
+    assert.equal(accJson.apiKeyPreview, '•••••••• (Chave salva)');
+    assert.equal(String(accJson.apiKeyPreview).includes('shortkey'), false);
 
     // 5. Teste E2E CRÍTICO: Webhook real da DePix onde X-DePix-Event-Id === data.event_id atualiza o pedido na 1ª entrega e deduplica na 2ª!
     repository.createOrder({
@@ -261,7 +329,22 @@ test('Servidor HTTP bloqueia Bearer password brute-force, CSRF cross-site, NaN e
     const whJson2 = (await whRes2.json()) as Record<string, unknown>;
     assert.equal(whJson2.duplicate, true);
 
-    // 6. Payload acima de 256 KB recebe HTTP 413 limpo (sem ECONNRESET)!
+    // 6. Filtro allowedTestPhone incompleto (<10 dígitos) é rejeitado com HTTP 400 (fail-closed)!
+    const badPhoneFilter = await fetch(`${url}/api/whatsapp/settings`, {
+      method: 'POST',
+      headers: { Cookie: authCookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filterMode: 'keyword_only', allowedTestPhone: '5511999' }),
+    });
+    assert.equal(badPhoneFilter.status, 400);
+
+    const goodPhoneFilter = await fetch(`${url}/api/whatsapp/settings`, {
+      method: 'POST',
+      headers: { Cookie: authCookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filterMode: 'keyword_only', allowedTestPhone: '5511999998888' }),
+    });
+    assert.equal(goodPhoneFilter.status, 200);
+
+    // 7. Payload acima de 256 KB recebe HTTP 413 limpo (sem ECONNRESET)!
     const hugeBody = JSON.stringify({ junk: 'x'.repeat(300 * 1024) });
     const tooLargeRes = await fetch(`${url}/api/account`, {
       method: 'POST',
@@ -361,4 +444,134 @@ test('DePixAppProvider detecta estorno (cancelled -> FAILED) em prd_..., prioriz
 
   const nox = new NoxPayProvider({ apiUrl: 'https://api.noxpay.io/v2', apiKey: 'k', webhookSecret: '' });
   assert.equal(nox.verifyWebhookSignature('{}', { 'x-signature': 'a' }), false);
+});
+
+test('ExpirationWatcher protege contra 503 transitório, respeita grace window de 15 min no rail depix e garante 100% de /deactivate em lote', async () => {
+  DePixAppProvider.clearRateLimitWindows();
+  let return503 = true;
+  const deactivatedIds: string[] = [];
+  const basePastIso = new Date(Date.now() - 60_000).toISOString();
+
+  const fakeServer = http.createServer((req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    if (req.method === 'POST' && req.url?.endsWith('/deactivate')) {
+      const m = req.url.match(/\/api\/products\/([^/]+)\/deactivate/);
+      if (m) deactivatedIds.push(decodeURIComponent(m[1]));
+      res.writeHead(200);
+      res.end(JSON.stringify({ success: true }));
+      return;
+    }
+
+    if (req.method === 'GET' && req.url?.includes('/checkouts')) {
+      if (return503) {
+        res.writeHead(503);
+        res.end(JSON.stringify({ error: 'temporary_unavailable' }));
+        return;
+      }
+      if (req.url.includes('prd_grace_rail')) {
+        // Expirou há 1 min no relógio normal, mas está no rail "depix" (grace window de +15 min!)
+        res.writeHead(200);
+        res.end(
+          JSON.stringify({
+            checkouts: [
+              {
+                id: 'chk_grace_1',
+                status: 'pending',
+                is_live: 1,
+                payment_method: 'depix',
+                expires_at: basePastIso,
+              },
+            ],
+          })
+        );
+        return;
+      }
+      res.writeHead(200);
+      res.end(JSON.stringify({ checkouts: [] }));
+      return;
+    }
+
+    res.writeHead(404);
+    res.end('{}');
+  });
+
+  await new Promise<void>((resolve) => fakeServer.listen(0, '127.0.0.1', resolve));
+  const apiUrl = `http://127.0.0.1:${(fakeServer.address() as { port: number }).port}`;
+
+  const { config, repository, whatsapp } = createPrivacyTestSetup();
+  try {
+    const depix = new DePixAppProvider({
+      apiUrl,
+      apiKey: 'sk_live_batch_watcher_test_key_123456',
+      webhookSecret: 'sec',
+    });
+    const depixConfig: AppConfig = { ...config, cryptoProvider: 'depixapp' };
+    const engine = new ConversationEngine(depixConfig, repository, depix, whatsapp);
+    const watcher = new ExpirationWatcher(repository, whatsapp, 3, engine);
+
+    // Cria 4 cobranças vencidas + 1 cobrança no rail Liquid dentro da grace window de 15 min
+    for (let i = 1; i <= 4; i++) {
+      repository.createOrder({
+        id: `id_batch_${i}`,
+        externalId: `ext_batch_${i}`,
+        provider: 'depixapp',
+        providerChargeId: `prd_batch_${i}`,
+        customerPhone: `551191111000${i}`,
+        amountBrl: 50,
+        cryptoAsset: 'DEPIX',
+        cryptoNetwork: 'LIQUID',
+        walletAddress: 'Liquid',
+        pixCopyPaste: `https://pay.depixapp.com/c/prd_batch_${i}`,
+        status: 'PENDING',
+        warningSent: false,
+        createdAt: basePastIso,
+        expiresAt: basePastIso,
+      });
+    }
+
+    repository.createOrder({
+      id: 'id_grace',
+      externalId: 'ext_grace',
+      provider: 'depixapp',
+      providerChargeId: 'prd_grace_rail',
+      customerPhone: '5511911110099',
+      amountBrl: 75,
+      cryptoAsset: 'DEPIX',
+      cryptoNetwork: 'LIQUID',
+      walletAddress: 'Liquid',
+      pixCopyPaste: 'https://pay.depixapp.com/c/prd_grace_rail',
+      status: 'PENDING',
+      warningSent: false,
+      createdAt: basePastIso,
+      expiresAt: basePastIso,
+    });
+
+    // 1. Durante erro HTTP 503 na API, NENHUMA cobrança é expirada às cegas!
+    const sweepDuringOutage = await watcher.sweepPendingOrders(new Date());
+    assert.equal(sweepDuringOutage.expiredCount, 0);
+    assert.equal(repository.getOrderById('id_batch_1')?.status, 'PENDING');
+
+    // 2. API volta ao normal: varreduras subsequentes expiram E desativam 100% das 4 cobranças sem perder nenhuma,
+    //    enquanto `prd_grace_rail` é estendida pela grace window de 15 min e continua PENDING!
+    return503 = false;
+    let clock = Date.now() + 20_000;
+    for (let cycle = 0; cycle < 4; cycle++) {
+      clock += 20_000;
+      await watcher.sweepPendingOrders(new Date(clock));
+    }
+
+    for (let i = 1; i <= 4; i++) {
+      const ord = repository.getOrderById(`id_batch_${i}`);
+      assert.equal(ord?.status, 'EXPIRED');
+      assert.equal(ord?.remoteDeactivated, true);
+      assert.equal(deactivatedIds.includes(`prd_batch_${i}`), true);
+    }
+
+    const graceOrd = repository.getOrderById('id_grace');
+    assert.equal(graceOrd?.status, 'PENDING');
+    assert.equal(deactivatedIds.includes('prd_grace_rail'), false);
+  } finally {
+    fakeServer.close();
+    repository.close();
+  }
 });
