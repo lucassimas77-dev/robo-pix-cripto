@@ -425,6 +425,41 @@ test('Parsing monetário trata pontuação final, milhar, horários, telefones, 
     inlineNewAmountBrl: null,
   });
 
+  // Casos da Busca #17: centavos coloquiais por extenso, "dois mil e um", autocorreção por extenso,
+  // "10:30h"/"14:30min"/"1 mês"/"5 semanas"/"nº 50", NBSP pós-pagamento, negação "não paguei" e novo pedido >= 10
+  assert.equal(parseBrlAmountFromText('pix de dez e cinquenta'), 10.5);
+  assert.equal(parseBrlAmountFromText('pix de vinte e cinco e cinquenta'), 25.5);
+  assert.equal(parseBrlAmountFromText('pix de dois mil e um'), 2001);
+  assert.equal(parseBrlAmountFromText('pix de mil e um'), 1001);
+  assert.equal(parseBrlAmountFromText('pix de cinquenta, ops oitenta'), null);
+  assert.equal(parseBrlAmountFromText('pix de cinquenta não, oitenta'), null);
+  assert.equal(parseBrlAmountFromText('pix de 20 reais e 50'), 20.5);
+  assert.equal(parseBrlAmountFromText('pix de vinte reais e cinquenta'), 20.5);
+
+  assert.equal(parseBrlAmountFromText('10:30h mando o pix'), null);
+  assert.equal(parseBrlAmountFromText('14:30min mando o pix'), null);
+  assert.equal(parseBrlAmountFromText('pago em 1 mês no pix'), null);
+  assert.equal(parseBrlAmountFromText('assinatura de 1 mes no pix'), null);
+  assert.equal(parseBrlAmountFromText('daqui a 5 semanas mando o pix'), null);
+  assert.equal(parseBrlAmountFromText('moro no nº 50 quero fazer um pix'), null);
+  assert.equal(parseBrlAmountFromText('Quero pagar cinquenta no pix'), 50);
+  assert.equal(parseBrlAmountFromText('Me manda cinquenta no pix'), 50);
+  assert.equal(parseBrlAmountFromText('Me manda cinquenta por favor'), 50);
+  assert.equal(parseBrlAmountFromText('Faz cinquenta aí no pix'), 50);
+  assert.equal(parseBrlAmountFromText('Oi, mil por favor'), 1000);
+
+  assert.equal(isPaymentConfirmationMessage('Enviei R$\u00A050,00'), true);
+  assert.equal(isPaymentConfirmationMessage('Enviei agora mesmo o pix de 50'), true);
+  assert.equal(isPaymentConfirmationMessage('Fiz pelo Nubank o pix de 50'), true);
+  assert.equal(isPaymentConfirmationMessage('Mandei pelo banco o pix de 50'), true);
+  assert.equal(isPaymentConfirmationMessage('Transferi pra sua conta o pix de 50'), true);
+  assert.equal(isPaymentConfirmationMessage('Fiz aqui rapidinho o pix de 50'), true);
+  assert.equal(isPaymentConfirmationMessage('Já paguei aquele, agora quero um pix de 50'), false);
+  assert.equal(isStatusQueryMessage('Confirmou! Gera um pix de 80'), false);
+  assert.equal(isStatusQueryMessage('Deu tudo certo! Agora me manda um pix de 100'), false);
+  assert.equal(isPaymentConfirmationMessage('Não paguei o pix de 50 ainda'), false);
+  assert.equal(isPaymentConfirmationMessage('Paguei não, quero um pix de 50'), false);
+
   assert.equal(formatTimeSaoPaulo('2026-07-01T18:15:00.000Z'), '15:15');
 });
 
@@ -564,6 +599,14 @@ test('Concorrência, mensagens pós-pagamento ("já paguei"), estado AWAITING_AM
   assert.equal(repository.findMostRecentOrderByPhone(phoneMenu)?.status, 'CANCELLED');
   assert.equal(repository.getSession(phoneMenu).stage, 'AWAITING_AMOUNT');
 
+  // "Quero a (2)" preserva pendingNewAmountBrl sem perder o valor pendente!
+  await engine.handleIncomingMessage({ phone: phoneMenu, text: 'Pix de 60' });
+  await engine.handleIncomingMessage({ phone: phoneMenu, text: 'Pix de 85' });
+  assert.equal(repository.getSession(phoneMenu).stage, 'AWAITING_ACTIVE_ORDER_DECISION');
+  await engine.handleIncomingMessage({ phone: phoneMenu, text: 'Quero a (2)' });
+  assert.equal(repository.findMostRecentOrderByPhone(phoneMenu)?.amountBrl, 85);
+  await engine.handleIncomingMessage({ phone: phoneMenu, text: 'Quero cancelar o pix!' });
+
   // Comando de ajuda funciona e mantém AWAITING_AMOUNT
   await engine.handleIncomingMessage({ phone: phoneMenu, text: 'Como funciona?' });
   assert.equal(repository.getSession(phoneMenu).stage, 'AWAITING_AMOUNT');
@@ -581,6 +624,7 @@ test('Concorrência, mensagens pós-pagamento ("já paguei"), estado AWAITING_AM
 
 test('Servidor HTTP bloqueia Bearer password brute-force, CSRF cross-site, NaN em minutos e processa Webhook DePix com X-DePix-Event-Id == data.event_id', async () => {
   const { config, repository, engine } = createPrivacyTestSetup();
+  config.publicBaseUrl = 'https://meu-tunel.trycloudflare.com';
   const baileys = new BaileysDirectManager(repository);
   const server = createAppHttpServer({ config, repository, engine, baileys });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -604,11 +648,28 @@ test('Servidor HTTP bloqueia Bearer password brute-force, CSRF cross-site, NaN e
     const statuses = [setupA.status, setupB.status].sort();
     assert.deepEqual(statuses, [200, 403]);
     const winnerRes = setupA.status === 200 ? setupA : setupB;
-    const authCookie = (winnerRes.headers.get('set-cookie') || '').split(';')[0];
+    const winnerPassword =
+      setupA.status === 200 ? 'minha_senha_segura' : 'senha_invasor_concorrente';
+    const fullSetCookie = winnerRes.headers.get('set-cookie') || '';
+    // Em HTTP local puro (mesmo com PUBLIC_BASE_URL https://), não força Secure para não travar navegador local!
+    assert.equal(fullSetCookie.includes('Secure'), false);
+    const authCookie = fullSetCookie.split(';')[0];
+
+    // E quando chega via proxy HTTPS ("X-Forwarded-Proto: https, http"), emite obrigatoriamente "; Secure"!
+    const httpsLoginRes = await fetch(`${url}/api/auth/login`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Forwarded-Proto': 'https, http',
+      },
+      body: JSON.stringify({ password: winnerPassword }),
+    });
+    assert.equal(httpsLoginRes.status, 200);
+    assert.equal((httpsLoginRes.headers.get('set-cookie') || '').includes('Secure'), true);
 
     // 2. Enviar a senha crua em Authorization: Bearer NÃO autentica (força uso de /api/auth/login com rate-limit!)
     const rawPwdBearer = await fetch(`${url}/api/account`, {
-      headers: { Authorization: 'Bearer minha_senha_segura' },
+      headers: { Authorization: `Bearer ${winnerPassword}` },
     });
     assert.equal(rawPwdBearer.status, 401);
 

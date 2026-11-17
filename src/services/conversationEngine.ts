@@ -10,6 +10,7 @@ import type {
 import {
   formatBrl,
   formatTimeSaoPaulo,
+  hasUnparsedDigitsInMenuReply,
   isCancelCommand,
   isExitCommand,
   isHelpCommand,
@@ -332,17 +333,8 @@ export class ConversationEngine {
         this.deactivateOrderRemotely(active);
 
         // Só reaproveita `pendingNewAmountBrl` anterior se o cliente NÃO escreveu outros dígitos ambíguos na resposta!
-        const textWithoutMenuLead =
-          menuReply.explicitOptionDigit === '2'
-            ? text
-                .trimStart()
-                .replace(
-                  /^[([#* \t]*(?:(?:quero|escolho|prefiro|vai|fico[ \t]+com|pode[ \t]+ser)[ \t]+)?(?:(?:a|o|na|no)[ \t]+)?(?:(?:op[cç][aã]o|item|n[uú]mero)[ \t#:.-]*)?2[\s)\].:*_-]*/i,
-                  ''
-                )
-            : text;
         const hasAmbiguousNewDigits =
-          menuReply.inlineNewAmountBrl === null && /\d/.test(textWithoutMenuLead);
+          menuReply.inlineNewAmountBrl === null && hasUnparsedDigitsInMenuReply(text);
         const targetAmt =
           menuReply.inlineNewAmountBrl ??
           (hasAmbiguousNewDigits ? undefined : session.pendingNewAmountBrl);

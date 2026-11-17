@@ -306,9 +306,28 @@ export function createAppHttpServer(params: {
     return false;
   };
 
+  const isEffectiveHttpsRequest = (req: http.IncomingMessage): boolean => {
+    if ((req.socket as { encrypted?: boolean }).encrypted === true) {
+      return true;
+    }
+    const rawProto = req.headers['x-forwarded-proto'];
+    if (typeof rawProto === 'string' && rawProto.trim()) {
+      return rawProto.split(',').some((p) => p.trim().toLowerCase() === 'https');
+    }
+    if (Array.isArray(rawProto) && rawProto.length > 0) {
+      return rawProto
+        .flatMap((v) => String(v).split(','))
+        .some((p) => p.trim().toLowerCase() === 'https');
+    }
+    const origin = req.headers.origin;
+    if (typeof origin === 'string' && origin.toLowerCase().startsWith('https://')) {
+      return true;
+    }
+    return false;
+  };
+
   const buildSessionCookie = (req: http.IncomingMessage, token: string, maxAge: number): string => {
-    const proto = String(req.headers['x-forwarded-proto'] || '');
-    const isSecure = proto === 'https' || config.publicBaseUrl.startsWith('https://');
+    const isSecure = isEffectiveHttpsRequest(req);
     const parts = [
       `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}`,
       'Path=/',
