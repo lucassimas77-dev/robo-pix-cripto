@@ -84,7 +84,7 @@ export class HodleProvider implements IPixCryptoProvider {
       destinationAddress: input.walletAddress,
       expirationMinutes: input.expirationMinutes,
     };
-    if (isPublicHttpsWebhookUrl(input.webhookUrl)) {
+    if (this.config.webhookSecret.trim() && isPublicHttpsWebhookUrl(input.webhookUrl)) {
       bodyPayload.webhookUrl = input.webhookUrl;
     }
 

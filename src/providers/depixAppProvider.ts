@@ -168,9 +168,10 @@ export class DePixAppProvider implements IPixCryptoProvider {
 
     const expMinutes = Number.isFinite(input.expirationMinutes) ? input.expirationMinutes : 15;
     const expiresInSeconds = Math.min(1200, Math.max(300, Math.round(expMinutes * 60)));
-    const publicHttpsCallback = isPublicHttpsWebhookUrl(input.webhookUrl)
-      ? input.webhookUrl
-      : undefined;
+    const publicHttpsCallback =
+      Boolean(this.config.webhookSecret) && isPublicHttpsWebhookUrl(input.webhookUrl)
+        ? input.webhookUrl
+        : undefined;
 
     const estimatedNet = Math.max(0, Math.round((input.amountBrl * 0.98 - 0.99) * 100) / 100);
 

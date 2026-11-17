@@ -460,6 +460,62 @@ test('Parsing monetário trata pontuação final, milhar, horários, telefones, 
   assert.equal(isPaymentConfirmationMessage('Não paguei o pix de 50 ainda'), false);
   assert.equal(isPaymentConfirmationMessage('Paguei não, quero um pix de 50'), false);
 
+  // Casos da Busca #18: horários compostos por extenso ("às duas e trinta", "seis e trinta da tarde", "10h 30"),
+  // "15 de novembro", quantidades de itens ("10 ingressos", "5 unidades"), intervalos com "um", telefones com ponto/"9 ",
+  // Unicode NFD, "Fiz uma compra de 50", "envia mil reais" e negação no menu ("Não quero cancelar", "Não cancela, manda a atual")
+  assert.equal(parseBrlAmountFromText('Te mando o pix às duas e trinta'), null);
+  assert.equal(parseBrlAmountFromText('Te mando o pix às quatro e vinte'), null);
+  assert.equal(parseBrlAmountFromText('Depois das cinco e trinta faço o pix'), null);
+  assert.equal(parseBrlAmountFromText('Te mando o pix às vinte e duas'), null);
+  assert.equal(parseBrlAmountFromText('Vou fazer o pix seis e trinta da tarde'), null);
+  assert.equal(parseBrlAmountFromText('Vou fazer o pix seis e meia da tarde'), null);
+  assert.equal(parseBrlAmountFromText('Te mando o pix às 10h 30'), null);
+  assert.equal(parseBrlAmountFromText('Pago em 15 de novembro no pix'), null);
+  assert.equal(parseBrlAmountFromText('Vou pagar R$ 100 em 15 de novembro no pix'), 100);
+
+  assert.equal(parseBrlAmountFromText('Oi, quero comprar 10 ingressos no pix'), null);
+  assert.equal(parseBrlAmountFromText('Quero 5 unidades, aceita pix?'), null);
+  assert.equal(parseBrlAmountFromText('Preciso de 20 peças, posso pagar no pix?'), null);
+  assert.equal(parseBrlAmountFromText('Quero 15 cotas no pix'), null);
+
+  assert.equal(parseBrlAmountFromText('pix entre um e dois mil'), null);
+  assert.equal(parseBrlAmountFromText('pix de um a dois mil'), null);
+  assert.equal(parseBrlAmountFromText('pix de um ou dois mil'), null);
+  assert.equal(parseBrlAmountFromText('pix de um ou dois reais'), null);
+
+  assert.equal(parseBrlAmountFromText('Meu zap é (21) 98888.7777, quero fazer um pix'), null);
+  assert.equal(parseBrlAmountFromText('Meu zap é (21) 9.8888.7777, quero fazer um pix'), null);
+  assert.equal(parseBrlAmountFromText('Meu zap é (11) 9 8888-7777, manda um pix de 50'), 50);
+
+  assert.equal(isPaymentConfirmationMessage('Fiz uma compra de 50, pode mandar o pix?'), false);
+  assert.equal(isPaymentConfirmationMessage('Fiz o pedido agora me passa o pix de 50'), false);
+  assert.equal(isPaymentConfirmationMessage('Gera R$ 50 aí que já envio o comprovante'), false);
+  assert.equal(
+    isPaymentConfirmationMessage('Já paguei aquele, agora manda um pix de mil reais'),
+    false
+  );
+  assert.equal(isStatusQueryMessage('Confirmou! Agora gera um pix de mil reais'), false);
+  assert.equal(parseBrlAmountFromText('envia mil reais no pix'), 1000);
+  assert.equal(parseBrlAmountFromText('passa mil reais no pix'), 1000);
+  assert.equal(isPaymentConfirmationMessage('Na\u0303o paguei o pix de 50 ainda'), false);
+  assert.equal(parseBrlAmountFromText('pix de tre\u0302s mil'), 3000);
+
+  assert.deepEqual(parseActiveOrderMenuReply('Não quero cancelar'), {
+    choice: 'none',
+    explicitOptionDigit: null,
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('Não cancela, manda a atual'), {
+    choice: 'resend',
+    explicitOptionDigit: null,
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('Não precisa trocar, mantém essa'), {
+    choice: 'resend',
+    explicitOptionDigit: null,
+    inlineNewAmountBrl: null,
+  });
+
   assert.equal(formatTimeSaoPaulo('2026-07-01T18:15:00.000Z'), '15:15');
 });
 
@@ -909,6 +965,24 @@ test('DePixAppProvider detecta estorno (cancelled -> FAILED) em prd_..., prioriz
       return;
     }
 
+    if (req.method === 'POST' && req.url === '/api/products') {
+      let raw = '';
+      req.on('data', (c) => (raw += c));
+      req.on('end', () => {
+        const parsed = JSON.parse(raw || '{}') as Record<string, unknown>;
+        res.writeHead(201);
+        res.end(
+          JSON.stringify({
+            product: {
+              id: parsed.callback_url ? 'prd_with_cb' : 'prd_no_cb',
+              payment_url: 'https://pay.depixapp.com/c/prd_test',
+            },
+          })
+        );
+      });
+      return;
+    }
+
     if (req.method === 'GET' && req.url === '/api/checkouts/chk_2') {
       res.writeHead(200);
       res.end(
@@ -994,6 +1068,36 @@ test('DePixAppProvider detecta estorno (cancelled -> FAILED) em prd_..., prioriz
     assert.equal(boolIds?.providerChargeId, 'chk_real_999');
     assert.equal(boolIds?.eventId, undefined);
     assert.equal(boolIds?.txHash, undefined);
+
+    // callback_url só é enviado quando webhookSecret está configurado (evita retentativas 401 na DePix App)
+    const depixNoSecret = new DePixAppProvider({
+      apiUrl: baseUrl,
+      apiKey: 'sk_live_no_sec_key123',
+      webhookSecret: '',
+    });
+    const outNoCb = await depixNoSecret.createCharge({
+      externalId: 'ext_no_cb',
+      customerPhone: '5511999990000',
+      amountBrl: 50,
+      cryptoAsset: 'DEPIX',
+      cryptoNetwork: 'LIQUID',
+      walletAddress: 'Liquid',
+      expirationMinutes: 15,
+      webhookUrl: 'https://robo-pix-cripto.onrender.com/webhooks/depixapp',
+    });
+    assert.equal(outNoCb.providerChargeId, 'prd_no_cb');
+
+    const outWithCb = await depix.createCharge({
+      externalId: 'ext_with_cb',
+      customerPhone: '5511999990000',
+      amountBrl: 50,
+      cryptoAsset: 'DEPIX',
+      cryptoNetwork: 'LIQUID',
+      walletAddress: 'Liquid',
+      expirationMinutes: 15,
+      webhookUrl: 'https://robo-pix-cripto.onrender.com/webhooks/depixapp',
+    });
+    assert.equal(outWithCb.providerChargeId, 'prd_with_cb');
   } finally {
     fakeDepixServer.close();
   }

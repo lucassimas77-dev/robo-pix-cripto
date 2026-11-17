@@ -60,7 +60,7 @@ export class NoxPayProvider implements IPixCryptoProvider {
       wallet_address: input.walletAddress,
       external_id: input.externalId,
     };
-    if (isPublicHttpsWebhookUrl(input.webhookUrl)) {
+    if (this.config.webhookSecret.trim() && isPublicHttpsWebhookUrl(input.webhookUrl)) {
       bodyPayload.webhook = input.webhookUrl;
     }
 

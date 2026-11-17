@@ -265,7 +265,7 @@ const NUM_LEFT = '(?<![-\\wÀ-ÿºª°@/,.])';
 const NUM_RIGHT = '(?![.,]\\d|\\d|[-\\wÀ-ÿºª°]|[ \\t]*%|\\.[a-zA-Z]|\\/[A-Za-zÀ-ÿ0-9])';
 
 function normalizeHorizontalSpaces(input: string): string {
-  return input.replace(/[\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]/g, ' ');
+  return input.normalize('NFC').replace(/[\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]/g, ' ');
 }
 
 const PT_UNITS: Record<string, number> = {
@@ -518,18 +518,41 @@ function normalizePortugueseNumberWords(input: string): string {
       wordIndices[endWordPos + 1] - endIdx <= 2
         ? tokens[wordIndices[endWordPos + 1]].toLowerCase()
         : '';
+    const nextNextWordIdx =
+      endWordPos >= 0 &&
+      endWordPos + 2 < wordIndices.length &&
+      wordIndices[endWordPos + 2] - wordIndices[endWordPos + 1] <= 2
+        ? wordIndices[endWordPos + 2]
+        : -1;
+    const nextNextWord = nextNextWordIdx >= 0 ? tokens[nextNextWordIdx].toLowerCase() : '';
 
-    const blockedPronounOrHour =
+    // Pronomes plurais ("nós dois", "os dois") e artigo feminino plural antes de substantivo comum ("as dez fotos")
+    // permanecem bloqueados; já preposições de hora ("às", "das", "pelas", "as 10", "as duas e trinta") convertem para dígitos
+    // para que o limpador completo de horários remova a expressão inteira sem deixar os minutos soltos!
+    const isPluralArticleBeforeNoun =
+      prevWord === 'as' &&
+      nextWord.length > 0 &&
+      nextWord !== 'e' &&
+      nextWord !== 'da' &&
+      !CURRENCY_OR_SCALE_WORDS.has(nextWord) &&
+      !QTY_OR_UNIT_WORDS.has(nextWord);
+
+    const blockedPronoun =
       !CURRENCY_OR_SCALE_WORDS.has(nextWord) &&
       !QTY_OR_UNIT_WORDS.has(nextWord) &&
-      (['as', 'às', 'pelas', 'das', 'nos', 'nós', 'voces', 'vocês', 'eles', 'elas', 'ambos', 'ambas', 'uns', 'umas'].includes(
-        prevWord
-      ) ||
+      (isPluralArticleBeforeNoun ||
+        ['nos', 'nós', 'voces', 'vocês', 'eles', 'elas', 'ambos', 'ambas', 'uns', 'umas'].includes(
+          prevWord
+        ) ||
         (prevWord === 'os' && value === 2));
 
+    const isHourPreposition = ['as', 'às', 'pelas', 'das'].includes(prevWord);
+
     // Centavos coloquiais por extenso: "dez e cinquenta" -> "10,50", "vinte e cinco e cinquenta" -> "25,50"
+    // Nunca combina como centavos quando for horário ("às duas e trinta", "seis e trinta da tarde") ou intervalo ("entre...")!
     if (
-      !blockedPronounOrHour &&
+      !blockedPronoun &&
+      !isHourPreposition &&
       prevWord !== 'entre' &&
       endIdx + 4 < tokens.length &&
       /^[ \t]+$/.test(tokens[endIdx + 1]) &&
@@ -548,9 +571,30 @@ function normalizePortugueseNumberWords(input: string): string {
           wordIndices[centsEndWordPos + 1] - centsSub.endIdx <= 2
             ? tokens[wordIndices[centsEndWordPos + 1]].toLowerCase()
             : '';
-        const blockedCentsNext = ['mil', 'milhao', 'milhão', 'milhoes', 'milhões'].includes(
-          wordAfterCents
-        );
+        const word2AfterCents =
+          centsEndWordPos >= 0 &&
+          centsEndWordPos + 2 < wordIndices.length &&
+          wordIndices[centsEndWordPos + 2] - wordIndices[centsEndWordPos + 1] <= 2
+            ? tokens[wordIndices[centsEndWordPos + 2]].toLowerCase()
+            : '';
+        const isDayPeriodAfter =
+          wordAfterCents === 'da' &&
+          ['manha', 'manhã', 'tarde', 'noite', 'madrugada'].includes(word2AfterCents);
+        const blockedCentsNext =
+          isDayPeriodAfter ||
+          [
+            'mil',
+            'milhao',
+            'milhão',
+            'milhoes',
+            'milhões',
+            'hora',
+            'horas',
+            'min',
+            'mins',
+            'minuto',
+            'minutos',
+          ].includes(wordAfterCents);
         if (
           !blockedCentsNext &&
           !/^[-/@.]/.test(afterCentsSep) &&
@@ -571,11 +615,22 @@ function normalizePortugueseNumberWords(input: string): string {
 
     let shouldConvert = false;
     if (singleUm) {
+      const isRangeOrChoiceConnector =
+        ['e', 'a', 'à', 'ate', 'até', 'ou', 'mais', 'menos'].includes(nextWord) &&
+        ((nextNextWordIdx >= 0 &&
+          (readSubThousandTokens(tokens, nextNextWordIdx) !== null ||
+            CURRENCY_OR_SCALE_WORDS.has(nextNextWord))) ||
+          (endWordPos >= 0 &&
+            endWordPos + 1 < wordIndices.length &&
+            wordIndices[endWordPos + 1] + 2 < tokens.length &&
+            /^\d/.test(tokens[wordIndices[endWordPos + 1] + 2])));
+
       shouldConvert =
         CURRENCY_OR_SCALE_WORDS.has(nextWord) ||
-        (prevWord === 'e' && prevPrevWord === 'mil');
+        (prevWord === 'e' && prevPrevWord === 'mil') ||
+        isRangeOrChoiceConnector;
     } else {
-      shouldConvert = !blockedPronounOrHour;
+      shouldConvert = !blockedPronoun;
     }
 
     if (shouldConvert) {
@@ -609,16 +664,16 @@ function unwrapWhatsAppMarkdown(input: string): string {
 }
 
 export function hasPixTriggerKeyword(text: string): boolean {
-  if (typeof text !== 'string' || text.length > MAX_NLU_LEN) return false;
-  return /(?<![A-Za-zÀ-ÿ0-9])(?:pix|pagar|pagamento|comprovante)(?![A-Za-zÀ-ÿ0-9])/i.test(
-    normalizeHorizontalSpaces(text)
-  );
+  if (typeof text !== 'string' || text.length > MAX_NLU_LEN * 2) return false;
+  const norm = normalizeHorizontalSpaces(text);
+  if (norm.length > MAX_NLU_LEN) return false;
+  return /(?<![A-Za-zÀ-ÿ0-9])(?:pix|pagar|pagamento|comprovante)(?![A-Za-zÀ-ÿ0-9])/i.test(norm);
 }
 
 export function parseBrlAmountFromText(text: string): number | null {
-  if (typeof text !== 'string' || text.length > MAX_NLU_LEN) return null;
+  if (typeof text !== 'string' || text.length > MAX_NLU_LEN * 2) return null;
   const cleaned = normalizeHorizontalSpaces(text).trim();
-  if (!cleaned) return null;
+  if (!cleaned || cleaned.length > MAX_NLU_LEN) return null;
 
   // Passo 0 (O(N)): remove tokens de URL, e-mail, @handle e IDs prd_/chk_
   const filteredWords = cleaned
@@ -662,12 +717,13 @@ export function parseBrlAmountFromText(text: string): number | null {
     .replace(/(?<!\d)(?:\d{4}\/\d{1,2}\/\d{1,2}|\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)(?!\d)/g, ' ')
     .replace(/(?<!\d)(?:\d{4}-\d{1,2}-\d{1,2}|\d{1,2}-\d{1,2}-\d{2,4})(?!\d)/g, ' ')
     .replace(/(?<![\d.,])\d+(?:-\d+){2,}(?![\d.,])/g, ' ')
-    // 2) Remove telefones completos COM ou SEM parênteses, DDD 2 ou 3 dígitos (011), com ou sem espaço após DDD/DDI
+    // 2) Remove telefones completos COM ou SEM parênteses, DDD 2/3 dígitos, espaço após o 9º dígito ou pontos separadores
     .replace(
-      /(?:(?:\+\d{1,3}[ \t]*|\b55[ \t]+))?(?:\(0?\d{2}\)[ \t]*|\b0?\d{2}[ \t]*)\d{4,5}[-\s]?\d{4}\b/g,
+      /(?:(?:\+\d{1,3}[ \t]*|\b55[ \t]+))?(?:\(0?\d{2}\)[ \t]*|\b0?\d{2}[ \t]*)(?:9[-.\s]?)?\d{4}[-.\s]?\d{4}\b/g,
       ' '
     )
-    // 3) Remove CEPs simples, telefones curtos, números longos e horários HH:MM(:SS)(h/min) ou 10h(30min)
+    .replace(/\b(?:9[-.\s]?)?\d{4}[-.]\d{4}\b/g, ' ')
+    // 3) Remove CEPs simples, telefones curtos, números longos e horários HH:MM(:SS)(h/min) ou "10h 30(min)"
     .replace(/(?<![\d.,/-])\d+-\d+(?![\d.,/-])/g, ' ')
     .replace(/\b\d{8,}\b/g, ' ')
     .replace(
@@ -675,18 +731,22 @@ export function parseBrlAmountFromText(text: string): number | null {
       ' '
     )
     .replace(
-      /\b\d{1,2}[ \t]*(?:h|hs|hr|hrs)(?:\d{2}(?:[ \t]*min(?:utos?)?)?)?(?![A-Za-zÀ-ÿ0-9])/gi,
+      /\b\d{1,2}[ \t]*(?:h|hs|hr|hrs)(?:[ \t]*[0-5]\d(?![.,]\d|[ \t]*(?:reais|real|brl|contos?|centavos?)\b)(?:[ \t]*min(?:utos?)?)?)?(?![A-Za-zÀ-ÿ0-9])/gi,
       ' '
     );
 
-  // Converte numerais cardinais em português ("dois mil", "dez e cinquenta", "quatro da tarde") ANTES de limpar horas/dias!
+  // Converte numerais cardinais em português ("dois mil", "dez e cinquenta", "quatro da tarde") ANTES de limpar horas/datas!
   const withNormalizedPtNumbers = normalizePortugueseNumberWords(withoutContactsAndDates)
     .replace(
-      /(?<![A-Za-zÀ-ÿ0-9])(?:[aà]s|pelas|das)[ \t]+(?:[01]?\d|2[0-4])\b(?![.,]\d|[ \t]*(?:reais|real|brl|contos?|centavos?)\b)(?:[ \t]+da[ \t]+(?:manh[aã]|tarde|noite|madrugada)(?![A-Za-zÀ-ÿ0-9]))?/gi,
+      /(?<![A-Za-zÀ-ÿ0-9])(?:[aà]s|pelas|das)[ \t]+(?:[01]?\d|2[0-4])\b(?![.,]\d|[ \t]*(?:reais|real|brl|contos?|centavos?)\b)(?:[ \t]+e[ \t]+(?:meia(?![A-Za-zÀ-ÿ0-9])|[0-5]?\d\b)(?:[ \t]*min(?:utos?)?(?![A-Za-zÀ-ÿ0-9]))?)?(?:[ \t]+da[ \t]+(?:manh[aã]|tarde|noite|madrugada)(?![A-Za-zÀ-ÿ0-9]))?/gi,
       ' '
     )
     .replace(
-      /\b(?:[01]?\d|2[0-4])[ \t]+da[ \t]+(?:manh[aã]|tarde|noite|madrugada)(?![A-Za-zÀ-ÿ0-9])/gi,
+      /\b(?:[01]?\d|2[0-4])(?:[ \t]+e[ \t]+(?:meia|[0-5]?\d)(?:[ \t]*min(?:utos?)?)?)?[ \t]+da[ \t]+(?:manh[aã]|tarde|noite|madrugada)(?![A-Za-zÀ-ÿ0-9])/gi,
+      ' '
+    )
+    .replace(
+      /(?<![A-Za-zÀ-ÿ0-9])(?:dia[ \t]+)?(?:[0-2]?\d|3[01])(?:[º°])?[ \t]+de[ \t]+(?:janeiro|fevereiro|mar[cç]o|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro|jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)(?:[ \t]+de[ \t]+\d{2,4})?(?![A-Za-zÀ-ÿ0-9])/gi,
       ' '
     )
     .replace(
@@ -767,7 +827,7 @@ export function parseBrlAmountFromText(text: string): number | null {
     // Passagem única determinística para TODAS as composições com "mil":
     // Aceita tanto "[N] mil e M" quanto gramática padrão sem "e" / com vírgula para centenas ("[N] mil 250", "dois mil, quinhentos")!
     .replace(
-      /(?:(?<![-\wÀ-ÿºª°@/,.])(\d{1,4}(?:[.,]\d{1,2})?)(?![.,]\d|\d)[ \t]*|(?<=^|[ \t]*[:=(\-,;.!?][ \t]*|r\$[ \t]*|(?<![A-Za-zÀ-ÿ0-9])(?:de|por|para|pra|no|em|gera|gerar|mand[ae]|mandar|faz|fa[cç]a|fazer|quero|preciso|pagar|cobran[cç]a|pix|valor|total|ser|[eé]|s[aã]o|oi|ol[aá]|a[ií]|ent[aã]o)[ \t]+))mil\b(?:[ \t]+(reais|real|brl|contos?)\b(?:[ \t]+e[ \t]+(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b)?|(?:[ \t]+e[ \t]+(?:(meio)\b|(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b|(\d{1,3})(?![.,]\d|\d|[ \t]*centavos?\b)(?:[ \t]*(reais|real|brl|contos?)\b)?(?:[ \t]+e[ \t]+(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b)?)|(?:[ \t]*,[ \t]*|[ \t]+)(?:(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b|([1-9]\d{2})(?![.,]\d|\d|[ \t]*centavos?\b)(?:[ \t]*(reais|real|brl|contos?)\b)?(?:[ \t]+e[ \t]+(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b)?))?)/gi,
+      /(?:(?<![-\wÀ-ÿºª°@/,.])(\d{1,4}(?:[.,]\d{1,2})?)(?![.,]\d|\d)[ \t]*|(?<=^|[ \t]*[:=(\-,;.!?][ \t]*|r\$[ \t]*|(?<![A-Za-zÀ-ÿ0-9])(?:de|por|para|pra|no|em|com|at[eé]|gera|gerar|gere|mand[ae]|mandar|envi[ae]|enviar|pass[ae]|passar|cobr[ae]|cobrar|faz|fa[cç]a|fazer|cria|criar|quero|queria|preciso|pagar|pago|pague|receber|depositar|transferir|cobran[cç]a|pagamento|pix|valor|total|ser|[eé]|s[aã]o|fica|ficou|deu|d[aá]|oi|ol[aá]|a[ií]|ent[aã]o|agora|hoje|favor)[ \t]+))mil\b(?:[ \t]+(reais|real|brl|contos?)\b(?:[ \t]+e[ \t]+(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b)?|(?:[ \t]+e[ \t]+(?:(meio)\b|(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b|(\d{1,3})(?![.,]\d|\d|[ \t]*centavos?\b)(?:[ \t]*(reais|real|brl|contos?)\b)?(?:[ \t]+e[ \t]+(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b)?)|(?:[ \t]*,[ \t]*|[ \t]+)(?:(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b|([1-9]\d{2})(?![.,]\d|\d|[ \t]*centavos?\b)(?:[ \t]*(reais|real|brl|contos?)\b)?(?:[ \t]+e[ \t]+(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b)?))?)/gi,
       (
         _m,
         multStr,
@@ -807,7 +867,10 @@ export function parseBrlAmountFromText(text: string): number | null {
       const valFixed = (Number(c) / 100).toFixed(2).replace('.', ',');
       return `R$ ${valFixed}`;
     })
-    .replace(/\b\d+[ \t]*(?:x|vezes|parcelas?)\b/gi, ' ')
+    .replace(
+      /\b\d+[ \t]*(?:x|vezes|parcelas?|itens?|unidades?|pe[cç]as?|produtos?|pacotes?|caixas?|kits?|ingressos?|cotas?)(?![A-Za-zÀ-ÿ0-9])/gi,
+      ' '
+    )
     .replace(
       /\b\d+[ \t]*(?:min|mins|minutos?|seg|segs|segundos?|dias?|semanas?|horas?|m[eê]s|meses|anos?)(?![A-Za-zÀ-ÿ0-9])/gi,
       ' '
@@ -845,8 +908,9 @@ export function parseBrlAmountFromText(text: string): number | null {
  * Varredura linear O(N) com dois ponteiros — zero regex backtracking!
  */
 export function normalizeCommandText(text: string): string {
-  if (typeof text !== 'string' || text.length > MAX_COMMAND_LEN) return '';
+  if (typeof text !== 'string' || text.length > MAX_COMMAND_LEN * 2) return '';
   const norm = normalizeHorizontalSpaces(text);
+  if (norm.length > MAX_COMMAND_LEN) return '';
   let start = 0;
   let end = norm.length - 1;
 
@@ -947,29 +1011,35 @@ function matchLeadingMenuOption(strippedMd: string): {
  * (usado por `ConversationEngine` para evitar reaproveitar `pendingNewAmountBrl` em entradas ambíguas como `"2 - 50 ou 100"`).
  */
 export function hasUnparsedDigitsInMenuReply(text: string): boolean {
-  if (typeof text !== 'string' || text.length > MAX_NLU_LEN) return false;
+  if (typeof text !== 'string' || text.length > MAX_NLU_LEN * 2) return false;
   const strippedMd = unwrapWhatsAppMarkdown(normalizeHorizontalSpaces(text)).trim();
-  if (!strippedMd) return false;
+  if (!strippedMd || strippedMd.length > MAX_NLU_LEN) return false;
 
   const opt = matchLeadingMenuOption(strippedMd);
   const bodyToInspect = opt ? opt.remainder : strippedMd;
   if (!bodyToInspect) return false;
 
   const normalizedBody = normalizePortugueseNumberWords(bodyToInspect);
-  return /\d/.test(normalizedBody);
+  return /\d/.test(normalizedBody) || /\b(?:mil|milh[aã]o|milh[oõ]es)\b/i.test(normalizedBody);
 }
+
+const MENU_NEW_INTENT_UNNEGATED_RE =
+  /(?<!(?<![A-Za-zÀ-ÿ0-9])n[aã]o[ \t]+(?:(?:quero|preciso|precisa|vou|pode|favor)[ \t]+)?|(?<![A-Za-zÀ-ÿ0-9])nem[ \t]+)\b(?:cancel(?:ar|a|e)|(?<!de[ \t]+)nov[oa]|outr[oa]|trocar|troca|mudar|muda|substituir|alterar)(?![A-Za-zÀ-ÿ0-9])/i;
+
+const MENU_RESEND_INTENT_UNNEGATED_RE =
+  /(?<!(?<![A-Za-zÀ-ÿ0-9])n[aã]o[ \t]+(?:(?:quero|preciso|precisa|vou|pode|favor|mand[ae]|envi[ae])[ \t]+)?|(?<![A-Za-zÀ-ÿ0-9])nem[ \t]+)\b(?:reenviar|reenvia|mesm[oa]|manter|mantenha|mant[eé]m|continua|continuar|de[ \t]+novo|(?:mand[ae]|envi[ae])[ \t]+(?:a[ \t]+|o[ \t]+)?(?:atual|ess[ae]))(?![A-Za-zÀ-ÿ0-9])/i;
 
 /**
  * Interpreta respostas ao menu `1 / 2` de cobrança ativa em tempo O(N), tratando `"2."`, `"quero a 2"`,
- * `"Quero a (2)"`, `"manda de novo"` (= reenviar!) e `"cancela e gera de 100"` (= novo!).
+ * `"Quero a (2)"`, `"manda de novo"` (= reenviar!), `"Não cancela, manda a atual"` (= reenviar!) e `"cancela e gera de 100"` (= novo!).
  */
 export function parseActiveOrderMenuReply(text: string): ActiveMenuParseResult {
-  if (typeof text !== 'string' || text.length > MAX_NLU_LEN) {
+  if (typeof text !== 'string' || text.length > MAX_NLU_LEN * 2) {
     return { choice: 'none', explicitOptionDigit: null, inlineNewAmountBrl: null };
   }
 
   const strippedMd = unwrapWhatsAppMarkdown(normalizeHorizontalSpaces(text)).trim();
-  if (!strippedMd) {
+  if (!strippedMd || strippedMd.length > MAX_NLU_LEN) {
     return { choice: 'none', explicitOptionDigit: null, inlineNewAmountBrl: null };
   }
 
@@ -979,13 +1049,7 @@ export function parseActiveOrderMenuReply(text: string): ActiveMenuParseResult {
     const { optDigit, remainder } = matchedOpt;
     const inlineAmt = remainder ? parseBrlAmountFromText(remainder) : null;
 
-    if (
-      remainder &&
-      (/\bcancel(?:ar|a|e)\b/i.test(remainder) ||
-        /\b(?:(?<!de[ \t]+)nov[oa]|outr[oa]|trocar|troca|mudar|muda|substituir|alterar)\b/i.test(
-          remainder
-        ))
-    ) {
+    if (remainder && MENU_NEW_INTENT_UNNEGATED_RE.test(remainder)) {
       return { choice: 'new', explicitOptionDigit: '2', inlineNewAmountBrl: inlineAmt };
     }
 
@@ -996,13 +1060,8 @@ export function parseActiveOrderMenuReply(text: string): ActiveMenuParseResult {
     };
   }
 
-  // Passo 2: Intenção textual de cancelar/substituir/novo valor (excluindo a locução "de novo" = novamente!)
-  if (
-    /\bcancel(?:ar|a|e)\b/i.test(strippedMd) ||
-    /\b(?:(?<!de[ \t]+)nov[oa]|outr[oa]|trocar|troca|mudar|muda|substituir|alterar)\b/i.test(
-      strippedMd
-    )
-  ) {
+  // Passo 2: Intenção textual NÃO negada de cancelar/substituir/novo valor (excluindo "de novo" e "Não quero cancelar"!)
+  if (MENU_NEW_INTENT_UNNEGATED_RE.test(strippedMd)) {
     return {
       choice: 'new',
       explicitOptionDigit: null,
@@ -1010,13 +1069,8 @@ export function parseActiveOrderMenuReply(text: string): ActiveMenuParseResult {
     };
   }
 
-  // Passo 3: Intenção textual de reenviar/manter cobrança existente (incluindo "manda de novo", sem negação "não")
-  if (
-    !/\bn[aã]o\b/i.test(strippedMd) &&
-    (/\b(?:reenviar|reenvia|mesm[oa]|manter|mantenha|continua|continuar)\b/i.test(strippedMd) ||
-      /\bde[ \t]+novo\b/i.test(strippedMd) ||
-      /\b(?:mand[ae]|envi[ae])[ \t]+(?:a[ \t]+|o[ \t]+)?atual\b/i.test(strippedMd))
-  ) {
+  // Passo 3: Intenção textual NÃO negada de reenviar/manter cobrança existente (ex: "manda de novo", "Não cancela, manda a atual")
+  if (MENU_RESEND_INTENT_UNNEGATED_RE.test(strippedMd)) {
     return { choice: 'resend', explicitOptionDigit: null, inlineNewAmountBrl: null };
   }
 
@@ -1028,10 +1082,13 @@ export function parseActiveOrderMenuReply(text: string): ActiveMenuParseResult {
 }
 
 const EXPLICIT_NEW_ORDER_INTENT_RE =
-  /\b(?:quero|gera|gerar|mand[ae]|mandar|preciso|faz|fazer|cria|criar)[ \t]+(?:outro|novo|mais[ \t]+um|(?:um[ \t]+)?pix[ \t]+de[ \t]+(?:r\$[ \t]*)?\d[\d.,]*|(?:uma[ \t]+)?cobran[cç]a(?![A-Za-zÀ-ÿ0-9]))/i;
+  /\b(?:quero|gera|gerar|gere|mand[ae]|mandar|pass[ae]|passar|preciso|faz|fazer|cria|criar)[ \t]+(?:outro|novo|mais[ \t]+um|(?:a[ií][ \t]+)?(?:um[ \t]+|o[ \t]+)?pix(?![A-Za-zÀ-ÿ0-9])|(?:uma[ \t]+)?cobran[cç]a(?![A-Za-zÀ-ÿ0-9])|(?:de[ \t]+)?(?:r\$[ \t]*\d[\d.,]*|\d[\d.,]*[ \t]*(?:reais|real|mil)\b|mil\b))/i;
+
+const POLITE_NEW_ORDER_MODAL_RE =
+  /\b(?:quero|preciso|vou|posso|pode|poderia|gostaria[ \t]+de|me)[ \t]+(?:pagar|fazer[ \t]+(?:um[ \t]+)?pix|gerar|mandar|mand[ae]|passar|pass[ae]|enviar|envi[ae]|criar|cri[ae])(?![A-Za-zÀ-ÿ0-9])/i;
 
 export function isStatusQueryMessage(text: string): boolean {
-  if (typeof text !== 'string' || text.length > MAX_NLU_LEN) return false;
+  if (typeof text !== 'string' || text.length > MAX_NLU_LEN * 2) return false;
   const n = normalizeCommandText(text);
   if (
     n &&
@@ -1043,15 +1100,10 @@ export function isStatusQueryMessage(text: string): boolean {
   }
 
   const rawTrimmed = unwrapWhatsAppMarkdown(normalizeHorizontalSpaces(text)).trim();
-  if (!rawTrimmed) return false;
+  if (!rawTrimmed || rawTrimmed.length > MAX_NLU_LEN) return false;
   const t = normalizePortugueseNumberWords(rawTrimmed);
 
-  if (
-    EXPLICIT_NEW_ORDER_INTENT_RE.test(t) ||
-    /\b(?:quero|preciso|vou|posso|pode|gostaria[ \t]+de)[ \t]+(?:pagar|fazer[ \t]+um[ \t]+pix|gerar)\b/i.test(
-      t
-    )
-  ) {
+  if (EXPLICIT_NEW_ORDER_INTENT_RE.test(t) || POLITE_NEW_ORDER_MODAL_RE.test(t)) {
     return false;
   }
 
@@ -1071,20 +1123,18 @@ export function isStatusQueryMessage(text: string): boolean {
 
 /**
  * Detecta mensagens/legendas pós-pagamento sem bloquear pedidos em 1ª pessoa ("Pago R$ 50", "Por R$ 50 pago agora")
- * nem negações ("Não paguei o pix de 50 ainda", "Paguei não").
+ * nem negações ("Não paguei o pix de 50 ainda", "Paguei não") nem novos pedidos ("Fiz uma compra de 50, pode mandar o pix?").
  */
 export function isPaymentConfirmationMessage(text: string): boolean {
-  if (typeof text !== 'string' || text.length > MAX_NLU_LEN) return false;
+  if (typeof text !== 'string' || text.length > MAX_NLU_LEN * 2) return false;
   const rawTrimmed = unwrapWhatsAppMarkdown(normalizeHorizontalSpaces(text)).trim();
-  if (!rawTrimmed) return false;
+  if (!rawTrimmed || rawTrimmed.length > MAX_NLU_LEN) return false;
 
   const t = normalizePortugueseNumberWords(rawTrimmed);
 
   if (
     EXPLICIT_NEW_ORDER_INTENT_RE.test(t) ||
-    /\b(?:quero|preciso|vou|posso|pode|gostaria[ \t]+de)[ \t]+(?:pagar|fazer[ \t]+um[ \t]+pix|gerar)\b/i.test(
-      t
-    ) ||
+    POLITE_NEW_ORDER_MODAL_RE.test(t) ||
     /(?:^|[ \t,;:.!?])(?:ainda[ \t]+)?n[aã]o[ \t]+(?:j[aá][ \t]+)?(?:paguei|quitei|depositei|passei|fiz|efetuei|realizei|mandei|enviei|transferi|foi|foram|est[aá]|est[aã]o|t[aá]|t[aã]o|consegui)\b/i.test(
       t
     ) ||
@@ -1120,9 +1170,14 @@ export function isPaymentConfirmationMessage(text: string): boolean {
     return true;
   }
 
+  const hasFutureReceiptPromise =
+    /\b(?:vou[ \t]+(?:mandar|enviar)|irei[ \t]+(?:mandar|enviar)|j[aá][ \t]+(?:envio|mando)|depois[ \t]+(?:envio|mando))[ \t]+(?:o[ \t]+)?comprovante\b/i.test(
+      t
+    );
+
   return (
     /\b(?:paguei|quitei|depositei|passei)\b/i.test(t) ||
-    /\bcomprovante\b/i.test(t) ||
+    (!hasFutureReceiptPromise && /\bcomprovante\b/i.test(t)) ||
     /\bsegue(?:[ \t]+(?:a[ií]|aqui|anexo|abaixo))?[ \t]+(?:(?:o|a|os|meu|minha)[ \t]+)?(?:pix|pagamento|comprovante|recibo|transfer[eê]ncia|dep[oó]sito)\b/i.test(
       t
     ) ||
@@ -1132,9 +1187,10 @@ export function isPaymentConfirmationMessage(text: string): boolean {
     /\b(?:pix|pagamento|cobran[cç]a|transfer[eê]ncia|transa[cç][aã]o|dep[oó]sito|valor)(?:[ \t]+pix)?(?:[ \t]+d[eo][ \t]+(?:r\$[ \t]*)?[\d.,]+(?:[ \t]+reais)?)?[ \t]+(?:j[aá][ \t]+)?(?:(?:foi|foram|est[aá]|est[aã]o|t[aá]|t[aã]o)[ \t]+)?(?:pag[oa]s?|enviad[oa]s?|feit[oa]s?|realizad[oa]s?|efetuad[oa]s?|conclu[ií]d[oa]s?|transferid[oa]s?|depositad[oa]s?|quitad[oa]s?)\b/i.test(
       t
     ) ||
-    /(?<![A-Za-zÀ-ÿ0-9])(?:j[aá][ \t]+)?(?:fiz|efetuei|realizei|mandei|enviei|transferi)(?:[ \t]+(?!n[aã]o(?![A-Za-zÀ-ÿ0-9])|nem\b|nunca\b|errad[oa]\b|outr[oa]\b)[A-Za-zÀ-ÿ]+){0,6}[ \t]+(?:pix|pagamento|dep[oó]sito|transfer[eê]ncia|cobran[cç]a|valor|comprovante|r\$[ \t]*\d|\d)/i.test(
-      t
-    ) ||
+    (!isQuestion &&
+      /(?<![A-Za-zÀ-ÿ0-9])(?:j[aá][ \t]+)?(?:fiz|efetuei|realizei|mandei|enviei|transferi)(?:[ \t]+(?!n[aã]o(?![A-Za-zÀ-ÿ0-9])|nem\b|nunca\b|errad[oa]\b|outr[oa]\b|compras?\b|pedidos?\b|or[cç]amentos?(?![A-Za-zÀ-ÿ0-9])|encomendas?\b|reservas?\b|cadastros?\b)[A-Za-zÀ-ÿ]+){0,6}[ \t]+(?:pix|pagamento|dep[oó]sito|transfer[eê]ncia|cobran[cç]a|valor|comprovante|r\$[ \t]*\d|\d)/i.test(
+        t
+      )) ||
     /\bacabei[ \t]+de[ \t]+(?:pagar|fazer|enviar|mandar|transferir|depositar|passar)\b/i.test(t)
   );
 }

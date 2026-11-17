@@ -304,8 +304,12 @@ export class ConversationEngine {
           await this.proceedWithAmount(phone, menuReply.inlineNewAmountBrl, session.customerJid);
           return;
         }
-        // Só reaproveita valor anterior se o cliente respondeu explicitamente à opção 2 do menu ("2", "2)", "opção 2")
-        if (menuReply.explicitOptionDigit === '2' && prevPendingAmt) {
+        // Só reaproveita valor anterior se o cliente respondeu explicitamente à opção 2 sem dígitos ambíguos extras!
+        if (
+          menuReply.explicitOptionDigit === '2' &&
+          prevPendingAmt &&
+          !hasUnparsedDigitsInMenuReply(text)
+        ) {
           await this.proceedWithAmount(phone, prevPendingAmt, session.customerJid);
           return;
         }
@@ -408,9 +412,13 @@ export class ConversationEngine {
       session.pendingNewAmountBrl = undefined;
       this.repository.saveSession(session);
 
-      // Somente consome `savedPendingAmt` se o cliente clicou/digitou explicitamente a opção numérica `2` (ou informou valor inline)
+      // Somente consome `savedPendingAmt` se o cliente clicou/digitou explicitamente a opção numérica `2` sem dígitos ambíguos extras!
       if (menuAfterExp.explicitOptionDigit === '2') {
-        const targetAmt = menuAfterExp.inlineNewAmountBrl ?? savedPendingAmt;
+        const hasAmbiguousNewDigits =
+          menuAfterExp.inlineNewAmountBrl === null && hasUnparsedDigitsInMenuReply(text);
+        const targetAmt =
+          menuAfterExp.inlineNewAmountBrl ??
+          (hasAmbiguousNewDigits ? undefined : savedPendingAmt);
         if (targetAmt) {
           await this.proceedWithAmount(phone, targetAmt, session.customerJid);
           return;
