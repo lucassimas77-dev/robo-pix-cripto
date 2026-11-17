@@ -174,9 +174,10 @@ export class DePixAppProvider implements IPixCryptoProvider {
 
     const estimatedNet = Math.max(0, Math.round((input.amountBrl * 0.98 - 0.99) * 100) / 100);
 
-    const saoPauloToday = new Intl.DateTimeFormat('en-CA', {
+    const expiresAtDate = new Date(Date.now() + expiresInSeconds * 1000);
+    const saoPauloDueDate = new Intl.DateTimeFormat('en-CA', {
       timeZone: 'America/Sao_Paulo',
-    }).format(new Date());
+    }).format(expiresAtDate);
 
     const uniqueSlug = `chg-${Date.now().toString(36)}-${crypto.randomBytes(5).toString('hex')}`;
 
@@ -185,7 +186,7 @@ export class DePixAppProvider implements IPixCryptoProvider {
       slug: uniqueSlug,
       amount: amountInCents,
       kind: 'charge',
-      due_date: saoPauloToday,
+      due_date: saoPauloDueDate,
       expires_in: expiresInSeconds,
       description: `Cobrança automática #${input.externalId}`,
       metadata: {
@@ -226,7 +227,7 @@ export class DePixAppProvider implements IPixCryptoProvider {
       throw new Error('Resposta da DePix App não retornou o link privado da cobrança.');
     }
 
-    const expiresAt = new Date(Date.now() + expiresInSeconds * 1000).toISOString();
+    const expiresAt = expiresAtDate.toISOString();
     const pixQrCodeBase64 = await QRCode.toDataURL(paymentUrl, { width: 320, margin: 2 });
 
     return {

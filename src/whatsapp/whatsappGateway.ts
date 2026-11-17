@@ -69,14 +69,16 @@ export class UnifiedWhatsAppGateway implements IWhatsAppGateway {
     });
 
     if (this.baileys?.isConnected()) {
+      let sentSummary = false;
       if (params.qrCodeBase64) {
-        await this.baileys.sendImageWithCaption(
+        sentSummary = await this.baileys.sendImageWithCaption(
           phone,
           params.qrCodeBase64,
           params.summaryText,
           params.preferredJid
         );
-      } else {
+      }
+      if (!sentSummary) {
         await this.baileys.sendText(phone, params.summaryText, params.preferredJid);
       }
       await this.baileys.sendText(phone, params.pixCopyPaste, params.preferredJid);
@@ -90,9 +92,11 @@ export class UnifiedWhatsAppGateway implements IWhatsAppGateway {
       }
       await this.sendViaMetaText(phone, params.pixCopyPaste);
     } else if (this.config.whatsappMode === 'evolution') {
+      let sentMedia = false;
       if (params.qrCodeBase64) {
-        await this.sendViaEvolutionMedia(phone, params.qrCodeBase64, params.summaryText);
-      } else {
+        sentMedia = await this.sendViaEvolutionMedia(phone, params.qrCodeBase64, params.summaryText);
+      }
+      if (!sentMedia) {
         await this.sendViaEvolutionText(phone, params.summaryText);
       }
       await this.sendViaEvolutionText(phone, params.pixCopyPaste);
@@ -182,9 +186,9 @@ export class UnifiedWhatsAppGateway implements IWhatsAppGateway {
     phone: string,
     dataUriBase64: string,
     caption: string
-  ): Promise<void> {
+  ): Promise<boolean> {
     const { apiUrl, apiKey, instanceName } = this.config.evolutionWhatsapp;
-    if (!apiKey) return;
+    if (!apiKey) return false;
 
     const mimeMatch = dataUriBase64.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,/i);
     const rawMime = mimeMatch ? mimeMatch[1].toLowerCase() : 'image/png';
@@ -195,7 +199,7 @@ export class UnifiedWhatsAppGateway implements IWhatsAppGateway {
       .replace(/\s+/g, '');
 
     try {
-      await fetch(`${apiUrl}/message/sendMedia/${encodeURIComponent(instanceName)}`, {
+      const res = await fetch(`${apiUrl}/message/sendMedia/${encodeURIComponent(instanceName)}`, {
         method: 'POST',
         headers: {
           apikey: apiKey,
@@ -211,8 +215,14 @@ export class UnifiedWhatsAppGateway implements IWhatsAppGateway {
         }),
         signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       });
+      if (!res.ok) {
+        console.error('[WhatsApp Evolution] Erro envio mídia HTTP', res.status);
+        return false;
+      }
+      return true;
     } catch (err) {
       console.error('[WhatsApp Evolution] Falha de transporte mídia:', err);
+      return false;
     }
   }
 }

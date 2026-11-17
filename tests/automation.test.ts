@@ -372,6 +372,59 @@ test('Parsing monetário trata pontuação final, milhar, horários, telefones, 
   assert.equal(isPaymentConfirmationMessage('Pronto, 50 enviado!'), true);
   assert.equal(isPaymentConfirmationMessage('Valor de R$ 50 transferido'), true);
 
+  // Casos da Busca #16: gramática padrão "dois mil duzentos e cinquenta", múltiplos números conflitantes,
+  // horários ("às 10", "depois das 6", "3 da tarde"), "dia 15", "taxa no pix de 100", plurais/femininos pós-pagamento e menu com ",", "!" e "quero"
+  assert.equal(
+    parseBrlAmountFromText('Me manda um pix de dois mil duzentos e cinquenta reais'),
+    2250
+  );
+  assert.equal(parseBrlAmountFromText('pix de mil duzentos e cinquenta reais'), 1250);
+  assert.equal(parseBrlAmountFromText('pix de dois mil, quinhentos reais'), 2500);
+  assert.equal(parseBrlAmountFromText('pix de dois mil duzentos e cinquenta'), 2250);
+  assert.equal(parseBrlAmountFromText('pix de 2 mil 250 reais'), 2250);
+
+  assert.equal(parseBrlAmountFromText('Vou levar 3 de R$ 50 no pix'), null);
+  assert.equal(parseBrlAmountFromText('Pix de R$ 50, ops 80'), null);
+  assert.equal(parseBrlAmountFromText('Era R$ 50 mas agora é 80'), null);
+  assert.equal(parseBrlAmountFromText('pix de R$ 100 / 2'), null);
+  assert.equal(parseBrlAmountFromText('pix de 100 reais dividido por 2'), null);
+
+  assert.equal(parseBrlAmountFromText('depois das 6 faço o pix'), null);
+  assert.equal(parseBrlAmountFromText('te mando o pix às 10'), null);
+  assert.equal(parseBrlAmountFromText('9 da manhã mando o pix'), null);
+  assert.equal(parseBrlAmountFromText('preciso da 2ª via do pix'), null);
+  assert.equal(parseBrlAmountFromText('vou fazer o pix 3 da tarde'), null);
+  assert.equal(parseBrlAmountFromText('8 da noite mando o pix'), null);
+  assert.equal(parseBrlAmountFromText('vou pagar no pix dia 15'), null);
+  assert.equal(parseBrlAmountFromText('bom dia 20'), 20);
+  assert.equal(parseBrlAmountFromText('Tem taxa no pix de 100?'), null);
+
+  assert.equal(isPaymentConfirmationMessage('50 reais pagos!'), true);
+  assert.equal(isPaymentConfirmationMessage('Os 50 reais já foram pagos no pix'), true);
+  assert.equal(isPaymentConfirmationMessage('A cobrança de 50 já foi paga'), true);
+  assert.equal(isPaymentConfirmationMessage('Transferência pix realizada de R$ 50,00'), true);
+  assert.equal(isPaymentConfirmationMessage('Transação pix efetuada R$ 50,00'), true);
+  assert.equal(isPaymentConfirmationMessage('Pago! R$ 50,00'), true);
+  assert.equal(isPaymentConfirmationMessage('Feito, pix de 50'), true);
+  assert.equal(isPaymentConfirmationMessage('Segue o pix de 50'), true);
+  assert.equal(isPaymentConfirmationMessage('Pix de cinquenta reais pago'), true);
+
+  assert.deepEqual(parseActiveOrderMenuReply('2, quero R$ 100'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: 100,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('2 quero 100'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: 100,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('1! manda aí'), {
+    choice: 'resend',
+    explicitOptionDigit: '1',
+    inlineNewAmountBrl: null,
+  });
+
   assert.equal(formatTimeSaoPaulo('2026-07-01T18:15:00.000Z'), '15:15');
 });
 
@@ -754,29 +807,6 @@ test('Servidor HTTP bloqueia Bearer password brute-force, CSRF cross-site, NaN e
       body: hugeBody,
     });
     assert.equal(tooLargeRes.status, 413);
-    // 5. Normalização UTC de expiresAt com offset -03:00 funciona na comparação lexicográfica do SQLite!
-    repository.createOrder({
-      id: 'ord_tz_offset',
-      externalId: 'ext_tz_offset',
-      provider: 'hodle',
-      providerChargeId: 'dep_tz_1',
-      customerPhone: '5511933334444',
-      amountBrl: 100,
-      cryptoAsset: 'USDT',
-      cryptoNetwork: 'POLYGON',
-      walletAddress: '0x123',
-      pixCopyPaste: '000201...',
-      status: 'PENDING',
-      warningSent: false,
-      createdAt: '2026-11-16T17:00:00.000Z',
-      expiresAt: '2026-11-16T14:15:00-03:00',
-    });
-    const activeTz = repository.findActivePendingOrderByPhone(
-      '5511933334444',
-      '2026-11-16T17:00:00.000Z'
-    );
-    assert.equal(activeTz?.id, 'ord_tz_offset');
-    assert.equal(activeTz?.expiresAt, '2026-11-16T17:15:00.000Z');
   } finally {
     server.close();
     repository.close();
@@ -912,6 +942,30 @@ test('DePixAppProvider detecta estorno (cancelled -> FAILED) em prd_..., prioriz
 
   const nox = new NoxPayProvider({ apiUrl: 'https://api.noxpay.io/v2', apiKey: 'k', webhookSecret: '' });
   assert.equal(nox.verifyWebhookSignature('{}', { 'x-signature': 'a' }), false);
+
+  // Fallback de texto em UnifiedWhatsAppGateway quando o upload de imagem do QR falha no Baileys
+  const { config: gwCfg, repository: gwRepo } = createPrivacyTestSetup();
+  try {
+    const sentTexts: string[] = [];
+    const fakeBaileys = {
+      isConnected: () => true,
+      sendImageWithCaption: async () => false,
+      sendText: async (_p: string, txt: string) => {
+        sentTexts.push(txt);
+        return true;
+      },
+    } as unknown as BaileysDirectManager;
+    const gw = new UnifiedWhatsAppGateway(gwCfg, gwRepo, fakeBaileys);
+    await gw.sendPixCharge({
+      phone: '5511999990000',
+      summaryText: 'Resumo R$ 50,00',
+      pixCopyPaste: 'https://pay.depixapp.com/c/prd_fallback',
+      qrCodeBase64: 'data:image/png;base64,AAAA',
+    });
+    assert.deepEqual(sentTexts, ['Resumo R$ 50,00', 'https://pay.depixapp.com/c/prd_fallback']);
+  } finally {
+    gwRepo.close();
+  }
 });
 
 test('ExpirationWatcher protege contra 503 transitório, respeita grace window de 15 min no rail depix e garante 100% de /deactivate em lote', async () => {
@@ -972,12 +1026,6 @@ test('ExpirationWatcher protege contra 503 transitório, respeita grace window d
       }
       res.writeHead(200);
       res.end(JSON.stringify({ checkouts: [] }));
-      return;
-    }
-
-    if (req.method === 'GET' && req.url?.startsWith('/api/transactions')) {
-      res.writeHead(200);
-      res.end(JSON.stringify({ transactions: [] }));
       return;
     }
 

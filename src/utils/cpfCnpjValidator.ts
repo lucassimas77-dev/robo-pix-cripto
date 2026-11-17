@@ -261,8 +261,8 @@ function parseNumericToken(token: string): number | null {
 
 const NUM_CORE =
   '(?:\\d{1,3}(?:\\.\\d{3})+,\\d{1,2}|\\d{1,3}(?:\\.\\d{3})+(?![.,]\\d|\\d)|\\d+,\\d{1,2}(?!\\d)|\\d+\\.\\d{1,2}(?![.,]\\d|\\d)|\\d+)';
-const NUM_LEFT = '(?<![-\\w@/,.])';
-const NUM_RIGHT = '(?![.,]\\d|\\d|[-\\w]|[ \\t]*%|\\.[a-zA-Z]|\\/[a-zA-Z0-9])';
+const NUM_LEFT = '(?<![-\\wÀ-ÿºª°@/,.])';
+const NUM_RIGHT = '(?![.,]\\d|\\d|[-\\wÀ-ÿºª°]|[ \\t]*%|\\.[a-zA-Z]|\\/[a-zA-Z0-9])';
 
 const PT_UNITS: Record<string, number> = {
   um: 1,
@@ -575,8 +575,9 @@ function normalizePortugueseNumberWords(input: string): string {
           nextSep.trimStart().startsWith('%') ||
           (nextWord === 'por' && nextNextWord === 'cento');
         const isCompoundTailAfterScale =
-          prevWord === 'e' &&
-          ['mil', 'real', 'reais', 'brl', 'conto', 'contos'].includes(prevPrevWord);
+          (prevWord === 'mil' && /^[ \t,]+$/.test(prevSep)) ||
+          (prevWord === 'e' &&
+            ['mil', 'real', 'reais', 'brl', 'conto', 'contos'].includes(prevPrevWord));
         const isAfterPixValueLabel =
           ['de', 'por', 'valor'].includes(prevWord) &&
           (prevWord === 'valor' ||
@@ -712,13 +713,25 @@ export function parseBrlAmountFromText(text: string): number | null {
       /(?:(?:\+\d{1,3}[ \t]*|\b55[ \t]+))?(?:\(0?\d{2}\)[ \t]*|\b0?\d{2}[ \t]*)\d{4,5}[-\s]?\d{4}\b/g,
       ' '
     )
-    // 3) Remove CEPs simples, telefones curtos, números longos e horários HH:MM(:SS)
+    // 3) Remove CEPs simples, telefones curtos, números longos, horários (HH:MM, 10h, "às 10", "3 da tarde") e datas ("dia 15")
     .replace(/(?<![\d.,/-])\d+-\d+(?![\d.,/-])/g, ' ')
     .replace(/\b\d{8,}\b/g, ' ')
     .replace(/\b\d{1,2}:\d{2}(?::\d{2})?\b/g, ' ')
-    .replace(/\b\d{1,2}h(?:\d{2})?\b/gi, ' ');
+    .replace(/\b\d{1,2}h(?:\d{2})?\b/gi, ' ')
+    .replace(
+      /(?<![A-Za-zÀ-ÿ0-9])(?:[aà]s|pelas|das)[ \t]+(?:[01]?\d|2[0-4])\b(?![.,]\d|[ \t]*(?:reais|real|brl|contos?|centavos?)\b)(?:[ \t]+da[ \t]+(?:manh[aã]|tarde|noite|madrugada)(?![A-Za-zÀ-ÿ0-9]))?/gi,
+      ' '
+    )
+    .replace(
+      /\b(?:[01]?\d|2[0-4])[ \t]+da[ \t]+(?:manh[aã]|tarde|noite|madrugada)(?![A-Za-zÀ-ÿ0-9])/gi,
+      ' '
+    )
+    .replace(
+      /(?<!\bbom[ \t]+)\bdia[ \t]+(?:[0-2]?\d|3[01])\b(?![.,]\d|[ \t]*(?:reais|real|brl|contos?|centavos?)\b)/gi,
+      ' '
+    );
 
-  // Converte numerais cardinais em português ("dois mil", "cinco mil", "três mil e quinhentos", "cem reais") em O(N)
+  // Converte numerais cardinais em português ("dois mil", "dois mil duzentos e cinquenta", "cem reais") em O(N)
   const withNormalizedPtNumbers = normalizePortugueseNumberWords(withoutContactsAndDates);
 
   // Rejeita valores negativos explícitos, vírgulas malformadas ("150,555", "1,500"), centavos decimais e quantificadores vagos antes de "mil"
@@ -735,13 +748,14 @@ export function parseBrlAmountFromText(text: string): number | null {
     return null;
   }
 
-  // Rejeita expressões aritméticas (+, *, -, menos) e dúvidas sobre taxas/descontos
+  // Rejeita expressões aritméticas (+, *, /, dividido, -, menos) e dúvidas sobre taxas/descontos (inclusive "taxa no pix de 100")
   if (
-    /\d[ \t]*[+*×÷][ \t]*(?:r\$[ \t]*)?\d/i.test(withNormalizedPtNumbers) ||
+    /\d[ \t]*[+*×÷/][ \t]*(?:r\$[ \t]*)?\d/i.test(withNormalizedPtNumbers) ||
+    /\bdividid[oa]s?[ \t]+(?:por|em)[ \t]+\d/i.test(withNormalizedPtNumbers) ||
     /(?<![-\w@/,.])(?:r\$[ \t]*)?\d[\d.,]*[ \t]*(?:reais|real|brl|contos?)?(?:[ \t]*-[ \t]*(?:r\$[ \t]*)?\d|[ \t]+menos[ \t]+(?:r\$[ \t]*)?\d)/i.test(
       withNormalizedPtNumbers
     ) ||
-    /\b(?:tem[ \t]+|qual[ \t]+(?:a[ \t]+)?|cobra[ \t]+)?(?:taxa|tarifa|juros|multa|desconto)[ \t]+d[eo][ \t]+(?:r\$[ \t]*)?\d/i.test(
+    /\b(?:taxa|tarifa|juros|multa|desconto)(?:[ \t]+(?:de|do|da|no|na|em|num|numa|pra|para|pro|sobre|acima|abaixo|por|o|a|um|uma|pix|pagamento|cobran[cç]a|valor)){1,6}[ \t]+(?:r\$[ \t]*)?\d/i.test(
       withNormalizedPtNumbers
     )
   ) {
@@ -786,20 +800,37 @@ export function parseBrlAmountFromText(text: string): number | null {
         return String(Math.round(mult * 1_000_000));
       }
     )
-    // Passagem única determinística para TODAS as composições com "mil" ("[N] mil [reais] [e meio | e M [reais] [e C centavos] | e C centavos]")
-    // Nota: "mil" isolado (sem dígito antes) exige início de frase, símbolo ou verbo/preposição válida, barrando typos como "doiz mil"!
+    // Passagem única determinística para TODAS as composições com "mil":
+    // Aceita tanto "[N] mil e M" quanto gramática padrão sem "e" / com vírgula para centenas ("[N] mil 250", "dois mil, quinhentos")!
     .replace(
-      /(?:(?<![-\w@/,.])(\d{1,4}(?:[.,]\d{1,2})?)(?![.,]\d|\d)[ \t]*|(?<=^|[ \t]*[:=(\-][ \t]*|r\$[ \t]*|\b(?:de|por|para|pra|no|em|gera|gerar|mand[ae]|mandar|faz|fa[cç]a|fazer|quero|preciso|pagar|cobran[cç]a|pix|valor|total|ser|[eé]|s[aã]o)[ \t]+))mil\b(?:[ \t]+(reais|real|brl|contos?)\b)?(?:[ \t]+e[ \t]+(?:(meio)\b|(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b|(\d{1,3})(?![.,]\d|\d|[ \t]*centavos?\b)(?:[ \t]*(reais|real|brl|contos?)\b)?(?:[ \t]+e[ \t]+(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b)?))?/gi,
-      (_m, multStr, unit1, halfWord, directCents, extraReais, unit2, tailCents) => {
+      /(?:(?<![-\wÀ-ÿºª°@/,.])(\d{1,4}(?:[.,]\d{1,2})?)(?![.,]\d|\d)[ \t]*|(?<=^|[ \t]*[:=(\-][ \t]*|r\$[ \t]*|(?<![A-Za-zÀ-ÿ0-9])(?:de|por|para|pra|no|em|gera|gerar|mand[ae]|mandar|faz|fa[cç]a|fazer|quero|preciso|pagar|cobran[cç]a|pix|valor|total|ser|[eé]|s[aã]o)[ \t]+))mil\b(?:[ \t]+(reais|real|brl|contos?)\b(?:[ \t]+e[ \t]+(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b)?|(?:[ \t]+e[ \t]+(?:(meio)\b|(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b|(\d{1,3})(?![.,]\d|\d|[ \t]*centavos?\b)(?:[ \t]*(reais|real|brl|contos?)\b)?(?:[ \t]+e[ \t]+(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b)?)|(?:[ \t]*,[ \t]*|[ \t]+)(?:(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b|([1-9]\d{2})(?![.,]\d|\d|[ \t]*centavos?\b)(?:[ \t]*(reais|real|brl|contos?)\b)?(?:[ \t]+e[ \t]+(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b)?))?)/gi,
+      (
+        _m,
+        multStr,
+        unit1,
+        unit1Cents,
+        halfWord,
+        eDirectCents,
+        eExtraReais,
+        eUnit2,
+        eTailCents,
+        bareDirectCents,
+        bareHundredsReais,
+        bareUnit2,
+        bareTailCents
+      ) => {
         const mult = multStr ? Number(String(multStr).replace(',', '.')) : 1;
         if (!Number.isFinite(mult) || mult <= 0) return ' ';
-        const addReais = halfWord ? 500 : extraReais ? Number(extraReais) : 0;
-        const cents = directCents ? Number(directCents) : tailCents ? Number(tailCents) : 0;
+        const extraStr = eExtraReais ?? bareHundredsReais;
+        const addReais = halfWord ? 500 : extraStr ? Number(extraStr) : 0;
+        const centsStr =
+          unit1Cents ?? eDirectCents ?? eTailCents ?? bareDirectCents ?? bareTailCents;
+        const cents = centsStr ? Number(centsStr) : 0;
         const total = Math.round((mult * 1000 + addReais + cents / 100) * 100) / 100;
         const formatted = Number.isInteger(total)
           ? String(total)
           : total.toFixed(2).replace('.', ',');
-        const hasUnit = Boolean(unit1 || unit2 || directCents || tailCents);
+        const hasUnit = Boolean(unit1 || eUnit2 || bareUnit2 || centsStr);
         return hasUnit ? `${formatted} reais` : formatted;
       }
     )
@@ -833,38 +864,14 @@ export function parseBrlAmountFromText(text: string): number | null {
     .map((m) => parseNumericToken(m[1]))
     .filter((v): v is number => v !== null);
 
-  // Rejeita dúvidas/escolhas com "ou" quando há 2 ou mais números distintos na frase
-  if (
-    /(?<!\d)\d+(?:[.,]\d+)?(?:[ \t]+(?:reais|real|brl|conto|contos))?[ \t]+ou[ \t]+(?:r\$[ \t]*)?\d/i.test(
-      sanitized
-    ) ||
-    (/\bou\b/i.test(sanitized) && new Set(allMatches).size > 1)
-  ) {
+  // Qualquer segundo número distinto remanescente na frase após limpar datas/horários/contatos/documentos
+  // ("Vou levar 3 de R$ 50", "Pix de R$ 50, ops 80", "Era R$ 50 mas agora é 80") representa ambiguidade real!
+  const uniqueCandidates = Array.from(new Set(allMatches));
+  if (uniqueCandidates.length !== 1) {
     return null;
   }
 
-  // Camadas 1 & 2 combinadas: se houver valores explícitos com "R$" e/ou "reais", exige que não haja conflito entre eles!
-  const explicitPrefixGlobal = new RegExp(`(?<!-)r\\$[ \\t]*(${NUM_CORE})${NUM_RIGHT}`, 'gi');
-  const prefixMatches = Array.from(sanitized.matchAll(explicitPrefixGlobal))
-    .map((m) => parseNumericToken(m[1]))
-    .filter((v): v is number => v !== null);
-
-  const explicitSuffixGlobal = new RegExp(
-    `${NUM_LEFT}(${NUM_CORE})[ \\t]*(?:reais|real|brl|conto|contos)\\b`,
-    'gi'
-  );
-  const suffixMatches = Array.from(sanitized.matchAll(explicitSuffixGlobal))
-    .map((m) => parseNumericToken(m[1]))
-    .filter((v): v is number => v !== null);
-
-  const uniqueExplicit = Array.from(new Set([...prefixMatches, ...suffixMatches]));
-  if (uniqueExplicit.length > 1) return null;
-  if (uniqueExplicit.length === 1) return uniqueExplicit[0];
-
-  // Camada 3: único número candidato inequívoco na frase
-  if (allMatches.length !== 1) return null;
-
-  return allMatches[0];
+  return uniqueCandidates[0];
 }
 
 /**
@@ -958,15 +965,15 @@ export function parseActiveOrderMenuReply(text: string): ActiveMenuParseResult {
     const startsWithNumberUnit =
       !menuWord &&
       remainder.length > 0 &&
-      /^(?:mil\b|milh[aã]o\b|milh[oõ]es\b|reais\b|real\b|brl\b|contos?\b|pilas?\b|centavos?\b|pix\b|e\b|ou\b|mais\b|menos\b|a\b|at[eé]\b|x\b|vezes\b|itens?\b|unidades?\b|parcelas?\b|min\b|minutos?\b|horas?\b|dias?\b|%)/i.test(
+      /^(?:mil|milh[aã]o|milh[oõ]es|reais|real|brl|contos?|pilas?|centavos?|pix|e|ou|mais|menos|a|at[eé]|x|vezes|itens?|unidades?|parcelas?|min|minutos?|horas?|dias?)(?![A-Za-zÀ-ÿ0-9])|^%/i.test(
         remainder
       );
 
-    const hasExplicitBullet = Boolean(menuWord || openSym || /[)\].:\-]/.test(sep));
+    const hasExplicitBullet = Boolean(menuWord || openSym || /[)\].:\-!?]/.test(sep));
     const allowedBareRemainder =
       remainder.length === 0 ||
       hasExplicitBullet ||
-      /^(?:por[ \t]+favor\b|pfv?\b|obrigad[oa]\b|valeu\b|agrade[cç]o\b|agora\b|a[ií]\b|reenvi\w*\b|manter\b|mantenha\b|continu\w*\b|cancel\w*\b|gerar\b|gera\b|fazer\b|faz\b|nov[oa]\b|outr[oa]\b|trocar\b|troca\b|mudar\b|muda\b|substituir\b|alterar\b)/i.test(
+      /^(?:r\$|(?:por[ \t]+favor|pfv?|obrigad[oa]|valeu|agrade[cç]o|agora|a[ií]|quero|preciso|mand[ae]|mandar|envi[ae]|enviar|pode|escolho|prefiro|vai|sim|ok|beleza|blz|fechado|isso|reenvi\w*|manter|mantenha|continu\w*|cancel\w*|gerar|gera|fazer|faz|nov[oa]|outr[oa]|trocar|troca|mudar|muda|substituir|alterar)(?![A-Za-zÀ-ÿ0-9]))/i.test(
         remainder
       );
 
@@ -1068,8 +1075,10 @@ export function isStatusQueryMessage(text: string): boolean {
  */
 export function isPaymentConfirmationMessage(text: string): boolean {
   if (typeof text !== 'string' || text.length > MAX_NLU_LEN) return false;
-  const t = unwrapWhatsAppMarkdown(text).trim();
-  if (!t) return false;
+  const rawTrimmed = unwrapWhatsAppMarkdown(text).trim();
+  if (!rawTrimmed) return false;
+
+  const t = normalizePortugueseNumberWords(rawTrimmed);
 
   if (
     EXPLICIT_NEW_ORDER_INTENT_RE.test(t) ||
@@ -1080,7 +1089,8 @@ export function isPaymentConfirmationMessage(text: string): boolean {
     return false;
   }
 
-  if (normalizeCommandText(t) === 'pago') {
+  const cmdNorm = normalizeCommandText(t);
+  if (cmdNorm === 'pago' || cmdNorm === 'paga' || cmdNorm === 'pagos') {
     return true;
   }
 
@@ -1091,11 +1101,13 @@ export function isPaymentConfirmationMessage(text: string): boolean {
   if (
     !isQuestion &&
     !hasConditionalOfferPrefix &&
-    (/^[ \t]*pago[ \t]+(?:o|meu)[ \t]+(?:pix|pagamento)\b/i.test(t) ||
-      /^[ \t]*(?:feito|realizado|efetuado|enviado|transferido|depositado|quitado)[ \t]+(?:o[ \t]+|meu[ \t]+)?(?:pix|pagamento|valor|r\$[ \t]*\d)/i.test(
+    (/^[ \t]*pag[oa]s?(?:[ \t]+(?:o|a|os|as|meu|minha)[ \t]+(?:pix|pagamento|cobran[cç]a|valor)\b|[!,.:;-]+[ \t]*(?:o[ \t]+|meu[ \t]+|pix\b|pagamento\b|r\$\s*\d|\d))/i.test(
+      t
+    ) ||
+      /^[ \t]*(?:feit[oa]s?|realizad[oa]s?|efetuad[oa]s?|enviad[oa]s?|transferid[oa]s?|depositad[oa]s?|quitad[oa]s?|conclu[ií]d[oa]s?)(?:[!,.:;-]+[ \t]*|[ \t]+)(?:(?:o|a|os|as|meu|minha)[ \t]+)?(?:pix|pagamento|cobran[cç]a|valor|r\$[ \t]*\d|\d)/i.test(
         t
       ) ||
-      /(?:(?<!\w)r\$[ \t]*\d[\d.,]*|(?<![-\w.,])\d[\d.,]*)[ \t]*(?:reais[ \t]+)?(?:j[aá][ \t]+)?(?:foi[ \t]+|est[aá][ \t]+|t[aá][ \t]+)?(?:pago(?![ \t]+(?:agora|hoje|amanh[aã]|depois|se\b))|enviado|transferido|feito|realizado|efetuado|depositado|quitado)\b/i.test(
+      /(?:(?<!\w)r\$[ \t]*\d[\d.,]*|(?<![-\w.,])\d[\d.,]*)[ \t]*(?:reais[ \t]+)?(?:j[aá][ \t]+)?(?:(?:foi|foram|est[aá]|est[aã]o|t[aá]|t[aã]o)[ \t]+)?(?:pago(?![ \t]+(?:agora|hoje|amanh[aã]|depois|se\b))|paga|pagos|pagas|enviad[oa]s?|transferid[oa]s?|feit[oa]s?|realizad[oa]s?|efetuad[oa]s?|depositad[oa]s?|quitad[oa]s?|conclu[ií]d[oa]s?)\b/i.test(
         t
       ))
   ) {
@@ -1105,13 +1117,13 @@ export function isPaymentConfirmationMessage(text: string): boolean {
   return (
     /\b(?:paguei|quitei|depositei|passei)\b/i.test(t) ||
     /\bcomprovante\b/i.test(t) ||
-    /\b(?:t[aá]|est[aá]|foi)[ \t]+(?:pago|enviado|transferido|feito|realizado|efetuado|depositado|quitado)\b/i.test(
+    /\bsegue(?:[ \t]+(?:a[ií]|aqui|anexo|abaixo))?[ \t]+(?:(?:o|a|os|meu|minha)[ \t]+)?(?:pix|pagamento|comprovante|recibo|transfer[eê]ncia|dep[oó]sito)\b/i.test(
       t
     ) ||
-    /\bpix[ \t]+(?:de[ \t]+)?(?:(?:r\$[ \t]*)?[\d.,]+[ \t]+(?:reais[ \t]+)?)?(?:j[aá][ \t]+)?(?:foi[ \t]+|est[aá][ \t]+|t[aá][ \t]+)?(?:pago|enviado|feito|realizado|efetuado|conclu[ií]do|transferido)\b/i.test(
+    /\b(?:t[aá]|est[aá]|foi|foram|est[aã]o|t[aã]o)[ \t]+(?:pag[oa]s?|enviad[oa]s?|transferid[oa]s?|feit[oa]s?|realizad[oa]s?|efetuad[oa]s?|depositad[oa]s?|quitad[oa]s?|conclu[ií]d[oa]s?)\b/i.test(
       t
     ) ||
-    /\bpagamento[ \t]+(?:d[eo][ \t]+)?(?:(?:r\$[ \t]*)?[\d.,]+[ \t]+(?:reais[ \t]+)?)?(?:j[aá][ \t]+)?(?:foi[ \t]+|est[aá][ \t]+|t[aá][ \t]+)?(?:feito|realizado|efetuado|enviado|conclu[ií]do|pago|transferido)\b/i.test(
+    /\b(?:pix|pagamento|cobran[cç]a|transfer[eê]ncia|transa[cç][aã]o|dep[oó]sito|valor)(?:[ \t]+pix)?(?:[ \t]+d[eo][ \t]+(?:r\$[ \t]*)?[\d.,]+(?:[ \t]+reais)?)?[ \t]+(?:j[aá][ \t]+)?(?:(?:foi|foram|est[aá]|est[aã]o|t[aá]|t[aã]o)[ \t]+)?(?:pag[oa]s?|enviad[oa]s?|feit[oa]s?|realizad[oa]s?|efetuad[oa]s?|conclu[ií]d[oa]s?|transferid[oa]s?|depositad[oa]s?|quitad[oa]s?)\b/i.test(
       t
     ) ||
     /\b(?:j[aá][ \t]+)?(?:fiz|efetuei|realizei|mandei|enviei|transferi)(?:[ \t]+(?:agora|agorinha|a[ií]|l[aá]|aqui|j[aá]|ali|hoje|pra|para|pro|p|vc|voc[eê]|tu|senhor|senhora|o|os|a|as|um|uma|meu|minha|esse|essa)){0,4}[ \t]+(?:pix|pagamento|dep[oó]sito|transfer[eê]ncia|valor|comprovante|r\$[ \t]*\d|\d)/i.test(
