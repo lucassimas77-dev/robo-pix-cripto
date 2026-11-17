@@ -2864,3 +2864,122 @@ test('12. Busca #32: fronteiras Unicode (milímetros/°C), invisíveis ZWSP/LRM,
   }
   assert.equal(isPostOrderFollowUpMessage('Pronto, mandei 50 mensagens'), false);
 });
+
+test('13. Busca #33: menu ("01"/"02"/"Opc 2"/"Quero a atual"), sufixo "k", novos pedidos por vírgula ("manda de 100"), "Transferi!", cobrança a maior/bloqueio/conta errada, "Aceita 80?", saudações em comandos e "hum mil"', () => {
+  // Achado 1: Menu 1 / 2 com zero à esquerda, abreviações e "atual"
+  for (const msg of ['01', 'Opção 01', 'Opc 1', 'Nº 1', 'Num 1']) {
+    assert.deepEqual(
+      parseActiveOrderMenuReply(msg),
+      { choice: 'resend', explicitOptionDigit: '1', inlineNewAmountBrl: null },
+      `Falha menu 01 em: ${msg}`
+    );
+    assert.equal(hasUnparsedDigitsInMenuReply(msg), false);
+  }
+  for (const msg of [
+    'Quero a atual',
+    'Pode ser a atual',
+    'Fico com a atual',
+    'Prefiro a atual',
+    'A atual',
+    'Essa atual',
+  ]) {
+    assert.deepEqual(
+      parseActiveOrderMenuReply(msg),
+      { choice: 'resend', explicitOptionDigit: null, inlineNewAmountBrl: null },
+      `Falha menu atual em: ${msg}`
+    );
+  }
+  for (const [msg, amt] of [
+    ['02', null],
+    ['Opc 2', null],
+    ['Opção 02', null],
+    ['Nº 2', null],
+    ['Num 2', null],
+    ['02 - gerar 120', 120],
+  ] as Array<[string, number | null]>) {
+    assert.deepEqual(
+      parseActiveOrderMenuReply(msg),
+      { choice: 'new', explicitOptionDigit: '2', inlineNewAmountBrl: amt },
+      `Falha menu 02 em: ${msg}`
+    );
+  }
+  assert.equal(hasUnparsedDigitsInMenuReply('02'), false);
+  assert.equal(hasUnparsedDigitsInMenuReply('Opc 2'), false);
+
+  // Achado 2: Sufixo "k" colado ou espaçado sem falsos positivos em "TV 4k" / "Ouro 18k"
+  assert.equal(parseBrlAmountFromText('pix de 5 k'), 5000);
+  assert.equal(parseBrlAmountFromText('pix de 5k'), 5000);
+  assert.equal(parseBrlAmountFromText('manda 5,5 k no pix'), 5500);
+  assert.equal(parseBrlAmountFromText('2 k no pix'), 2000);
+  assert.equal(parseBrlAmountFromText('TV 4k no pix'), null);
+  assert.equal(parseBrlAmountFromText('TV 4 k, manda pix de 50'), 50);
+  assert.equal(parseBrlAmountFromText('Ouro 18k no pix'), null);
+  assert.equal(parseBrlAmountFromText('Anel de ouro 18 k, manda pix de 200'), 200);
+
+  // Achado 3: Pedidos explícitos de novo Pix separados por vírgula/ponto sem repetir "pix"/"reais"
+  for (const [msg, expected] of [
+    ['Já paguei aquele, manda de 100', 100],
+    ['Já paguei aquele, faz 100 pra mim', 100],
+    ['Deu erro no link, gera de 80', 80],
+    ['Venceu o link, manda de 50', 50],
+    ['Cancela a atual, gera de 80', 80],
+    ['Cancela esse, manda 80', 80],
+  ] as Array<[string, number]>) {
+    assert.equal(isStatusQueryMessage(msg), false, `Não deveria ser status: ${msg}`);
+    assert.equal(isPaymentConfirmationMessage(msg), false, `Não deveria ser pago: ${msg}`);
+    assert.equal(parseBrlAmountFromText(msg), expected, `Deveria extrair ${expected} em: ${msg}`);
+  }
+
+  // Achado 4: "Transferi!" intransitivo em isPaymentConfirmationMessage e isPostOrderFollowUpMessage
+  for (const msg of [
+    'Transferi!',
+    'Já transferi!',
+    'Transferi agora!',
+    'Já te transferi!',
+    'Pronto, transferi!',
+  ]) {
+    assert.equal(isPaymentConfirmationMessage(msg), true, `Deveria confirmar pagamento: ${msg}`);
+    assert.equal(isPostOrderFollowUpMessage(msg), true, `Deveria aceitar follow-up: ${msg}`);
+  }
+  assert.equal(isPaymentConfirmationMessage('Transferi os arquivos'), false);
+
+  // Achado 5: Cobrança a maior em 3ª pessoa, bloqueio cautelar e destinatário errado
+  for (const msg of [
+    'Cobrou 50 a mais no pix',
+    'Veio cobrando 50 a mais no pix',
+    'Me cobraram 50 a mais no pix',
+    'Caiu no bloqueio cautelar o pix de 500',
+    'Deu bloqueio no pix de 500',
+    'Fiz o pix de 50 pra conta errada',
+    'Mandei os 50 pra pessoa errada no pix',
+    'Foi 50 pra conta errada no pix',
+  ]) {
+    assert.equal(isStatusQueryMessage(msg), true, `Deveria ser status: ${msg}`);
+    assert.equal(parseBrlAmountFromText(msg), null, `Não deveria cobrar: ${msg}`);
+  }
+
+  // Achado 6: Propostas/pechinchas ("Aceita 80?", "80 no pix fecha?") e pagamento parcial/escalonado
+  for (const msg of [
+    'Aceita 80 no pix?',
+    'Topa 80 no pix?',
+    'Por 80 no pix fecha?',
+    '80 no pix fecha?',
+    'R$ 80 no pix rola?',
+    'Pago 50 hoje e o resto amanhã no pix?',
+    'Posso dar 50 de sinal no pix?',
+    'Aceita 50 de entrada no pix?',
+    'Me cobra 50 a menos no pix?',
+  ]) {
+    assert.equal(parseBrlAmountFromText(msg), null, `Deveria bloquear proposta: ${msg}`);
+  }
+
+  // Achado 7: Saudações e modais em isExitCommand/isCancelCommand + "hum mil" / "cinqüenta"
+  assert.equal(isCancelCommand('Oi, pode cancelar o pix?'), true);
+  assert.equal(isCancelCommand('Bom dia, cancela o pix por favor'), true);
+  assert.equal(isExitCommand('Quero sair'), true);
+  assert.equal(isExitCommand('Pode encerrar'), true);
+  assert.equal(isExitCommand('Oi, pode encerrar o atendimento'), true);
+  assert.equal(parseBrlAmountFromText('pix de hum mil reais'), 1000);
+  assert.equal(parseBrlAmountFromText('Hum, manda pix de 50'), 50);
+  assert.equal(parseBrlAmountFromText('pix de cinqüenta reais'), 50);
+});
