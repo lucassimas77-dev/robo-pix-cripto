@@ -7,7 +7,11 @@ import type {
   IPixCryptoProvider,
   WebhookSettlementEvent,
 } from '../types/domain.ts';
-import { safeOptionalId, safePrimitiveString } from '../utils/cpfCnpjValidator.ts';
+import {
+  safeOptionalId,
+  safePositiveNumber,
+  safePrimitiveString,
+} from '../utils/cpfCnpjValidator.ts';
 
 export class MockProvider implements IPixCryptoProvider {
   public readonly name = 'mock' as const;
@@ -81,10 +85,6 @@ export class MockProvider implements IPixCryptoProvider {
     >;
 
     if (event === 'MOCK_SETTLED_CRYPTO') {
-      const cryptoNum =
-        typeof data.cryptoAmount === 'number' || typeof data.cryptoAmount === 'string'
-          ? Number(data.cryptoAmount)
-          : NaN;
       return {
         provider: 'mock',
         eventId: safeOptionalId(obj.eventId),
@@ -93,7 +93,7 @@ export class MockProvider implements IPixCryptoProvider {
         newStatus: 'SETTLED_CRYPTO',
         txHash: safeOptionalId(data.txHash) ?? `0x${crypto.randomBytes(32).toString('hex')}`,
         endToEndId: safeOptionalId(data.endToEndId) ?? `E00000000${Date.now()}MOCK`,
-        cryptoAmount: Number.isFinite(cryptoNum) ? cryptoNum : undefined,
+        cryptoAmount: safePositiveNumber(data.cryptoAmount),
         rawEventName: event,
       };
     }

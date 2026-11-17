@@ -6,6 +6,7 @@ import { createCryptoProvider } from './providers/providerFactory.ts';
 import { createAppHttpServer } from './server/httpServer.ts';
 import { ConversationEngine } from './services/conversationEngine.ts';
 import { ExpirationWatcher } from './services/expirationWatcher.ts';
+import { stripTrailingSlashes } from './utils/cpfCnpjValidator.ts';
 import { BaileysDirectManager } from './whatsapp/baileysManager.ts';
 import { UnifiedWhatsAppGateway } from './whatsapp/whatsappGateway.ts';
 
@@ -105,7 +106,7 @@ async function bootstrap(): Promise<void> {
   const externalKeepAliveUrl = process.env.RENDER_EXTERNAL_URL;
   let keepAliveTimer: NodeJS.Timeout | undefined;
   if (externalKeepAliveUrl) {
-    const cleanUrl = externalKeepAliveUrl.replace(/\/+$/, '');
+    const cleanUrl = stripTrailingSlashes(externalKeepAliveUrl);
     keepAliveTimer = setInterval(() => {
       fetch(`${cleanUrl}/health`, { signal: AbortSignal.timeout(10_000) }).catch(() => {});
     }, 10 * 60 * 1000);

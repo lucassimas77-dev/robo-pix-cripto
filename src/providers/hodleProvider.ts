@@ -8,7 +8,12 @@ import type {
   OrderStatus,
   WebhookSettlementEvent,
 } from '../types/domain.ts';
-import { safeOptionalId, safePrimitiveString } from '../utils/cpfCnpjValidator.ts';
+import {
+  safeOptionalId,
+  safePositiveNumber,
+  safePrimitiveString,
+  stripTrailingSlashes,
+} from '../utils/cpfCnpjValidator.ts';
 
 const FETCH_TIMEOUT_MS = 15_000;
 
@@ -24,7 +29,7 @@ export class HodleProvider implements IPixCryptoProvider {
 
   constructor(config: { apiUrl: string; apiKey: string; webhookSecret: string }) {
     this.config = {
-      apiUrl: config.apiUrl.replace(/\/+$/, ''),
+      apiUrl: stripTrailingSlashes(config.apiUrl),
       apiKey: config.apiKey.trim(),
       webhookSecret: config.webhookSecret.trim(),
     };
@@ -52,9 +57,8 @@ export class HodleProvider implements IPixCryptoProvider {
       );
       if (quoteRes.ok) {
         const quoteData = (await quoteRes.json()) as Record<string, unknown>;
-        if (quoteData.estimatedAmount != null || quoteData.amountOut != null) {
-          estimatedCryptoAmount = Number(quoteData.estimatedAmount ?? quoteData.amountOut);
-        }
+        estimatedCryptoAmount =
+          safePositiveNumber(quoteData.estimatedAmount) ?? safePositiveNumber(quoteData.amountOut);
       }
     } catch {
       // Cotação prévia opcional
@@ -112,10 +116,7 @@ export class HodleProvider implements IPixCryptoProvider {
         safeOptionalId(data.id) ?? safeOptionalId(data.depositId) ?? input.externalId,
       pixCopyPaste,
       pixQrCodeBase64,
-      estimatedCryptoAmount:
-        typeof data.assetAmount === 'number' || typeof data.assetAmount === 'string'
-          ? Number(data.assetAmount)
-          : estimatedCryptoAmount,
+      estimatedCryptoAmount: safePositiveNumber(data.assetAmount) ?? estimatedCryptoAmount,
       expiresAt,
     };
   }
@@ -163,11 +164,6 @@ export class HodleProvider implements IPixCryptoProvider {
 
     if (!newStatus) return null;
 
-    const amtNum =
-      typeof data.amount === 'number' || typeof data.amount === 'string'
-        ? Number(data.amount)
-        : NaN;
-
     return {
       provider: 'hodle',
       eventId: safeOptionalId(root.eventId),
@@ -176,7 +172,7 @@ export class HodleProvider implements IPixCryptoProvider {
       newStatus,
       txHash: safeOptionalId(data.txHash),
       endToEndId: safeOptionalId(data.endToEndId),
-      cryptoAmount: Number.isFinite(amtNum) ? amtNum : undefined,
+      cryptoAmount: safePositiveNumber(data.amount),
       rawEventName: event,
     };
   }
@@ -199,14 +195,10 @@ export class HodleProvider implements IPixCryptoProvider {
       const data = (await res.json()) as Record<string, unknown>;
       const st = safePrimitiveString(data.status).toUpperCase();
       if (st === 'COMPLETED' || st === 'ASSET_SUCCESS' || st === 'SETTLED') {
-        const assetAmt =
-          typeof data.assetAmount === 'number' || typeof data.assetAmount === 'string'
-            ? Number(data.assetAmount)
-            : NaN;
         return {
           status: 'SETTLED_CRYPTO',
           txHash: safeOptionalId(data.txHash),
-          cryptoAmount: Number.isFinite(assetAmt) ? assetAmt : undefined,
+          cryptoAmount: safePositiveNumber(data.assetAmount),
         };
       }
       if (st === 'PIX_CONFIRMED' || st === 'PAID' || st === 'PROCESSING') {

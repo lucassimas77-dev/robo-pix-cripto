@@ -1,6 +1,7 @@
 import path from 'node:path';
 import dotenv from 'dotenv';
 import type { SupportedProviderName } from '../types/domain.ts';
+import { stripTrailingSlashes } from '../utils/cpfCnpjValidator.ts';
 
 dotenv.config();
 
@@ -99,7 +100,7 @@ export function loadConfig(): AppConfig {
   return {
     port: clampInt(process.env.PORT, 3000, 1, 65535),
     dataDir,
-    publicBaseUrl: autoBaseUrl.replace(/\/+$/, ''),
+    publicBaseUrl: stripTrailingSlashes(autoBaseUrl),
     adminPassword: (process.env.ADMIN_PASSWORD || '').trim(),
     cryptoProvider,
     walletAddress: (process.env.WALLET_ADDRESS || '').trim(),
@@ -110,17 +111,19 @@ export function loadConfig(): AppConfig {
     whatsappMode,
     adminWhatsappPhone: (process.env.ADMIN_WHATSAPP_PHONE || '').replace(/\D/g, ''),
     depixapp: {
-      apiUrl: (process.env.DEPIXAPP_API_URL || 'https://api.depixapp.com/api').replace(/\/+$/, ''),
+      apiUrl: stripTrailingSlashes(
+        process.env.DEPIXAPP_API_URL || 'https://api.depixapp.com/api'
+      ),
       apiKey: (process.env.DEPIXAPP_API_KEY || '').trim(),
       webhookSecret: (process.env.DEPIXAPP_WEBHOOK_SECRET || '').trim(),
     },
     hodle: {
-      apiUrl: (process.env.HODLE_API_URL || 'https://api.hodle.com.br').replace(/\/+$/, ''),
+      apiUrl: stripTrailingSlashes(process.env.HODLE_API_URL || 'https://api.hodle.com.br'),
       apiKey: (process.env.HODLE_API_KEY || '').trim(),
       webhookSecret: (process.env.HODLE_WEBHOOK_SECRET || '').trim(),
     },
     noxpay: {
-      apiUrl: (process.env.NOXPAY_API_URL || 'https://api.noxpay.io/v2').replace(/\/+$/, ''),
+      apiUrl: stripTrailingSlashes(process.env.NOXPAY_API_URL || 'https://api.noxpay.io/v2'),
       apiKey: (process.env.NOXPAY_API_KEY || '').trim(),
       webhookSecret: (process.env.NOXPAY_WEBHOOK_SECRET || '').trim(),
     },
@@ -130,7 +133,7 @@ export function loadConfig(): AppConfig {
       verifyToken: (process.env.META_WA_VERIFY_TOKEN || '').trim(),
     },
     evolutionWhatsapp: {
-      apiUrl: (process.env.EVOLUTION_API_URL || 'http://localhost:8080').replace(/\/+$/, ''),
+      apiUrl: stripTrailingSlashes(process.env.EVOLUTION_API_URL || 'http://localhost:8080'),
       apiKey: (process.env.EVOLUTION_API_KEY || '').trim(),
       instanceName: (process.env.EVOLUTION_INSTANCE_NAME || 'pix_crypto_bot').trim(),
     },

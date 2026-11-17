@@ -8,7 +8,12 @@ import type {
   OrderStatus,
   WebhookSettlementEvent,
 } from '../types/domain.ts';
-import { safeOptionalId, safePrimitiveString } from '../utils/cpfCnpjValidator.ts';
+import {
+  safeOptionalId,
+  safePositiveNumber,
+  safePrimitiveString,
+  stripTrailingSlashes,
+} from '../utils/cpfCnpjValidator.ts';
 
 const FETCH_TIMEOUT_MS = 15_000;
 
@@ -24,7 +29,7 @@ export class NoxPayProvider implements IPixCryptoProvider {
 
   constructor(config: { apiUrl: string; apiKey: string; webhookSecret: string }) {
     this.config = {
-      apiUrl: config.apiUrl.replace(/\/+$/, ''),
+      apiUrl: stripTrailingSlashes(config.apiUrl),
       apiKey: config.apiKey.trim(),
       webhookSecret: config.webhookSecret.trim(),
     };
@@ -83,17 +88,13 @@ export class NoxPayProvider implements IPixCryptoProvider {
       new Date(Date.now() + input.expirationMinutes * 60_000).toISOString();
 
     const pixQrCodeBase64 = await QRCode.toDataURL(pixCopyPaste, { width: 320, margin: 2 });
-    const cryptoNum =
-      typeof data.amount_crypto === 'number' || typeof data.amount_crypto === 'string'
-        ? Number(data.amount_crypto)
-        : NaN;
 
     return {
       providerChargeId: safeOptionalId(data.txid) ?? safeOptionalId(data.id) ?? input.externalId,
       pixCopyPaste,
       pixQrCodeBase64,
       paymentUrl: safeOptionalId(data.checkout_url),
-      estimatedCryptoAmount: Number.isFinite(cryptoNum) ? cryptoNum : undefined,
+      estimatedCryptoAmount: safePositiveNumber(data.amount_crypto),
       expiresAt,
     };
   }
@@ -136,11 +137,6 @@ export class NoxPayProvider implements IPixCryptoProvider {
 
     if (!newStatus) return null;
 
-    const cryptoNum =
-      typeof obj.amount_crypto === 'number' || typeof obj.amount_crypto === 'string'
-        ? Number(obj.amount_crypto)
-        : NaN;
-
     return {
       provider: 'noxpay',
       eventId: safeOptionalId(obj.event_id),
@@ -148,7 +144,7 @@ export class NoxPayProvider implements IPixCryptoProvider {
       externalId: safeOptionalId(obj.external_id),
       newStatus,
       txHash: safeOptionalId(obj.tx_hash),
-      cryptoAmount: Number.isFinite(cryptoNum) ? cryptoNum : undefined,
+      cryptoAmount: safePositiveNumber(obj.amount_crypto),
       rawEventName: statusRaw,
     };
   }
@@ -171,14 +167,10 @@ export class NoxPayProvider implements IPixCryptoProvider {
       const obj = (await res.json()) as Record<string, unknown>;
       const st = safePrimitiveString(obj.status).toUpperCase();
       if (st === 'COMPLETED' || st === 'SETTLED') {
-        const cryptoNum =
-          typeof obj.amount_crypto === 'number' || typeof obj.amount_crypto === 'string'
-            ? Number(obj.amount_crypto)
-            : NaN;
         return {
           status: 'SETTLED_CRYPTO',
           txHash: safeOptionalId(obj.tx_hash),
-          cryptoAmount: Number.isFinite(cryptoNum) ? cryptoNum : undefined,
+          cryptoAmount: safePositiveNumber(obj.amount_crypto),
         };
       }
       if (st === 'PAID' || st === 'PIX_PAID') {

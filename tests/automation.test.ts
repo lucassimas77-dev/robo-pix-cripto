@@ -18,6 +18,7 @@ import {
   isPaymentConfirmationMessage,
   normalizeCommandText,
   parseBrlAmountFromText,
+  stripTrailingSlashes,
 } from '../src/utils/cpfCnpjValidator.ts';
 import { BaileysDirectManager } from '../src/whatsapp/baileysManager.ts';
 import { UnifiedWhatsAppGateway } from '../src/whatsapp/whatsappGateway.ts';
@@ -88,7 +89,12 @@ test('Parsing monetário trata pontuação final, milhar, horários, telefones, 
   const adv1 = 'a' + '!'.repeat(60_000) + 'a';
   const adv2 = 'a' + ' '.repeat(60_000) + 'b';
   const adv3 = 'a' + ' '.repeat(50_000) + '1 pix '.repeat(1_000);
-  for (const s of [adv1, adv2, adv3]) {
+  const adv4 = '10' + ' '.repeat(1_950) + 'x';
+  const adv5 = '1' + '.000'.repeat(495) + 'a';
+  const advSlashes = '/'.repeat(65_536) + 'a';
+  assert.equal(stripTrailingSlashes(advSlashes).length, 65_537);
+  assert.equal(stripTrailingSlashes('https://api.depixapp.com///'), 'https://api.depixapp.com');
+  for (const s of [adv1, adv2, adv3, adv4, adv5]) {
     assert.equal(parseBrlAmountFromText(s), null);
     assert.equal(normalizeCommandText(s), '');
     assert.equal(isCancelCommand(s), false);
@@ -188,6 +194,20 @@ test('Concorrência, mensagens pós-pagamento ("já paguei"), estado AWAITING_AM
     phone: '5511955554444',
     text: 'Pagamento de 50 feito',
   });
+  for (const receiptMsg of [
+    'Comprovante R$ 50,00',
+    'Comprovante do pix de 50',
+    'Segue meu comprovante de R$ 50',
+    'Aqui está o comprovante de 50',
+    'Pix de 50 pago!',
+    'O pix de R$ 50 já foi pago',
+  ]) {
+    await engine.handleIncomingMessage({
+      phone: clientPhone,
+      customerJid: clientLid,
+      text: receiptMsg,
+    });
+  }
   assert.equal(repository.listRecentOrders().length, 1);
 
   // Comandos naturais ("Quero cancelar o pix", "Ajuda", "Novo valor de 150" sobrescrevendo valor pendente antigo)
@@ -492,6 +512,21 @@ test('DePixAppProvider detecta estorno (cancelled -> FAILED) em prd_..., prioriz
       data: { id: 'chk_sub_1', product_id: 'prd_refund_test', status: 'expired', is_live: true },
     });
     assert.equal(subExpired, null);
+
+    // Campos numéricos malformados ({"toString": null}, "", 0, []) em parseWebhookPayload não lançam TypeError nem gravam 0!
+    const advAmt1 = depix.parseWebhookPayload(
+      JSON.parse(
+        '{"event":"checkout.completed","data":{"id":"chk_adv_1","status":"completed","is_live":true,"amount_received":{"toString":null}}}'
+      )
+    );
+    assert.equal(advAmt1?.newStatus, 'SETTLED_CRYPTO');
+    assert.equal(advAmt1?.cryptoAmount, undefined);
+
+    const advAmt2 = depix.parseWebhookPayload({
+      event: 'checkout.completed',
+      data: { id: 'chk_adv_2', status: 'completed', is_live: true, amount_received: '' },
+    });
+    assert.equal(advAmt2?.cryptoAmount, undefined);
   } finally {
     fakeDepixServer.close();
   }

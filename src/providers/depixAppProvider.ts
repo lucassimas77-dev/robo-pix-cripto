@@ -8,7 +8,12 @@ import type {
   OrderStatus,
   WebhookSettlementEvent,
 } from '../types/domain.ts';
-import { safeOptionalId, safePrimitiveString } from '../utils/cpfCnpjValidator.ts';
+import {
+  safeOptionalId,
+  safePositiveNumber,
+  safePrimitiveString,
+  stripTrailingSlashes,
+} from '../utils/cpfCnpjValidator.ts';
 
 const FETCH_TIMEOUT_MS = 15_000;
 const WEBHOOK_TOLERANCE_SECONDS = 300; // 5 minutos contra replay attacks
@@ -37,7 +42,7 @@ export class DePixAppProvider implements IPixCryptoProvider {
     webhookSecret: string;
     skipTimestampWindowCheck?: boolean;
   }) {
-    const cleanBase = config.apiUrl.replace(/\/+$/, '');
+    const cleanBase = stripTrailingSlashes(config.apiUrl);
     this.config = {
       apiUrl: cleanBase.endsWith('/api') ? cleanBase : `${cleanBase}/api`,
       apiKey: config.apiKey.trim(),
@@ -98,18 +103,18 @@ export class DePixAppProvider implements IPixCryptoProvider {
         ? (item.depix as Record<string, unknown>)
         : undefined;
 
-    if (item.depix_due_cents != null && Number.isFinite(Number(item.depix_due_cents))) {
-      return Number(item.depix_due_cents) / 100;
-    }
-    if (depixBlock?.amount_cents != null && Number.isFinite(Number(depixBlock.amount_cents))) {
-      return Number(depixBlock.amount_cents) / 100;
-    }
-    if (item.amount_received != null && Number.isFinite(Number(item.amount_received))) {
-      return Number(item.amount_received) / 100;
-    }
-    if (item.net_amount != null && Number.isFinite(Number(item.net_amount))) {
-      return Number(item.net_amount) / 100;
-    }
+    const dueCents = safePositiveNumber(item.depix_due_cents);
+    if (dueCents !== undefined) return dueCents / 100;
+
+    const depixCents = safePositiveNumber(depixBlock?.amount_cents);
+    if (depixCents !== undefined) return depixCents / 100;
+
+    const receivedCents = safePositiveNumber(item.amount_received);
+    if (receivedCents !== undefined) return receivedCents / 100;
+
+    const netCents = safePositiveNumber(item.net_amount);
+    if (netCents !== undefined) return netCents / 100;
+
     return undefined;
   }
 
