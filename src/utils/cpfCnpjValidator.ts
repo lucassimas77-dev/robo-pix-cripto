@@ -412,10 +412,187 @@ const QTY_OR_UNIT_WORDS = new Set([
   'm³',
   'cm2',
   'cm²',
+  'ton',
+  'tonelada',
+  'toneladas',
+  'ha',
+  'hectare',
+  'hectares',
+  'arroba',
+  'arrobas',
+  'alqueire',
+  'alqueires',
+  'polegada',
+  'polegadas',
+  'gb',
+  'giga',
+  'gigas',
+  'gigabyte',
+  'gigabytes',
+  'mb',
+  'mega',
+  'megas',
+  'megabyte',
+  'megabytes',
+  'tb',
+  'terabyte',
+  'terabytes',
+  'kb',
+  'mbps',
+  'gbps',
+  'w',
+  'watt',
+  'watts',
+  'kw',
+  'kwh',
+  'kva',
+  'v',
+  'volt',
+  'volts',
+  'kv',
+  'mah',
+  'ampere',
+  'amperes',
+  'hz',
+  'khz',
+  'mhz',
+  'ghz',
+  'btu',
+  'btus',
+  'cv',
+  'cilindrada',
+  'cilindradas',
+  'kcal',
+  'caloria',
+  'calorias',
+  'grau',
+  'graus',
   'pessoa',
   'pessoas',
   'lugar',
   'lugares',
+]);
+
+const PLURAL_DETERMINER_WORDS = new Set([
+  'os',
+  'as',
+  'uns',
+  'umas',
+  'esses',
+  'essas',
+  'estes',
+  'estas',
+  'aqueles',
+  'aquelas',
+  'meus',
+  'minhas',
+  'seus',
+  'suas',
+  'nossos',
+  'nossas',
+  'pelos',
+  'pelas',
+  'nos',
+  'nas',
+  'dos',
+  'das',
+  'aos',
+  'às',
+]);
+
+const ENUMERATION_PREV_WORDS = new Set([
+  ...PLURAL_DETERMINER_WORDS,
+  'entre',
+  'dia',
+  'dias',
+  'item',
+  'itens',
+  'kit',
+  'kits',
+  'mesa',
+  'mesas',
+  'parcela',
+  'parcelas',
+  'opcao',
+  'opção',
+  'opcoes',
+  'opções',
+  'quarto',
+  'quartos',
+  'sala',
+  'salas',
+  'lote',
+  'lotes',
+  'tamanho',
+  'tamanhos',
+  'tam',
+  'caixa',
+  'caixas',
+  'pacote',
+  'pacotes',
+  'unidade',
+  'unidades',
+  'peca',
+  'peça',
+  'pecas',
+  'peças',
+  'produto',
+  'produtos',
+  'numero',
+  'número',
+  'numeros',
+  'números',
+  'codigo',
+  'código',
+  'codigos',
+  'códigos',
+  'pedido',
+  'pedidos',
+  'ingresso',
+  'ingressos',
+  'cota',
+  'cotas',
+  'bloco',
+  'blocos',
+  'quadra',
+  'quadras',
+  'casa',
+  'casas',
+  'loja',
+  'lojas',
+  'andar',
+  'andares',
+  'piso',
+  'pisos',
+  'pessoa',
+  'pessoas',
+  'lugar',
+  'lugares',
+  'camisa',
+  'camisas',
+  'camiseta',
+  'camisetas',
+  'calca',
+  'calça',
+  'calcas',
+  'calças',
+  'sapato',
+  'sapatos',
+  'tenis',
+  'tênis',
+  'aro',
+  'aros',
+  'hora',
+  'horas',
+  'minuto',
+  'minutos',
+  'semana',
+  'semanas',
+  'mes',
+  'mês',
+  'meses',
+  'ano',
+  'anos',
 ]);
 
 function readSubHundredTokens(
@@ -572,19 +749,23 @@ function normalizePortugueseNumberWords(input: string): string {
       !CURRENCY_OR_SCALE_WORDS.has(nextWord) &&
       !QTY_OR_UNIT_WORDS.has(nextWord) &&
       (isPluralArticleBeforeNoun ||
-        ['nos', 'nós', 'voces', 'vocês', 'eles', 'elas', 'ambos', 'ambas', 'uns', 'umas'].includes(
+        ['nos', 'nós', 'voces', 'vocês', 'eles', 'elas', 'ambos', 'ambas', 'uns'].includes(
           prevWord
         ) ||
         (prevWord === 'os' && value === 2));
 
-    const isHourPreposition = ['as', 'às', 'pelas', 'das', 'pras'].includes(prevWord);
+    const isHourPreposition = ['as', 'às', 'pelas', 'das', 'pras', 'umas'].includes(prevWord);
 
     // Centavos coloquiais por extenso: "dez e cinquenta" -> "10,50", "vinte e cinco e cinquenta" -> "25,50"
-    // Nunca combina como centavos quando for horário ("às duas e trinta", "seis e trinta da tarde") ou intervalo ("entre...")!
+    // Nunca combina como centavos quando for horário ("às duas e trinta", "umas duas e trinta"), intervalo ("entre...") ou enumeração ("dias dez e quinze")!
+    const isPrecededByEnumerationContext =
+      ENUMERATION_PREV_WORDS.has(prevWord) ||
+      (prevWord === 'de' && PLURAL_DETERMINER_WORDS.has(prevPrevWord));
+
     if (
       !blockedPronoun &&
       !isHourPreposition &&
-      prevWord !== 'entre' &&
+      !isPrecededByEnumerationContext &&
       endIdx + 4 < tokens.length &&
       /^[ \t]+$/.test(tokens[endIdx + 1]) &&
       tokens[endIdx + 2].toLowerCase() === 'e' &&
@@ -608,6 +789,7 @@ function normalizePortugueseNumberWords(input: string): string {
           wordIndices[centsEndWordPos + 2] - wordIndices[centsEndWordPos + 1] <= 2
             ? tokens[wordIndices[centsEndWordPos + 2]].toLowerCase()
             : '';
+        const hasExplicitCentavos = wordAfterCents === 'centavo' || wordAfterCents === 'centavos';
         const isDayPeriodAfter =
           wordAfterCents === 'da' &&
           ['manha', 'manhã', 'tarde', 'noite', 'madrugada'].includes(word2AfterCents);
@@ -629,10 +811,10 @@ function normalizePortugueseNumberWords(input: string): string {
         if (
           !blockedCentsNext &&
           !/^[-/@.]/.test(afterCentsSep) &&
-          (!centsSub.singleUm || wordAfterCents === 'centavo' || wordAfterCents === 'centavos')
+          (hasExplicitCentavos || centsSub.value >= 20)
         ) {
           const formattedDec = `${value},${String(centsSub.value).padStart(2, '0')}`;
-          if (wordAfterCents === 'centavo' || wordAfterCents === 'centavos') {
+          if (hasExplicitCentavos) {
             out.push(`${formattedDec} reais`);
             i = wordIndices[centsEndWordPos + 1] + 1;
           } else {
@@ -711,6 +893,12 @@ function hasForeignCurrencyOrCrypto(input: string): boolean {
   return FOREIGN_CURRENCY_PREFIX_RE.test(input) || FOREIGN_CURRENCY_SUFFIX_RE.test(input);
 }
 
+const PHYSICAL_OR_SPEC_SUFFIX_UNIT_PATTERN =
+  '(?:x|vezes|parcelas?|itens?|unidades?|pe[cç]as?|produtos?|pacotes?|caixas?|kits?|ingressos?|cotas?|kg|quilos?|g|gramas?|mg|ton|toneladas?|ha|hectares?|arrobas?|alqueires?|l|litros?|ml|m|metros?|m2|m²|m3|m³|cm|cm2|cm²|mm|km|quil[oô]metros?|polegadas?|gb|gigas?|gigabytes?|mb|megas?|megabytes?|tb|terabytes?|kb|mbps|gbps|w|watts?|kw|kwh|kva|v|volts?|kv|mah|amperes?|hz|khz|mhz|ghz|btu|btus|cv|cilindradas?|kcal|calorias?|graus?|pessoas?|lugares?)';
+
+const ACCOUNT_DEBITED_REPORT_RE =
+  /\b(?:descontou|descontaram|debitou|debitaram|(?:saiu|sa[ií]ram)(?:[ \t]+(?:os?|as?|r\$|\d[\d.,]*|reais|real|valor|dinheiro|pagamento|pix)){0,6}[ \t]+(?:da[ \t]+(?:minha[ \t]+)?conta|do[ \t]+(?:meu[ \t]+)?(?:banco|saldo)))\b/i;
+
 function stripDatesAndHours(input: string): string {
   return input
     .replace(/(?<!\d)(?:\d{4}\/\d{1,2}\/\d{1,2}|\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)(?!\d)/g, ' ')
@@ -724,7 +912,11 @@ function stripDatesAndHours(input: string): string {
       ' '
     )
     .replace(
-      /(?<![A-Za-zÀ-ÿ0-9])(?:at[eé][ \t]+)?(?:[aà]s|pelas|das|pras)[ \t]+(?:[01]?\d|2[0-4])\b(?![.,]\d|[ \t]*(?:reais|real|brl|contos?|centavos?)\b)(?:[ \t]+e[ \t]+(?:meia(?![A-Za-zÀ-ÿ0-9])|[0-5]?\d\b)(?:[ \t]*min(?:utos?)?(?![A-Za-zÀ-ÿ0-9]))?)?(?:[ \t]+da[ \t]+(?:manh[aã]|tarde|noite|madrugada)(?![A-Za-zÀ-ÿ0-9]))?/gi,
+      /(?<![A-Za-zÀ-ÿ0-9])(?:(?:ao|[aà])[ \t]+)?(?:meio[ \t-]+dia|meia[ \t-]+noite)(?:[ \t]+e[ \t]+(?:meia|[0-5]?\d|uma?)(?![.,]\d|[ \t]*(?:reais|real|brl|contos?|centavos?)\b)(?:[ \t]*min(?:utos?)?)?)?(?![A-Za-zÀ-ÿ0-9])/gi,
+      ' '
+    )
+    .replace(
+      /(?<![A-Za-zÀ-ÿ0-9])(?:(?:at[eé]|l[aá])[ \t]+)?(?:[aà]s|pelas|das|pras|umas)[ \t]+(?:[01]?\d|2[0-4])\b(?![.,]\d|[ \t]*(?:reais|real|brl|contos?|centavos?)\b)(?:[ \t]+e[ \t]+(?:meia(?![A-Za-zÀ-ÿ0-9])|[0-5]?\d\b)(?:[ \t]*min(?:utos?)?(?![A-Za-zÀ-ÿ0-9]))?)?(?:[ \t]+da[ \t]+(?:manh[aã]|tarde|noite|madrugada)(?![A-Za-zÀ-ÿ0-9]))?/gi,
       ' '
     )
     .replace(
@@ -841,9 +1033,10 @@ export function parseBrlAmountFromText(text: string): number | null {
       withNormalizedPtNumbers
     ) ||
     (!hasReplacementVerb &&
-      /\b(?:cancel(?:ar|a|e)|esquece|esque[cç]a|desisto|desisti|deixa[ \t]+(?:pra[ \t]+l[aá]|quieto|assim)|melhor[ \t]+n[aã]o|deu[ \t]+erro|falhou|recusou|recusad[oa]|bloqueou|bloquead[oa]|estorno|estornar|reembolso|reembolsar|devolv(?:er|a|e)|devolu[cç][aã]o|(?:mandei|enviei|fiz|transferi|paguei)[ \t]+errad[oa])(?![A-Za-zÀ-ÿ0-9])/i.test(
-        withNormalizedPtNumbers
-      ))
+      (ACCOUNT_DEBITED_REPORT_RE.test(withNormalizedPtNumbers) ||
+        /\b(?:cancel(?:ar|a|e)|esquece|esque[cç]a|desisto|desisti|deixa[ \t]+(?:pra[ \t]+l[aá]|quieto|assim)|melhor[ \t]+n[aã]o|deu[ \t]+erro|falhou|recusou|recusad[oa]|bloqueou|bloquead[oa]|estorno|estornar|reembolso|reembolsar|devolv(?:er|a|e)|devolu[cç][aã]o|(?:mandei|enviei|fiz|transferi|paguei)[ \t]+errad[oa])(?![A-Za-zÀ-ÿ0-9])/i.test(
+          withNormalizedPtNumbers
+        )))
   ) {
     return null;
   }
@@ -888,10 +1081,12 @@ export function parseBrlAmountFromText(text: string): number | null {
   }
 
   // Rejeita multiplicadores de quantidade e medidas com preço unitário ("2 itens de R$ 50", "2 kg de R$ 50", "2 pix de 50")
+  const qtyWithUnitPriceRe = new RegExp(
+    `(?<![\\d.,])\\d+(?:[.,]\\d+)?[ \\t]*${PHYSICAL_OR_SPEC_SUFFIX_UNIT_PATTERN}[ \\t]+(?:de[ \\t]+|por[ \\t]+|a[ \\t]+)?(?:r\\$[ \\t]*)?\\d`,
+    'i'
+  );
   if (
-    /(?<![\d.,])\d+(?:[.,]\d+)?[ \t]*(?:itens?|unidades?|pe[cç]as?|produtos?|pacotes?|caixas?|kits?|ingressos?|cotas?|x|vezes|parcelas?|kg|quilos?|g|gramas?|mg|l|litros?|ml|m|metros?|m2|m²|m3|m³|cm|cm2|cm²|mm|km|quil[oô]metros?|pessoas?|lugares?)[ \t]+(?:de[ \t]+|por[ \t]+|a[ \t]+)?(?:r\$[ \t]*)?\d/i.test(
-      withNormalizedPtNumbers
-    ) ||
+    qtyWithUnitPriceRe.test(withNormalizedPtNumbers) ||
     /(?<![\d.,])(?:[2-9]|\d{2,})[ \t]*pix[ \t]+(?:de[ \t]+|por[ \t]+|a[ \t]+)?(?:r\$[ \t]*)?\d/i.test(
       withNormalizedPtNumbers
     )
@@ -899,8 +1094,13 @@ export function parseBrlAmountFromText(text: string): number | null {
     return null;
   }
 
+  const suffixUnitStripRe = new RegExp(
+    `(?<![\\d.,])\\d+(?:[.,]\\d+)*[ \\t]*${PHYSICAL_OR_SPEC_SUFFIX_UNIT_PATTERN}(?![A-Za-zÀ-ÿ0-9])`,
+    'gi'
+  );
+
   const sanitized = withNormalizedPtNumbers
-    // Remove hashtags/códigos (#80, #150), "nº 50"/"número 50" autônomo e dados bancários/endereços/pedidos com ou sem ':'
+    // Remove hashtags/códigos (#80, #150), "nº 50"/"número 50" autônomo e dados bancários/endereços/especificações/pedidos com ou sem ':'
     .replace(/#[ \t]*\d+(?:[.,]\d+)?/g, ' ')
     .replace(
       /(?<![A-Za-zÀ-ÿ0-9])(?:n[º°]|n[uú]mero|n[uú]m\.?)[ \t#:.-]*\d+(?:[.,]\d+)?(?![A-Za-zÀ-ÿ0-9])/gi,
@@ -912,7 +1112,7 @@ export function parseBrlAmountFromText(text: string): number | null {
       ' '
     )
     .replace(
-      /\b(?:pedido|ordem|protocolo|chamado|fatura|boleto|nota|nf|mesa|quarto|ap|apt|apto|apartamento|rua|av|avenida|travessa|alameda|rodovia|estrada|km|bloco|bl|quadra|qd|lote|lt|casa|sala|loja|andar|piso|id|cod|c[oó]digo|item|op[cç][aã]o|ag[eê]ncia|ag|conta|cc|banco|cpf|cnpj|cep|rg)(?:[ \t]*[:=-][ \t]*(?:#|n[º°o.]?[ \t:.=-]*)?|[ \t]+(?:#|n[º°o.]?[ \t:.=-]*)?|[ \t]*#[ \t]*)\d+(?:[.,]\d+)?\b/gi,
+      /\b(?:pedido|ordem|protocolo|chamado|fatura|boleto|nota|nf|mesa|quarto|ap|apt|apto|apartamento|rua|av|avenida|travessa|alameda|rodovia|estrada|km|bloco|bl|quadra|qd|lote|lt|casa|sala|loja|andar|piso|id|cod|c[oó]digo|item|op[cç][aã]o|tamanho|tam|numera[cç][aã]o|aro|calibre|bitola|modelo|mod|vers[aã]o|voltagem|tens[aã]o|pot[eê]ncia|ag[eê]ncia|ag|conta|cc|banco|cpf|cnpj|cep|rg)\.?(?:[ \t]*[:=-][ \t]*(?:#|n[º°o.]?[ \t:.=-]*)?|[ \t]+(?:#|n[º°o.]?[ \t:.=-]*)?|[ \t]*#[ \t]*)\d+(?:[.,]\d+)?(?![.,]\d|\d|[ \t]*(?:reais|real|brl|contos?|centavos?)\b)\b/gi,
       ' '
     )
     // Remove contagem inteira "1 pix" / "5 pix" SEM corromper "R$ 1.500 pix" ou "50,75 pix"!
@@ -968,10 +1168,8 @@ export function parseBrlAmountFromText(text: string): number | null {
       const valFixed = (Number(c) / 100).toFixed(2).replace('.', ',');
       return `R$ ${valFixed}`;
     })
-    .replace(
-      /(?<![\d.,])\d+(?:[.,]\d+)*[ \t]*(?:x|vezes|parcelas?|itens?|unidades?|pe[cç]as?|produtos?|pacotes?|caixas?|kits?|ingressos?|cotas?|kg|quilos?|g|gramas?|mg|l|litros?|ml|m|metros?|m2|m²|m3|m³|cm|cm2|cm²|mm|km|quil[oô]metros?|pessoas?|lugares?)(?![A-Za-zÀ-ÿ0-9])/gi,
-      ' '
-    )
+    .replace(suffixUnitStripRe, ' ')
+    .replace(/(?<![\d.,])\d+(?:[.,]\d+)*ah(?![A-Za-zÀ-ÿ0-9])/gi, ' ')
     .replace(
       /(?<![\d.,])\d+(?:[.,]\d+)*[ \t]*(?:min|mins|minutos?|seg|segs|segundos?|dias?|semanas?|horas?|m[eê]s|meses|anos?)(?![A-Za-zÀ-ÿ0-9])/gi,
       ' '
@@ -1228,9 +1426,6 @@ const EXPLICIT_NEW_ORDER_INTENT_RE =
 const POLITE_NEW_ORDER_MODAL_RE =
   /(?<!(?<![A-Za-zÀ-ÿ0-9])(?:acabei|terminei|consegui|tentei)[ \t]+(?:de[ \t]+)?)\b(?:quero|preciso|vou|posso|pode|poderia|gostaria[ \t]+de|me)[ \t]+(?:pagar|fazer[ \t]+(?:um[ \t]+)?pix|(?:gerar|mandar|mand[ae]|passar|pass[ae]|enviar|envi[ae]|criar|cri[ae])[ \t]+(?:a[ií][ \t]+|aqui[ \t]+|agora[ \t]+)?(?:outro|novo|mais[ \t]+um|(?:um[ \t]+|uma[ \t]+|o[ \t]+|a[ \t]+)?(?:pix|cobran[cç]a|link|qr(?:[ \t]*code)?|chave)|(?:de[ \t]+)?(?:r\$[ \t]*\d|\d+[ \t]*(?:reais|real|mil)\b|mil\b)))(?![A-Za-zÀ-ÿ0-9])/i;
 
-const ACCOUNT_DEBITED_REPORT_RE =
-  /\b(?:descontou|debitou|saiu[ \t]+da[ \t]+(?:minha[ \t]+)?conta)\b/i;
-
 export function isStatusQueryMessage(text: string): boolean {
   if (typeof text !== 'string' || text.length > MAX_NLU_LEN * 2) return false;
   const n = normalizeCommandText(text);
@@ -1287,7 +1482,7 @@ export function isPaymentConfirmationMessage(text: string): boolean {
   if (
     EXPLICIT_NEW_ORDER_INTENT_RE.test(t) ||
     POLITE_NEW_ORDER_MODAL_RE.test(t) ||
-    /(?:^|[ \t,;:.!?])(?:ainda[ \t]+)?n[aã]o[ \t]+(?:j[aá][ \t]+)?(?:paguei|quitei|depositei|passei|fiz|efetuei|realizei|mandei|enviei|transferi|foi|foram|est[aá]|est[aã]o|t[aá]|t[aã]o|consegui)\b/i.test(
+    /(?:^|[ \t,;:.!?])(?:ainda[ \t]+)?n[aã]o[ \t]+(?:j[aá][ \t]+)?(?:paguei|quitei|depositei|passei|fiz|efetuei|realizei|mandei|enviei|transferi|foi|foram|est[aá]|est[aã]o|t[aá]|t[aã]o|consegui|descontou|descontaram|debitou|debitaram|saiu|sa[ií]ram)\b/i.test(
       t
     ) ||
     /\b(?:paguei|quitei|depositei|passei|fiz|efetuei|realizei|mandei|enviei|transferi|pag[oa]s?)[ \t]+n[aã]o(?![A-Za-zÀ-ÿ0-9])/i.test(
@@ -1326,7 +1521,7 @@ export function isPaymentConfirmationMessage(text: string): boolean {
   return (
     /\b(?:paguei|quitei|depositei|passei)\b/i.test(t) ||
     /\b(?:comprovante|recibo)\b/i.test(t) ||
-    /\b(?:descontou|debitou|saiu[ \t]+da[ \t]+(?:minha[ \t]+)?conta)\b/i.test(t) ||
+    ACCOUNT_DEBITED_REPORT_RE.test(t) ||
     /\bsegue(?:[ \t]+(?:a[ií]|aqui|anexo|abaixo))?[ \t]+(?:(?:o|a|os|meu|minha)[ \t]+)?(?:pix|pagamento|comprovante|recibo|transfer[eê]ncia|dep[oó]sito)\b/i.test(
       t
     ) ||

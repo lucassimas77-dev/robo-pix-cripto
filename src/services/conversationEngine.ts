@@ -130,12 +130,35 @@ export class ConversationEngine {
     }
 
     // Expira estados residuais de sessão / menu 1-2 por TTL apenas quando NÃO há cobrança PENDING ativa!
+    // Se a cobrança acabou de vencer por relógio antes do ciclo do ExpirationWatcher, conta os 5 min a partir de `expiresAt`!
+    const nowMs = Date.now();
     const liveActiveAtEntry = this.repository.findActivePendingOrderByPhone(phone);
-    const sessionAgeMs = Date.now() - new Date(session.updatedAt).getTime();
+    const sessionUpdatedMs = new Date(session.updatedAt).getTime();
+    let effectiveMenuRefMs = sessionUpdatedMs;
+    if (!liveActiveAtEntry && session.stage === 'AWAITING_ACTIVE_ORDER_DECISION') {
+      const mostRecentAtEntry = this.repository.findMostRecentOrderByPhone(phone);
+      if (
+        mostRecentAtEntry &&
+        (mostRecentAtEntry.status === 'PENDING' || mostRecentAtEntry.status === 'EXPIRED')
+      ) {
+        const recentExpMs = new Date(mostRecentAtEntry.expiresAt).getTime();
+        if (Number.isFinite(recentExpMs) && recentExpMs > effectiveMenuRefMs) {
+          effectiveMenuRefMs = recentExpMs;
+        }
+      }
+    }
+    const sessionAgeMs = nowMs - effectiveMenuRefMs;
     if (!Number.isFinite(sessionAgeMs) || (sessionAgeMs > SESSION_TTL_MS && !liveActiveAtEntry)) {
+      const hadDirtyState =
+        session.stage !== 'IDLE' ||
+        session.pendingNewAmountBrl !== undefined ||
+        session.draftAmountBrl !== undefined;
       session.stage = 'IDLE';
       session.pendingNewAmountBrl = undefined;
       session.draftAmountBrl = undefined;
+      if (hadDirtyState) {
+        this.repository.saveSession(session);
+      }
     } else if (
       !liveActiveAtEntry &&
       sessionAgeMs > DECISION_MENU_TTL_MS &&
@@ -832,8 +855,13 @@ export class ConversationEngine {
 
         if (!hasNewerOrder) {
           const sess = this.repository.getSession(updatedOrder.customerPhone);
-          const nowIso = new Date().toISOString();
-          const menuFresh = sess.stage === 'AWAITING_ACTIVE_ORDER_DECISION';
+          const nowMs = Date.now();
+          const nowIso = new Date(nowMs).toISOString();
+          const postExpiryAgeMs = nowMs - new Date(updatedOrder.expiresAt).getTime();
+          const menuFresh =
+            sess.stage === 'AWAITING_ACTIVE_ORDER_DECISION' &&
+            Number.isFinite(postExpiryAgeMs) &&
+            postExpiryAgeMs <= DECISION_MENU_TTL_MS;
           this.repository.saveSession(
             {
               phone: updatedOrder.customerPhone,

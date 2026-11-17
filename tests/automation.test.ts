@@ -686,6 +686,36 @@ test('Parsing monetário trata pontuação final, milhar, horários, telefones, 
   assert.equal(parseBrlAmountFromText('pix de 50R$'), 50);
   assert.equal(parseBrlAmountFromText('50,75R$ no pix'), 50.75);
 
+  // Cobertura Busca #22: "Saiu 50 reais da minha conta", enumerações por extenso ("dias dez e quinze", "kits cinco e seis"),
+  // horários com "umas" / "meio-dia" / "meia-noite" e especificações/unidades físicas ("tamanho 42", "aro 15", "10 hectares", "5 toneladas", "500 mega")
+  assert.equal(isStatusQueryMessage('Saiu 50 reais da minha conta'), true);
+  assert.equal(isPaymentConfirmationMessage('Saiu 50 reais da minha conta'), true);
+  assert.equal(isStatusQueryMessage('Já saiu R$ 50,00 da conta'), true);
+  assert.equal(isStatusQueryMessage('Saiu os 50 da minha conta mas não confirmou'), true);
+  assert.equal(parseBrlAmountFromText('Saiu 50 reais da minha conta'), null);
+
+  assert.equal(parseBrlAmountFromText('Vou pagar no pix nos dias dez e quinze'), null);
+  assert.equal(parseBrlAmountFromText('Quero os kits cinco e seis no pix'), null);
+  assert.equal(parseBrlAmountFromText('Mesas dez e doze vão pagar no pix'), null);
+  assert.equal(parseBrlAmountFromText('pix de dois e três'), null);
+  assert.equal(parseBrlAmountFromText('pix de cinco e seis centavos'), 5.06);
+
+  assert.equal(parseBrlAmountFromText('Te mando o pix umas 10'), null);
+  assert.equal(parseBrlAmountFromText('Te mando o pix umas duas e trinta'), null);
+  assert.equal(parseBrlAmountFromText('Meio-dia e trinta mando o pix'), null);
+  assert.equal(parseBrlAmountFromText('Meia-noite e vinte mando o pix'), null);
+  assert.equal(parseBrlAmountFromText('Meio dia e quinze mando o pix'), null);
+
+  assert.equal(parseBrlAmountFromText('Camisa tamanho 42 no pix'), null);
+  assert.equal(parseBrlAmountFromText('Pneu aro 15 no pix'), null);
+  assert.equal(parseBrlAmountFromText('Terreno de 10 hectares no pix'), null);
+  assert.equal(parseBrlAmountFromText('Caminhão de 5 toneladas no pix'), null);
+  assert.equal(parseBrlAmountFromText('Internet de 500 mega no pix'), null);
+  assert.equal(parseBrlAmountFromText('Celular 128 gb no pix'), null);
+  assert.equal(parseBrlAmountFromText('Fonte 500w 220v no pix'), null);
+  assert.equal(parseBrlAmountFromText('Bateria 60Ah no pix'), null);
+  assert.equal(parseBrlAmountFromText('Camisa tam. 42, manda um pix de 80'), 80);
+
   assert.equal(formatTimeSaoPaulo('2026-07-01T18:15:00.000Z'), '15:15');
 });
 
@@ -843,6 +873,70 @@ test('Concorrência, mensagens pós-pagamento ("já paguei"), estado AWAITING_AM
   assert.equal(repository.findMostRecentOrderByPhone(phoneMenu)?.amountBrl, 85);
   await engine.handleIncomingMessage({ phone: phoneMenu, text: 'Cancela o pix de 85' });
   assert.equal(repository.findMostRecentOrderByPhone(phoneMenu)?.status, 'CANCELLED');
+
+  // Corrida Busca #22: cobrança venceu há 2s no relógio (ANTES do ExpirationWatcher rodar) e menu abriu há 10 min:
+  // responder "2" DEVE gerar R$ 90 (e nunca R$ 2!), e responder "1" em outra janela vencida avisa expiração (e nunca cobra R$ 1!)
+  const phoneClockRace = '5511977771111';
+  const nowRaceMs = Date.now();
+  repository.createOrder({
+    id: 'ord_clock_race_1',
+    externalId: 'ext_clock_race_1',
+    provider: 'mock',
+    providerChargeId: 'mock_clock_race_1',
+    customerPhone: phoneClockRace,
+    amountBrl: 50,
+    estimatedCryptoAmount: 50,
+    cryptoAsset: 'DEPIX',
+    cryptoNetwork: 'LIQUID',
+    walletAddress: 'Carteira Liquid',
+    pixCopyPaste: '000201_clock_race_1',
+    status: 'PENDING',
+    warningSent: true,
+    createdAt: new Date(nowRaceMs - 15 * 60_000 - 2_000).toISOString(),
+    expiresAt: new Date(nowRaceMs - 2_000).toISOString(),
+  });
+  repository.saveSession(
+    {
+      phone: phoneClockRace,
+      stage: 'AWAITING_ACTIVE_ORDER_DECISION',
+      pendingNewAmountBrl: 90,
+      updatedAt: new Date(nowRaceMs - 10 * 60_000).toISOString(),
+    },
+    true
+  );
+  await engine.handleIncomingMessage({ phone: phoneClockRace, text: '2' });
+  assert.equal(repository.findMostRecentOrderByPhone(phoneClockRace)?.amountBrl, 90);
+
+  const phoneClockRaceOpt1 = '5511977772222';
+  repository.createOrder({
+    id: 'ord_clock_race_2',
+    externalId: 'ext_clock_race_2',
+    provider: 'mock',
+    providerChargeId: 'mock_clock_race_2',
+    customerPhone: phoneClockRaceOpt1,
+    amountBrl: 50,
+    estimatedCryptoAmount: 50,
+    cryptoAsset: 'DEPIX',
+    cryptoNetwork: 'LIQUID',
+    walletAddress: 'Carteira Liquid',
+    pixCopyPaste: '000201_clock_race_2',
+    status: 'PENDING',
+    warningSent: true,
+    createdAt: new Date(nowRaceMs - 15 * 60_000 - 2_000).toISOString(),
+    expiresAt: new Date(nowRaceMs - 2_000).toISOString(),
+  });
+  repository.saveSession(
+    {
+      phone: phoneClockRaceOpt1,
+      stage: 'AWAITING_ACTIVE_ORDER_DECISION',
+      pendingNewAmountBrl: 90,
+      updatedAt: new Date(nowRaceMs - 10 * 60_000).toISOString(),
+    },
+    true
+  );
+  await engine.handleIncomingMessage({ phone: phoneClockRaceOpt1, text: '1' });
+  assert.equal(repository.findMostRecentOrderByPhone(phoneClockRaceOpt1)?.id, 'ord_clock_race_2');
+  assert.equal(repository.getSession(phoneClockRaceOpt1).stage, 'AWAITING_AMOUNT');
 
   // Comando de ajuda funciona e mantém AWAITING_AMOUNT
   await engine.handleIncomingMessage({ phone: phoneMenu, text: 'Como funciona?' });
