@@ -264,6 +264,402 @@ const NUM_CORE =
 const NUM_LEFT = '(?<![-\\w@/,.])';
 const NUM_RIGHT = '(?![.,]\\d|\\d|[-\\w]|[ \\t]*%|\\.[a-zA-Z]|\\/[a-zA-Z0-9])';
 
+const PT_UNITS: Record<string, number> = {
+  um: 1,
+  uma: 1,
+  dois: 2,
+  duas: 2,
+  tres: 3,
+  três: 3,
+  quatro: 4,
+  cinco: 5,
+  seis: 6,
+  sete: 7,
+  oito: 8,
+  nove: 9,
+};
+
+const PT_TEENS: Record<string, number> = {
+  dez: 10,
+  onze: 11,
+  doze: 12,
+  treze: 13,
+  quatorze: 14,
+  catorze: 14,
+  quinze: 15,
+  dezesseis: 16,
+  dezessete: 17,
+  dezoito: 18,
+  dezenove: 19,
+};
+
+const PT_TENS: Record<string, number> = {
+  vinte: 20,
+  trinta: 30,
+  quarenta: 40,
+  cinquenta: 50,
+  sessenta: 60,
+  setenta: 70,
+  oitenta: 80,
+  noventa: 90,
+};
+
+const PT_HUNDREDS: Record<string, number> = {
+  duzentos: 200,
+  duzentas: 200,
+  trezentos: 300,
+  trezentas: 300,
+  quatrocentos: 400,
+  quatrocentas: 400,
+  quinhentos: 500,
+  quinhentas: 500,
+  seiscentos: 600,
+  seiscentas: 600,
+  setecentos: 700,
+  setecentas: 700,
+  oitocentos: 800,
+  oitocentas: 800,
+  novecentos: 900,
+  novecentas: 900,
+};
+
+const CURRENCY_OR_SCALE_WORDS = new Set([
+  'mil',
+  'milhao',
+  'milhão',
+  'milhoes',
+  'milhões',
+  'real',
+  'reais',
+  'brl',
+  'conto',
+  'contos',
+  'centavo',
+  'centavos',
+]);
+
+const QTY_OR_UNIT_WORDS = new Set([
+  'pix',
+  'item',
+  'itens',
+  'unidade',
+  'unidades',
+  'peca',
+  'peça',
+  'pecas',
+  'peças',
+  'produto',
+  'produtos',
+  'pacote',
+  'pacotes',
+  'caixa',
+  'caixas',
+  'kit',
+  'kits',
+  'ingresso',
+  'ingressos',
+  'cota',
+  'cotas',
+  'x',
+  'vezes',
+  'parcela',
+  'parcelas',
+  'min',
+  'minuto',
+  'minutos',
+  'seg',
+  'segundo',
+  'segundos',
+  'hora',
+  'horas',
+  'dia',
+  'dias',
+  'mes',
+  'mês',
+  'meses',
+  'ano',
+  'anos',
+]);
+
+const POLITE_REQUEST_WORDS = new Set([
+  'oi',
+  'ola',
+  'olá',
+  'bom',
+  'dia',
+  'boa',
+  'tarde',
+  'noite',
+  'quero',
+  'gera',
+  'gerar',
+  'manda',
+  'mande',
+  'mandar',
+  'faz',
+  'faca',
+  'faça',
+  'fazer',
+  'preciso',
+  'pagar',
+  'de',
+  'um',
+  'uma',
+  'o',
+  'meu',
+  'pix',
+  'valor',
+  'por',
+  'favor',
+  'pfv',
+  'pf',
+  'obrigado',
+  'obrigada',
+  'pode',
+  'ser',
+]);
+
+function readSubHundredTokens(
+  tokens: string[],
+  idx: number
+): { value: number; endIdx: number; singleUm: boolean } | null {
+  if (idx >= tokens.length) return null;
+  const w = tokens[idx].toLowerCase();
+  if (w in PT_TEENS) {
+    return { value: PT_TEENS[w], endIdx: idx, singleUm: false };
+  }
+  if (w in PT_TENS) {
+    const base = PT_TENS[w];
+    if (
+      idx + 4 < tokens.length &&
+      /^[ \t]+$/.test(tokens[idx + 1]) &&
+      tokens[idx + 2].toLowerCase() === 'e' &&
+      /^[ \t]+$/.test(tokens[idx + 3])
+    ) {
+      const u = tokens[idx + 4].toLowerCase();
+      if (u in PT_UNITS) {
+        return { value: base + PT_UNITS[u], endIdx: idx + 4, singleUm: false };
+      }
+    }
+    return { value: base, endIdx: idx, singleUm: false };
+  }
+  if (w in PT_UNITS) {
+    return { value: PT_UNITS[w], endIdx: idx, singleUm: w === 'um' || w === 'uma' };
+  }
+  return null;
+}
+
+function readSubThousandTokens(
+  tokens: string[],
+  idx: number
+): { value: number; endIdx: number; singleUm: boolean } | null {
+  if (idx >= tokens.length) return null;
+  const w = tokens[idx].toLowerCase();
+  if (w === 'cem') {
+    return { value: 100, endIdx: idx, singleUm: false };
+  }
+  if (w === 'cento') {
+    if (
+      idx + 4 < tokens.length &&
+      /^[ \t]+$/.test(tokens[idx + 1]) &&
+      tokens[idx + 2].toLowerCase() === 'e' &&
+      /^[ \t]+$/.test(tokens[idx + 3])
+    ) {
+      const sub = readSubHundredTokens(tokens, idx + 4);
+      if (sub) {
+        return { value: 100 + sub.value, endIdx: sub.endIdx, singleUm: false };
+      }
+    }
+    return null;
+  }
+  if (w in PT_HUNDREDS) {
+    const base = PT_HUNDREDS[w];
+    if (
+      idx + 4 < tokens.length &&
+      /^[ \t]+$/.test(tokens[idx + 1]) &&
+      tokens[idx + 2].toLowerCase() === 'e' &&
+      /^[ \t]+$/.test(tokens[idx + 3])
+    ) {
+      const sub = readSubHundredTokens(tokens, idx + 4);
+      if (sub) {
+        return { value: base + sub.value, endIdx: sub.endIdx, singleUm: false };
+      }
+    }
+    return { value: base, endIdx: idx, singleUm: false };
+  }
+  return readSubHundredTokens(tokens, idx);
+}
+
+/**
+ * Converte numerais cardinais por extenso em português (`2..999` e `um` antes de escala/moeda)
+ * em passe único linear O(N), sem falsos positivos em horários coloquiais ("às cinco", "nós dois").
+ */
+function normalizePortugueseNumberWords(input: string): string {
+  const tokens = input.match(/[A-Za-zÀ-ÿ]+|\d+(?:[.,]\d+)?|[^A-Za-zÀ-ÿ\d]+/g);
+  if (!tokens || tokens.length === 0) return input;
+
+  const hasAnyDigits = /\d/.test(input);
+  const wordIndices: number[] = [];
+  for (let k = 0; k < tokens.length; k++) {
+    if (/^[A-Za-zÀ-ÿ]+$/.test(tokens[k])) {
+      wordIndices.push(k);
+    }
+  }
+  const wordPosMap = new Map<number, number>();
+  for (let p = 0; p < wordIndices.length; p++) {
+    wordPosMap.set(wordIndices[p], p);
+  }
+
+  const out: string[] = [];
+  let i = 0;
+  while (i < tokens.length) {
+    if (!/^[A-Za-zÀ-ÿ]+$/.test(tokens[i])) {
+      out.push(tokens[i]);
+      i++;
+      continue;
+    }
+
+    const parsed = readSubThousandTokens(tokens, i);
+    if (!parsed) {
+      out.push(tokens[i]);
+      i++;
+      continue;
+    }
+
+    const { value, endIdx, singleUm } = parsed;
+    const prevSep = i > 0 ? tokens[i - 1] : '';
+    const nextSep = endIdx + 1 < tokens.length ? tokens[endIdx + 1] : '';
+    if (/[-/@.]/.test(prevSep) || /^[-/@.]/.test(nextSep)) {
+      out.push(tokens[i]);
+      i++;
+      continue;
+    }
+
+    const startWordPos = wordPosMap.get(i) ?? -1;
+    const endWordPos = wordPosMap.get(endIdx) ?? -1;
+    const prevWord =
+      startWordPos > 0 && i - wordIndices[startWordPos - 1] <= 2
+        ? tokens[wordIndices[startWordPos - 1]].toLowerCase()
+        : '';
+    const prevPrevWord =
+      startWordPos > 1 && wordIndices[startWordPos - 1] - wordIndices[startWordPos - 2] <= 2
+        ? tokens[wordIndices[startWordPos - 2]].toLowerCase()
+        : '';
+    const nextWord =
+      endWordPos >= 0 &&
+      endWordPos + 1 < wordIndices.length &&
+      wordIndices[endWordPos + 1] - endIdx <= 2
+        ? tokens[wordIndices[endWordPos + 1]].toLowerCase()
+        : '';
+    const nextNextWord =
+      endWordPos >= 0 &&
+      endWordPos + 2 < wordIndices.length &&
+      wordIndices[endWordPos + 2] - wordIndices[endWordPos + 1] <= 2
+        ? tokens[wordIndices[endWordPos + 2]].toLowerCase()
+        : '';
+
+    let shouldConvert = false;
+    if (singleUm) {
+      shouldConvert = CURRENCY_OR_SCALE_WORDS.has(nextWord);
+    } else {
+      const blockedPronounOrHour =
+        !CURRENCY_OR_SCALE_WORDS.has(nextWord) &&
+        ['as', 'às', 'pelas', 'das', 'nos', 'nós', 'voces', 'vocês', 'eles', 'elas', 'ambos', 'ambas'].includes(
+          prevWord
+        );
+
+      if (!blockedPronounOrHour) {
+        const hasScaleOrCurrencyNext = CURRENCY_OR_SCALE_WORDS.has(nextWord);
+        const hasQtyOrPctNext =
+          QTY_OR_UNIT_WORDS.has(nextWord) ||
+          nextSep.trimStart().startsWith('%') ||
+          (nextWord === 'por' && nextNextWord === 'cento');
+        const isCompoundTailAfterScale =
+          prevWord === 'e' &&
+          ['mil', 'real', 'reais', 'brl', 'conto', 'contos'].includes(prevPrevWord);
+        const isAfterPixValueLabel =
+          ['de', 'por', 'valor'].includes(prevWord) &&
+          (prevWord === 'valor' ||
+            [
+              'pix',
+              'valor',
+              'cobranca',
+              'cobrança',
+              'pagamento',
+              'deposito',
+              'depósito',
+              'transferencia',
+              'transferência',
+              'gerar',
+              'gera',
+              'manda',
+              'mande',
+              'mandar',
+              'faz',
+              'fazer',
+            ].includes(prevPrevWord));
+        const isMathOrRangeNeighbor =
+          ['mais', 'menos', 'ou', 'a', 'à', 'ate', 'até'].includes(prevWord) ||
+          ['mais', 'menos', 'ou', 'a', 'à', 'ate', 'até'].includes(nextWord);
+
+        let isStandaloneAmountReply = false;
+        if (!hasAnyDigits) {
+          isStandaloneAmountReply = true;
+          for (let wp = 0; wp < wordIndices.length; wp++) {
+            const tokIdx = wordIndices[wp];
+            if (tokIdx >= i && tokIdx <= endIdx) continue;
+            if (!POLITE_REQUEST_WORDS.has(tokens[tokIdx].toLowerCase())) {
+              isStandaloneAmountReply = false;
+              break;
+            }
+          }
+        }
+
+        shouldConvert =
+          hasScaleOrCurrencyNext ||
+          hasQtyOrPctNext ||
+          isCompoundTailAfterScale ||
+          isAfterPixValueLabel ||
+          isMathOrRangeNeighbor ||
+          isStandaloneAmountReply;
+      }
+    }
+
+    if (shouldConvert) {
+      out.push(String(value));
+      i = endIdx + 1;
+    } else {
+      out.push(tokens[i]);
+      i++;
+    }
+  }
+
+  return out.join('');
+}
+
+function unwrapWhatsAppMarkdown(input: string): string {
+  let s = input;
+  for (let pass = 0; pass < 2; pass++) {
+    s = s
+      .replace(/(^|[\s([{"'])\*([^*\n]+)\*(?=$|[\s)\]}"'.,!?;:])/g, (m, lead, inner) =>
+        /^\s|\s$/.test(inner) ? m : `${lead}${inner}`
+      )
+      .replace(/(^|[\s([{"'])_([^_\n]+)_(?=$|[\s)\]}"'.,!?;:])/g, (m, lead, inner) =>
+        /^\s|\s$/.test(inner) ? m : `${lead}${inner}`
+      )
+      .replace(/(^|[\s([{"'])~([^~\n]+)~(?=$|[\s)\]}"'.,!?;:])/g, (m, lead, inner) =>
+        /^\s|\s$/.test(inner) ? m : `${lead}${inner}`
+      )
+      .replace(/(^|[\s([{"'])`([^`\n]+)`(?=$|[\s)\]}"'.,!?;:])/g, '$1$2');
+  }
+  return s;
+}
+
+export function hasPixTriggerKeyword(text: string): boolean {
+  if (typeof text !== 'string' || text.length > MAX_NLU_LEN) return false;
+  return /(?<![A-Za-zÀ-ÿ0-9])(?:pix|pagar|pagamento|comprovante)(?![A-Za-zÀ-ÿ0-9])/i.test(text);
+}
+
 export function parseBrlAmountFromText(text: string): number | null {
   if (typeof text !== 'string' || text.length > MAX_NLU_LEN) return null;
   const cleaned = text.trim();
@@ -294,10 +690,13 @@ export function parseBrlAmountFromText(text: string): number | null {
 
   if (!filteredWords) return null;
 
-  // Remove formatação Markdown do WhatsApp (*50,00*, _50,00_, ~50~, `50`) preservando underscores internos de códigos (ord_123)
-  const unformattedWords = filteredWords
-    .replace(/(^|[\s(])_([^_\n]+)_(?=$|[\s).,!?;:])/g, '$1$2')
-    .replace(/[*~`]/g, '');
+  // Rejeita multiplicação/soma compacta ANTES de desenrolar formatação Markdown ("2*50", "2 * 3 * 50")
+  if (/\d[ \t]*[+*×÷][ \t]*(?:r\$[ \t]*)?\d/i.test(filteredWords)) {
+    return null;
+  }
+
+  // Remove formatação Markdown pareada do WhatsApp (*50,00*, _50,00_, ~50~, `50`) sem fundir "2*50" nem tocar em ord_123
+  const unformattedWords = unwrapWhatsAppMarkdown(filteredWords);
 
   const withoutContactsAndDates = unformattedWords
     // 1) Remove documentos estruturados (CPF, CNPJ numérico ou alfanumérico, CEP pontuado, RG) e datas ANTES de pares hifenizados!
@@ -319,22 +718,31 @@ export function parseBrlAmountFromText(text: string): number | null {
     .replace(/\b\d{1,2}:\d{2}(?::\d{2})?\b/g, ' ')
     .replace(/\b\d{1,2}h(?:\d{2})?\b/gi, ' ');
 
-  // Rejeita valores negativos explícitos, vírgulas malformadas com 3+ dígitos ("150,555", "1,500") e centavos decimais ("10,50 centavos")
+  // Converte numerais cardinais em português ("dois mil", "cinco mil", "três mil e quinhentos", "cem reais") em O(N)
+  const withNormalizedPtNumbers = normalizePortugueseNumberWords(withoutContactsAndDates);
+
+  // Rejeita valores negativos explícitos, vírgulas malformadas ("150,555", "1,500"), centavos decimais e quantificadores vagos antes de "mil"
   if (
-    /r\$[ \t]*-[ \t]*\d/i.test(withoutContactsAndDates) ||
-    /-[ \t]*r\$[ \t]*\d/i.test(withoutContactsAndDates) ||
-    /(?:^|[\s(/:=])-\d/.test(withoutContactsAndDates) ||
-    /\d,\d{3,}/.test(withoutContactsAndDates) ||
-    /\d[.,]\d+[ \t]*centavos?\b/i.test(withoutContactsAndDates)
+    /r\$[ \t]*-[ \t]*\d/i.test(withNormalizedPtNumbers) ||
+    /-[ \t]*r\$[ \t]*\d/i.test(withNormalizedPtNumbers) ||
+    /(?:^|[\s(/:=])-\d/.test(withNormalizedPtNumbers) ||
+    /\d,\d{3,}/.test(withNormalizedPtNumbers) ||
+    /\d[.,]\d+[ \t]*centavos?\b/i.test(withNormalizedPtNumbers) ||
+    /\b(?:quantos?|v[aá]rios?|alguns|algumas|muitos?|poucos?|tantos?|uns|umas)[ \t]+mil\b/i.test(
+      withNormalizedPtNumbers
+    )
   ) {
     return null;
   }
 
-  // Rejeita expressões de soma/multiplicação ("R$ 50 + 30") e dúvidas sobre taxas/descontos
+  // Rejeita expressões aritméticas (+, *, -, menos) e dúvidas sobre taxas/descontos
   if (
-    /\d[ \t]*[+*][ \t]*(?:r\$[ \t]*)?\d/i.test(withoutContactsAndDates) ||
+    /\d[ \t]*[+*×÷][ \t]*(?:r\$[ \t]*)?\d/i.test(withNormalizedPtNumbers) ||
+    /(?<![-\w@/,.])(?:r\$[ \t]*)?\d[\d.,]*[ \t]*(?:reais|real|brl|contos?)?(?:[ \t]*-[ \t]*(?:r\$[ \t]*)?\d|[ \t]+menos[ \t]+(?:r\$[ \t]*)?\d)/i.test(
+      withNormalizedPtNumbers
+    ) ||
     /\b(?:tem[ \t]+|qual[ \t]+(?:a[ \t]+)?|cobra[ \t]+)?(?:taxa|tarifa|juros|multa|desconto)[ \t]+d[eo][ \t]+(?:r\$[ \t]*)?\d/i.test(
-      withoutContactsAndDates
+      withNormalizedPtNumbers
     )
   ) {
     return null;
@@ -345,23 +753,23 @@ export function parseBrlAmountFromText(text: string): number | null {
     `${NUM_LEFT}(?:${NUM_CORE})[ \\t]*(?:%|por[ \\t]*cento\\b|porcento\\b)`,
     'i'
   );
-  if (pctRegex.test(withoutContactsAndDates)) {
+  if (pctRegex.test(withNormalizedPtNumbers)) {
     return null;
   }
 
   // Rejeita multiplicadores de quantidade ("2 itens de R$ 50", "2 pix de 50", "3x de R$ 50")
   if (
     /\b\d+[ \t]*(?:itens?|unidades?|pe[cç]as?|produtos?|pacotes?|caixas?|kits?|ingressos?|cotas?|x|vezes|parcelas?)[ \t]+(?:de[ \t]+|por[ \t]+|a[ \t]+)?(?:r\$[ \t]*)?\d/i.test(
-      withoutContactsAndDates
+      withNormalizedPtNumbers
     ) ||
     /\b(?:[2-9]|\d{2,})[ \t]*pix[ \t]+(?:de[ \t]+|por[ \t]+|a[ \t]+)?(?:r\$[ \t]*)?\d/i.test(
-      withoutContactsAndDates
+      withNormalizedPtNumbers
     )
   ) {
     return null;
   }
 
-  const sanitized = withoutContactsAndDates
+  const sanitized = withNormalizedPtNumbers
     // Remove hashtags/códigos (#80, #150), dados bancários/pedidos com ou sem ':' ("ag: 1234", "pedido: 150", "id: 500")
     .replace(/#[ \t]*\d+(?:[.,]\d+)?/g, ' ')
     .replace(
@@ -372,16 +780,20 @@ export function parseBrlAmountFromText(text: string): number | null {
     .replace(/(?<!r\$[ \t]*)\b\d+[ \t]+pix\b/gi, ' pix ')
     // Converte milhões para escala exata (caindo no aviso de teto máximo em vez de cobrar R$ 1,00!)
     .replace(
-      /(?<![-\w@/,.])(\d{1,3}(?:[.,]\d{1,2})?)(?![.,]\d|\d)[ \t]*milh(?:[aã]o|[oõ]es)\b/gi,
-      (_m, nStr) => String(Math.round(Number(String(nStr).replace(',', '.')) * 1_000_000))
+      /(?:(?<![-\w@/,.])(\d{1,3}(?:[.,]\d{1,2})?)(?![.,]\d|\d)[ \t]*|\b(meio)[ \t]+)milh(?:[aã]o|[oõ]es)\b/gi,
+      (_m, nStr, halfWord) => {
+        const mult = halfWord ? 0.5 : Number(String(nStr).replace(',', '.'));
+        return String(Math.round(mult * 1_000_000));
+      }
     )
-    // Passagem única determinística para TODAS as composições com "mil" ("[N|um] mil [reais] [e M [reais] [e C centavos] | e C centavos]")
+    // Passagem única determinística para TODAS as composições com "mil" ("[N] mil [reais] [e meio | e M [reais] [e C centavos] | e C centavos]")
+    // Nota: "mil" isolado (sem dígito antes) exige início de frase, símbolo ou verbo/preposição válida, barrando typos como "doiz mil"!
     .replace(
-      /(?:(?<![-\w@/,.])(\d{1,4}(?:[.,]\d{1,2})?)(?![.,]\d|\d)[ \t]*|\bum[ \t]+|(?<![-\w@/,.\d]))mil\b(?:[ \t]+(reais|real|brl|contos?)\b)?(?:[ \t]+e[ \t]+(?:(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b|(\d{1,3})(?![.,]\d|\d|[ \t]*centavos?\b)(?:[ \t]*(reais|real|brl|contos?)\b)?(?:[ \t]+e[ \t]+(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b)?))?/gi,
-      (_m, multStr, unit1, directCents, extraReais, unit2, tailCents) => {
+      /(?:(?<![-\w@/,.])(\d{1,4}(?:[.,]\d{1,2})?)(?![.,]\d|\d)[ \t]*|(?<=^|[ \t]*[:=(\-][ \t]*|r\$[ \t]*|\b(?:de|por|para|pra|no|em|gera|gerar|mand[ae]|mandar|faz|fa[cç]a|fazer|quero|preciso|pagar|cobran[cç]a|pix|valor|total|ser|[eé]|s[aã]o)[ \t]+))mil\b(?:[ \t]+(reais|real|brl|contos?)\b)?(?:[ \t]+e[ \t]+(?:(meio)\b|(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b|(\d{1,3})(?![.,]\d|\d|[ \t]*centavos?\b)(?:[ \t]*(reais|real|brl|contos?)\b)?(?:[ \t]+e[ \t]+(\d{1,2})(?![.,]\d|\d)[ \t]*centavos?\b)?))?/gi,
+      (_m, multStr, unit1, halfWord, directCents, extraReais, unit2, tailCents) => {
         const mult = multStr ? Number(String(multStr).replace(',', '.')) : 1;
         if (!Number.isFinite(mult) || mult <= 0) return ' ';
-        const addReais = extraReais ? Number(extraReais) : 0;
+        const addReais = halfWord ? 500 : extraReais ? Number(extraReais) : 0;
         const cents = directCents ? Number(directCents) : tailCents ? Number(tailCents) : 0;
         const total = Math.round((mult * 1000 + addReais + cents / 100) * 100) / 100;
         const formatted = Number.isInteger(total)
@@ -403,9 +815,12 @@ export function parseBrlAmountFromText(text: string): number | null {
     .replace(/\b\d+[ \t]*(?:x|vezes|parcelas?)\b/gi, ' ')
     .replace(/\b\d+[ \t]*(?:min|minutos?|seg|segundos?|dias?|horas?|meses|anos?)\b/gi, ' ');
 
-  // Rejeita somas implícitas com "e" ou "mais" entre dois valores distintos ("pix de R$ 50 e 30 reais", "pix de R$ 50 mais 30")
+  // Rejeita somas, subtrações e intervalos ("R$ 50 e 30", "R$ 50 mais 30", "R$ 50 - 10", "50 a 100 reais", "de 50 até 100")
   if (
-    /(?<![-\w@/,.])(?:r\$[ \t]*)?\d[\d.,]*[ \t]*(?:reais|real|brl|conto|contos)?[ \t]+(?:e|mais)[ \t]+(?:r\$[ \t]*)?\d/i.test(
+    /(?<![-\w@/,.])(?:r\$[ \t]*)?\d[\d.,]*[ \t]*(?:reais|real|brl|conto|contos)?[ \t]+(?:e|mais|menos|a|à|at[eé])[ \t]+(?:r\$[ \t]*)?\d/i.test(
+      sanitized
+    ) ||
+    /(?<![-\w@/,.])(?:r\$[ \t]*)?\d[\d.,]*[ \t]*(?:reais|real|brl|conto|contos)?[ \t]*-[ \t]*(?:r\$[ \t]*)?\d/i.test(
       sanitized
     )
   ) {
@@ -523,35 +938,57 @@ export function parseActiveOrderMenuReply(text: string): ActiveMenuParseResult {
     return { choice: 'none', explicitOptionDigit: null, inlineNewAmountBrl: null };
   }
 
-  const strippedMd = text.replace(/[*_~`]/g, '').trim();
+  const strippedMd = unwrapWhatsAppMarkdown(text).trim();
   if (!strippedMd) {
     return { choice: 'none', explicitOptionDigit: null, inlineNewAmountBrl: null };
   }
 
-  // Passo 1: Opção explícita 1 ou 2 ("1", "2.", "2)", "(2)", "#2", "opção 2", "quero a 2", "quero a opção 2", "2 - gerar 80")
+  // Passo 1: Opção explícita 1 ou 2 ("1", "2.", "2)", "(2)", "#2", "opção 2", "quero a 2", "2 - gerar 80")
+  // Nunca consome "1" ou "2" quando seguido de unidade/escala monetária ("2 mil reais", "1 mil", "2 reais", "Quero 2 mil")!
   const leadingOptMatch = strippedMd.match(
-    /^(?:(?:quero|escolho|prefiro|vai|fico[ \t]+com|pode[ \t]+ser)[ \t]+)?(?:(?:a|o|na|no)[ \t]+)?(?:[([]\s*)?(?:#\s*)?(?:(?:op[cç][aã]o|item|n[uú]mero)[ \t#:.-]*)?([12])(?![0-9]|[.,][0-9])(?:[)\].:,\-!?\s]+([\s\S]*))?$/i
+    /^(?:(?:quero|escolho|prefiro|vai|fico[ \t]+com|pode[ \t]+ser)[ \t]+)?(?:(?:a|o|na|no)[ \t]+)?([([#][ \t]*)?(?:(op[cç][aã]o|item|n[uú]mero)[ \t#:.-]*)?([12])(?![0-9]|[.,*][0-9])(?:([ \t]*[)\].:\-!?]+[ \t]*|[ \t,]+)([\s\S]*))?$/i
   );
   if (leadingOptMatch) {
-    const optDigit = leadingOptMatch[1] as '1' | '2';
-    const remainder = (leadingOptMatch[2] ?? '').trim();
-    const inlineAmt = remainder ? parseBrlAmountFromText(remainder) : null;
+    const openSym = leadingOptMatch[1] ?? '';
+    const menuWord = leadingOptMatch[2] ?? '';
+    const optDigit = leadingOptMatch[3] as '1' | '2';
+    const sep = leadingOptMatch[4] ?? '';
+    const remainder = (leadingOptMatch[5] ?? '').trim();
 
-    if (
-      remainder &&
-      (/\bcancel(?:ar|a|e)\b/i.test(remainder) ||
-        /\b(?:(?<!de[ \t]+)nov[oa]|outr[oa]|trocar|troca|mudar|muda|substituir|alterar)\b/i.test(
-          remainder
-        ))
-    ) {
-      return { choice: 'new', explicitOptionDigit: '2', inlineNewAmountBrl: inlineAmt };
+    const startsWithNumberUnit =
+      !menuWord &&
+      remainder.length > 0 &&
+      /^(?:mil\b|milh[aã]o\b|milh[oõ]es\b|reais\b|real\b|brl\b|contos?\b|pilas?\b|centavos?\b|pix\b|e\b|ou\b|mais\b|menos\b|a\b|at[eé]\b|x\b|vezes\b|itens?\b|unidades?\b|parcelas?\b|min\b|minutos?\b|horas?\b|dias?\b|%)/i.test(
+        remainder
+      );
+
+    const hasExplicitBullet = Boolean(menuWord || openSym || /[)\].:\-]/.test(sep));
+    const allowedBareRemainder =
+      remainder.length === 0 ||
+      hasExplicitBullet ||
+      /^(?:por[ \t]+favor\b|pfv?\b|obrigad[oa]\b|valeu\b|agrade[cç]o\b|agora\b|a[ií]\b|reenvi\w*\b|manter\b|mantenha\b|continu\w*\b|cancel\w*\b|gerar\b|gera\b|fazer\b|faz\b|nov[oa]\b|outr[oa]\b|trocar\b|troca\b|mudar\b|muda\b|substituir\b|alterar\b)/i.test(
+        remainder
+      );
+
+    if (!startsWithNumberUnit && allowedBareRemainder) {
+      const inlineAmt = remainder ? parseBrlAmountFromText(remainder) : null;
+
+      if (
+        remainder &&
+        (/\bcancel(?:ar|a|e)\b/i.test(remainder) ||
+          /\b(?:(?<!de[ \t]+)nov[oa]|outr[oa]|trocar|troca|mudar|muda|substituir|alterar)\b/i.test(
+            remainder
+          ))
+      ) {
+        return { choice: 'new', explicitOptionDigit: '2', inlineNewAmountBrl: inlineAmt };
+      }
+
+      return {
+        choice: optDigit === '1' ? 'resend' : 'new',
+        explicitOptionDigit: optDigit,
+        inlineNewAmountBrl: optDigit === '2' ? inlineAmt : null,
+      };
     }
-
-    return {
-      choice: optDigit === '1' ? 'resend' : 'new',
-      explicitOptionDigit: optDigit,
-      inlineNewAmountBrl: optDigit === '2' ? inlineAmt : null,
-    };
   }
 
   // Passo 2: Intenção textual de cancelar/substituir/novo valor (excluindo a locução "de novo" = novamente!)
@@ -585,6 +1022,9 @@ export function parseActiveOrderMenuReply(text: string): ActiveMenuParseResult {
   };
 }
 
+const EXPLICIT_NEW_ORDER_INTENT_RE =
+  /\b(?:quero|gera|gerar|mand[ae]|mandar|preciso|faz|fazer|cria|criar)[ \t]+(?:outro|novo|mais[ \t]+um|(?:um[ \t]+)?pix[ \t]+de[ \t]+(?:r\$[ \t]*)?\d|(?:uma[ \t]+)?cobran[cç]a)\b/i;
+
 export function isStatusQueryMessage(text: string): boolean {
   if (typeof text !== 'string' || text.length > MAX_NLU_LEN) return false;
   const n = normalizeCommandText(text);
@@ -597,13 +1037,11 @@ export function isStatusQueryMessage(text: string): boolean {
     return true;
   }
 
-  const t = text.trim();
+  const t = unwrapWhatsAppMarkdown(text).trim();
   if (!t) return false;
 
   if (
-    /\b(?:quero|gera|gerar|manda|mandar|preciso|faz|fazer)[ \t]+(?:outro|novo|mais[ \t]+um)\b/i.test(
-      t
-    ) ||
+    EXPLICIT_NEW_ORDER_INTENT_RE.test(t) ||
     /\b(?:quero|preciso|vou|posso|pode|gostaria[ \t]+de)[ \t]+(?:pagar|fazer[ \t]+um[ \t]+pix|gerar)\b/i.test(
       t
     )
@@ -630,13 +1068,11 @@ export function isStatusQueryMessage(text: string): boolean {
  */
 export function isPaymentConfirmationMessage(text: string): boolean {
   if (typeof text !== 'string' || text.length > MAX_NLU_LEN) return false;
-  const t = text.trim();
+  const t = unwrapWhatsAppMarkdown(text).trim();
   if (!t) return false;
 
   if (
-    /\b(?:quero|gera|gerar|manda|mandar|preciso|faz|fazer)[ \t]+(?:outro|novo|mais[ \t]+um)\b/i.test(
-      t
-    ) ||
+    EXPLICIT_NEW_ORDER_INTENT_RE.test(t) ||
     /\b(?:quero|preciso|vou|posso|pode|gostaria[ \t]+de)[ \t]+(?:pagar|fazer[ \t]+um[ \t]+pix|gerar)\b/i.test(
       t
     )
@@ -656,10 +1092,10 @@ export function isPaymentConfirmationMessage(text: string): boolean {
     !isQuestion &&
     !hasConditionalOfferPrefix &&
     (/^[ \t]*pago[ \t]+(?:o|meu)[ \t]+(?:pix|pagamento)\b/i.test(t) ||
-      /^[ \t]*(?:feito|realizado|efetuado|enviado|transferido)[ \t]+(?:o[ \t]+|meu[ \t]+)?(?:pix|pagamento|valor|r\$[ \t]*\d)/i.test(
+      /^[ \t]*(?:feito|realizado|efetuado|enviado|transferido|depositado|quitado)[ \t]+(?:o[ \t]+|meu[ \t]+)?(?:pix|pagamento|valor|r\$[ \t]*\d)/i.test(
         t
       ) ||
-      /(?:(?<!\w)r\$[ \t]*\d[\d.,]*|(?<![-\w.,])\d[\d.,]*)[ \t]*(?:reais[ \t]+)?(?:j[aá][ \t]+)?(?:foi[ \t]+|est[aá][ \t]+|t[aá][ \t]+)?pago(?![ \t]+(?:agora|hoje|amanh[aã]|depois|se\b))\b/i.test(
+      /(?:(?<!\w)r\$[ \t]*\d[\d.,]*|(?<![-\w.,])\d[\d.,]*)[ \t]*(?:reais[ \t]+)?(?:j[aá][ \t]+)?(?:foi[ \t]+|est[aá][ \t]+|t[aá][ \t]+)?(?:pago(?![ \t]+(?:agora|hoje|amanh[aã]|depois|se\b))|enviado|transferido|feito|realizado|efetuado|depositado|quitado)\b/i.test(
         t
       ))
   ) {
@@ -669,20 +1105,19 @@ export function isPaymentConfirmationMessage(text: string): boolean {
   return (
     /\b(?:paguei|quitei|depositei|passei)\b/i.test(t) ||
     /\bcomprovante\b/i.test(t) ||
-    /\b(?:t[aá]|est[aá]|foi)[ \t]+pago\b/i.test(t) ||
+    /\b(?:t[aá]|est[aá]|foi)[ \t]+(?:pago|enviado|transferido|feito|realizado|efetuado|depositado|quitado)\b/i.test(
+      t
+    ) ||
     /\bpix[ \t]+(?:de[ \t]+)?(?:(?:r\$[ \t]*)?[\d.,]+[ \t]+(?:reais[ \t]+)?)?(?:j[aá][ \t]+)?(?:foi[ \t]+|est[aá][ \t]+|t[aá][ \t]+)?(?:pago|enviado|feito|realizado|efetuado|conclu[ií]do|transferido)\b/i.test(
       t
     ) ||
-    /\bpagamento[ \t]+(?:d[eo][ \t]+)?(?:(?:r\$[ \t]*)?[\d.,]+[ \t]+(?:reais[ \t]+)?)?(?:j[aá][ \t]+)?(?:foi[ \t]+|est[aá][ \t]+|t[aá][ \t]+)?(?:feito|realizado|efetuado|enviado|conclu[ií]do|pago)\b/i.test(
+    /\bpagamento[ \t]+(?:d[eo][ \t]+)?(?:(?:r\$[ \t]*)?[\d.,]+[ \t]+(?:reais[ \t]+)?)?(?:j[aá][ \t]+)?(?:foi[ \t]+|est[aá][ \t]+|t[aá][ \t]+)?(?:feito|realizado|efetuado|enviado|conclu[ií]do|pago|transferido)\b/i.test(
       t
     ) ||
-    /\b(?:j[aá][ \t]+)?(?:fiz|efetuei|realizei)[ \t]+(?:(?:o[ \t]+|os[ \t]+|a[ \t]+|um[ \t]+)?(?:pix|pagamento|dep[oó]sito|transfer[eê]ncia)|(?:os[ \t]+)?(?:r\$[ \t]*)?\d)/i.test(
+    /\b(?:j[aá][ \t]+)?(?:fiz|efetuei|realizei|mandei|enviei|transferi)(?:[ \t]+(?:agora|agorinha|a[ií]|l[aá]|aqui|j[aá]|ali|hoje|pra|para|pro|p|vc|voc[eê]|tu|senhor|senhora|o|os|a|as|um|uma|meu|minha|esse|essa)){0,4}[ \t]+(?:pix|pagamento|dep[oó]sito|transfer[eê]ncia|valor|comprovante|r\$[ \t]*\d|\d)/i.test(
       t
     ) ||
-    /\bacabei[ \t]+de[ \t]+(?:pagar|fazer|enviar|mandar|transferir|depositar|passar)\b/i.test(t) ||
-    /\b(?:mandei|enviei|transferi)[ \t]+(?:o[ \t]+|os[ \t]+|a[ \t]+|as[ \t]+|um[ \t]+|meu[ \t]+)?(?:pix|pagamento|valor|comprovante|r\$[ \t]*\d|\d)/i.test(
-      t
-    )
+    /\bacabei[ \t]+de[ \t]+(?:pagar|fazer|enviar|mandar|transferir|depositar|passar)\b/i.test(t)
   );
 }
 

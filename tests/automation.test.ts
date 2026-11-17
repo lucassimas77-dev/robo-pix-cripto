@@ -14,6 +14,7 @@ import { ConversationEngine } from '../src/services/conversationEngine.ts';
 import { ExpirationWatcher } from '../src/services/expirationWatcher.ts';
 import {
   formatTimeSaoPaulo,
+  hasPixTriggerKeyword,
   isCancelCommand,
   isExitCommand,
   isPaymentConfirmationMessage,
@@ -304,6 +305,72 @@ test('Parsing monetário trata pontuação final, milhar, horários, telefones, 
     explicitOptionDigit: '1',
     inlineNewAmountBrl: null,
   });
+
+  // Casos da Busca #15: menu 1 / 2 com "2 mil reais" / "1 mil" / "2 reais", numerais por extenso, multiplicação/subtração/intervalos, filtro "apagar" e confirmações com advérbios
+  assert.deepEqual(parseActiveOrderMenuReply('2 mil reais'), {
+    choice: 'none',
+    explicitOptionDigit: null,
+    inlineNewAmountBrl: 2000,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('Quero 2 mil'), {
+    choice: 'none',
+    explicitOptionDigit: null,
+    inlineNewAmountBrl: 2000,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('2 mil e 500 reais'), {
+    choice: 'none',
+    explicitOptionDigit: null,
+    inlineNewAmountBrl: 2500,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('1 mil reais'), {
+    choice: 'none',
+    explicitOptionDigit: null,
+    inlineNewAmountBrl: 1000,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('Quero 2 reais'), {
+    choice: 'none',
+    explicitOptionDigit: null,
+    inlineNewAmountBrl: 2,
+  });
+
+  assert.equal(parseBrlAmountFromText('pix de dois mil reais'), 2000);
+  assert.equal(parseBrlAmountFromText('quero um pix de cinco mil'), 5000);
+  assert.equal(parseBrlAmountFromText('pix de tres mil e 500'), 3500);
+  assert.equal(parseBrlAmountFromText('pix de três mil e quinhentos reais'), 3500);
+  assert.equal(parseBrlAmountFromText('pix de mil e quinhentos'), 1500);
+  assert.equal(parseBrlAmountFromText('pix de dez mil reais'), 10000);
+  assert.equal(parseBrlAmountFromText('pix de vinte e cinco mil'), 25000);
+  assert.equal(parseBrlAmountFromText('pix de cento e cinquenta reais'), 150);
+  assert.equal(parseBrlAmountFromText('100 reais e cinquenta centavos'), 100.5);
+  assert.equal(parseBrlAmountFromText('pix de dois mil e meio'), 2500);
+  assert.equal(parseBrlAmountFromText('depois das cinco faço o pix'), null);
+  assert.equal(parseBrlAmountFromText('quantos mil pode no pix?'), null);
+  assert.equal(parseBrlAmountFromText('pix de doiz mil'), null);
+
+  assert.equal(parseBrlAmountFromText('pix de 2*50'), null);
+  assert.equal(parseBrlAmountFromText('3*50 reais'), null);
+  assert.equal(parseBrlAmountFromText('pix de 2 * 50 reais'), null);
+  assert.equal(parseBrlAmountFromText('*2* * *50*'), null);
+  assert.equal(parseBrlAmountFromText('pix de R$ 50 - 10'), null);
+  assert.equal(parseBrlAmountFromText('pix de 100 - 20 reais'), null);
+  assert.equal(parseBrlAmountFromText('pix de 100 menos 20 reais'), null);
+  assert.equal(parseBrlAmountFromText('pix de 50 a 100 reais?'), null);
+  assert.equal(parseBrlAmountFromText('*Pix* de *50,00*'), 50);
+
+  assert.equal(hasPixTriggerKeyword('Vou apagar as 10 fotos'), false);
+  assert.equal(hasPixTriggerKeyword('Pode apagar aquela mensagem'), false);
+  assert.equal(hasPixTriggerKeyword('Não precisa propagar isso'), false);
+  assert.equal(hasPixTriggerKeyword('Quero pagar 50'), true);
+  assert.equal(hasPixTriggerKeyword('Manda o pix de 50'), true);
+
+  assert.equal(isPaymentConfirmationMessage('Fiz agora o pix de 50'), true);
+  assert.equal(isPaymentConfirmationMessage('Enviei agora R$ 50'), true);
+  assert.equal(isPaymentConfirmationMessage('Mandei aí os 50 no pix'), true);
+  assert.equal(isPaymentConfirmationMessage('Transferi agora 50 reais'), true);
+  assert.equal(isPaymentConfirmationMessage('Já mandei lá o pix de 80'), true);
+  assert.equal(isPaymentConfirmationMessage('Já transferi pra vc os 50'), true);
+  assert.equal(isPaymentConfirmationMessage('Pronto, 50 enviado!'), true);
+  assert.equal(isPaymentConfirmationMessage('Valor de R$ 50 transferido'), true);
 
   assert.equal(formatTimeSaoPaulo('2026-07-01T18:15:00.000Z'), '15:15');
 });
@@ -887,8 +954,30 @@ test('ExpirationWatcher protege contra 503 transitório, respeita grace window d
         );
         return;
       }
+      if (req.url.includes('prd_live_priority')) {
+        res.writeHead(200);
+        res.end(
+          JSON.stringify({
+            checkouts: [
+              {
+                id: 'chk_live_prio',
+                status: 'processing',
+                is_live: 1,
+                payment_method: 'pix',
+              },
+            ],
+          })
+        );
+        return;
+      }
       res.writeHead(200);
       res.end(JSON.stringify({ checkouts: [] }));
+      return;
+    }
+
+    if (req.method === 'GET' && req.url?.startsWith('/api/transactions')) {
+      res.writeHead(200);
+      res.end(JSON.stringify({ transactions: [] }));
       return;
     }
 
@@ -972,6 +1061,46 @@ test('ExpirationWatcher protege contra 503 transitório, respeita grace window d
     assert.equal(graceOrd?.status, 'PENDING');
     assert.equal(deactivatedIds.includes('prd_grace_rail'), false);
 
+    // 2b. Anti-starvation: mesmo com 25 vendas históricas retidas em PIX_CONFIRMED no Cofre,
+    //     um pedido PENDING ao vivo é priorizado e confirmado já na próxima varredura de 15s!
+    for (let v = 1; v <= 25; v++) {
+      repository.createOrder({
+        id: `id_vault_${v}`,
+        externalId: `ext_vault_${v}`,
+        provider: 'depixapp',
+        providerChargeId: `prd_vault_${v}`,
+        customerPhone: `55119444400${String(v).padStart(2, '0')}`,
+        amountBrl: 60,
+        cryptoAsset: 'DEPIX',
+        cryptoNetwork: 'LIQUID',
+        walletAddress: 'Liquid',
+        pixCopyPaste: `https://pay.depixapp.com/c/prd_vault_${v}`,
+        status: 'PIX_CONFIRMED',
+        warningSent: false,
+        createdAt: basePastIso,
+        expiresAt: basePastIso,
+      });
+    }
+    repository.createOrder({
+      id: 'id_live_prio',
+      externalId: 'ext_live_prio',
+      provider: 'depixapp',
+      providerChargeId: 'prd_live_priority',
+      customerPhone: '5511955556666',
+      amountBrl: 110,
+      cryptoAsset: 'DEPIX',
+      cryptoNetwork: 'LIQUID',
+      walletAddress: 'Liquid',
+      pixCopyPaste: 'https://pay.depixapp.com/c/prd_live_priority',
+      status: 'PENDING',
+      warningSent: false,
+      createdAt: new Date(clock).toISOString(),
+      expiresAt: new Date(clock + 900_000).toISOString(),
+    });
+    clock += 20_000;
+    await watcher.sweepPendingOrders(new Date(clock));
+    assert.equal(repository.getOrderById('id_live_prio')?.status, 'PIX_CONFIRMED');
+
     // 3. PIX_CONFIRMED -> FAILED (PAYER_MISMATCH) chama /deactivate e marca remoteDeactivated = true!
     repository.createOrder({
       id: 'id_mismatch',
@@ -1029,8 +1158,9 @@ test('ExpirationWatcher protege contra 503 transitório, respeita grace window d
     assert.equal(repository.getSession(racePhone).stage, 'AWAITING_ACTIVE_ORDER_DECISION');
     assert.equal(repository.getSession(racePhone).pendingNewAmountBrl, 80);
 
-    // Expira a cobrança de R$ 50 antes de o cliente digitar "2"
-    await watcher.sweepPendingOrders(new Date(Date.now() + 120_000));
+    // Expira a cobrança de R$ 50 antes de o cliente digitar "2" (avança janela simulada de 2 min)
+    DePixAppProvider.clearRateLimitWindows();
+    await watcher.sweepPendingOrders(new Date(clock + 120_000));
     assert.equal(repository.getOrderById('id_menu_race')?.status, 'EXPIRED');
     assert.equal(repository.getSession(racePhone).stage, 'AWAITING_AMOUNT');
     assert.equal(repository.getSession(racePhone).pendingNewAmountBrl, 80);

@@ -186,7 +186,13 @@ export class UnifiedWhatsAppGateway implements IWhatsAppGateway {
     const { apiUrl, apiKey, instanceName } = this.config.evolutionWhatsapp;
     if (!apiKey) return;
 
-    const cleanBase64 = dataUriBase64.replace(/^data:image\/\w+;base64,/, '');
+    const mimeMatch = dataUriBase64.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,/i);
+    const rawMime = mimeMatch ? mimeMatch[1].toLowerCase() : 'image/png';
+    const mimetype = rawMime === 'image/jpg' ? 'image/jpeg' : rawMime;
+    const ext = mimetype === 'image/jpeg' ? 'jpg' : mimetype === 'image/webp' ? 'webp' : 'png';
+    const cleanBase64 = dataUriBase64
+      .replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/i, '')
+      .replace(/\s+/g, '');
 
     try {
       await fetch(`${apiUrl}/message/sendMedia/${encodeURIComponent(instanceName)}`, {
@@ -198,10 +204,10 @@ export class UnifiedWhatsAppGateway implements IWhatsAppGateway {
         body: JSON.stringify({
           number: phone,
           mediatype: 'image',
-          mimetype: 'image/png',
+          mimetype,
           caption,
           media: cleanBase64,
-          fileName: 'qrcode-pix.png',
+          fileName: `qrcode-pix.${ext}`,
         }),
         signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       });

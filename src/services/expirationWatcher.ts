@@ -72,25 +72,52 @@ export class ExpirationWatcher {
         }
       }
 
-      const eligibleForPoll: PixCryptoOrder[] = [];
+      const eligiblePending: PixCryptoOrder[] = [];
+      const eligibleConfirmed: PixCryptoOrder[] = [];
+      let hasExpiredPending = false;
       if (provider && provider.name !== 'mock') {
         for (const order of activeOrders) {
           if (order.provider !== provider.name) continue;
+          const isPending = order.status === 'PENDING';
+          const isExpiredClock = isPending && new Date(order.expiresAt).getTime() <= nowMs;
+          if (isExpiredClock) {
+            hasExpiredPending = true;
+            // Pedidos com relógio já vencido são tratados diretamente no Passo 3 (lastChance + deactivate)
+            continue;
+          }
           const lastMs = this.lastPolledAt.get(order.id) ?? 0;
-          const cooldown =
-            order.status === 'PENDING' ? PENDING_POLL_COOLDOWN_MS : CONFIRMED_POLL_COOLDOWN_MS;
+          const cooldown = isPending ? PENDING_POLL_COOLDOWN_MS : CONFIRMED_POLL_COOLDOWN_MS;
           if (nowMs - lastMs >= cooldown) {
-            eligibleForPoll.push(order);
+            if (isPending) {
+              eligiblePending.push(order);
+            } else {
+              eligibleConfirmed.push(order);
+            }
           }
         }
-        eligibleForPoll.sort(
+        eligiblePending.sort(
+          (a, b) => (this.lastPolledAt.get(a.id) ?? 0) - (this.lastPolledAt.get(b.id) ?? 0)
+        );
+        eligibleConfirmed.sort(
           (a, b) => (this.lastPolledAt.get(a.id) ?? 0) - (this.lastPolledAt.get(b.id) ?? 0)
         );
       }
 
-      const pollIdsThisCycle = new Set(
-        eligibleForPoll.slice(0, MAX_API_POLLS_PER_SWEEP).map((o) => o.id)
-      );
+      // Prioriza clientes ao vivo em PENDING sem deixar vendas do Cofre (PIX_CONFIRMED) sofrerem starvation!
+      const pollBudget = hasExpiredPending ? MAX_API_POLLS_PER_SWEEP : MAX_API_POLLS_PER_SWEEP + 1;
+      const selectedForPoll: PixCryptoOrder[] = [];
+      if (eligiblePending.length > 0 && eligibleConfirmed.length > 0) {
+        const pendingSlots = Math.max(1, pollBudget - 1);
+        selectedForPoll.push(...eligiblePending.slice(0, pendingSlots));
+        const remainingSlots = pollBudget - selectedForPoll.length;
+        selectedForPoll.push(...eligibleConfirmed.slice(0, remainingSlots));
+      } else if (eligiblePending.length > 0) {
+        selectedForPoll.push(...eligiblePending.slice(0, pollBudget));
+      } else if (eligibleConfirmed.length > 0) {
+        selectedForPoll.push(...eligibleConfirmed.slice(0, pollBudget));
+      }
+
+      const pollIdsThisCycle = new Set(selectedForPoll.map((o) => o.id));
 
       for (const order of activeOrders) {
         // 1. Consulta periódica respeitando orçamento global por ciclo

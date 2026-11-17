@@ -123,7 +123,7 @@ export class HodleProvider implements IPixCryptoProvider {
 
     const rawQr = safeOptionalId(data.qrCodeBase64);
     const pixQrCodeBase64 =
-      rawQr && /^data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+$/.test(rawQr)
+      rawQr && /^data:image\/(?:png|jpeg|jpg|webp);base64,[A-Za-z0-9+/=\s]+$/i.test(rawQr)
         ? rawQr
         : await QRCode.toDataURL(pixCopyPaste, { width: 320, margin: 2 });
 

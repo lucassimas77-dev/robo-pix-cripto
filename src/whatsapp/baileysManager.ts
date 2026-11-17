@@ -13,6 +13,7 @@ import type { WASocket } from '@whiskeysockets/baileys';
 import { OrderRepository } from '../database/orderRepository.ts';
 import type { FilterMode } from '../types/domain.ts';
 import {
+  hasPixTriggerKeyword,
   isCancelCommand,
   isExitCommand,
   isHelpCommand,
@@ -344,11 +345,7 @@ export class BaileysDirectManager {
 
               const isAlreadyInFlow =
                 isFreshSession || activeOrder !== null || isPostOrderFollowUp;
-              const hasPixKeyword =
-                text.length <= 2_000 &&
-                /\bpix\b|pagar|pagamento|chave[ \t]*pix|gerar[ \t]*pix|mand[ae][ \t]*(?:o[ \t]*)?pix|comprovante/i.test(
-                  text
-                );
+              const hasPixKeyword = hasPixTriggerKeyword(text);
 
               if (!isAlreadyInFlow && !hasPixKeyword) {
                 continue;
@@ -431,11 +428,14 @@ export class BaileysDirectManager {
     if (!this.sock || this.state !== 'CONNECTED') return false;
     try {
       const targetJid = this.resolveJid(phoneDigits, preferredJid);
-      const cleanBase64 = dataUriBase64.replace(/^data:image\/\w+;base64,/, '');
+      const mimeMatch = dataUriBase64.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,/i);
+      const rawMime = mimeMatch ? mimeMatch[1].toLowerCase() : 'image/png';
+      const mimetype = rawMime === 'image/jpg' ? 'image/jpeg' : rawMime;
+      const cleanBase64 = dataUriBase64.replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/i, '').replace(/\s+/g, '');
       const buffer = Buffer.from(cleanBase64, 'base64');
       await this.sock.sendMessage(targetJid, {
         image: buffer,
-        mimetype: 'image/png',
+        mimetype,
         caption,
       });
       return true;
