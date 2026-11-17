@@ -130,6 +130,69 @@ test('Parsing monetário trata pontuação final, milhar, horários, telefones, 
   assert.equal(isPublicHttpsWebhookUrl('https://10.0.0.5/webhooks/depixapp'), false);
   assert.equal(isPublicHttpsWebhookUrl('https://172.16.0.1/webhooks/depixapp'), false);
   assert.equal(isPublicHttpsWebhookUrl('https://[::1]:3000/webhooks/depixapp'), false);
+  assert.equal(isPublicHttpsWebhookUrl('https://localhost./webhooks/depixapp'), false);
+  assert.equal(isPublicHttpsWebhookUrl('https://./webhooks/depixapp'), false);
+  assert.equal(isPublicHttpsWebhookUrl('https://app.internal./webhooks/depixapp'), false);
+  assert.equal(isPublicHttpsWebhookUrl('https://[::127.0.0.1]/webhooks/depixapp'), false);
+  assert.equal(isPublicHttpsWebhookUrl('https://[febf::1]/webhooks/depixapp'), false);
+
+  // Casos da Busca #13: vírgulas inválidas (150,555 / 1,500), compostos "mil e ...", centavos >= 100, rótulos com ':', DDD 011, 2 pix de 50, .pdf, /mes, CNPJ alfanumérico
+  assert.equal(parseBrlAmountFromText('R$ 150,555'), null);
+  assert.equal(parseBrlAmountFromText('pix de 150,555'), null);
+  assert.equal(parseBrlAmountFromText('pix de 1,500'), null);
+  assert.equal(parseBrlAmountFromText('pix de 1,255 mil'), null);
+  assert.equal(parseBrlAmountFromText('pix de 10,50 centavos'), null);
+  assert.equal(parseBrlAmountFromText('pix de 1.500 reais e 50 centavos'), 1500.5);
+  assert.equal(parseBrlAmountFromText('pix de 150 centavos'), 1.5);
+  assert.equal(parseBrlAmountFromText('pix de 500 centavos'), 5);
+  assert.equal(parseBrlAmountFromText('pix de 2 mil e 500 reais'), 2500);
+  assert.equal(parseBrlAmountFromText('pix de R$ 2 mil e 500'), 2500);
+  assert.equal(parseBrlAmountFromText('pix de R$ 50 e 30 reais'), null);
+  assert.equal(parseBrlAmountFromText('pix de mil reais'), 1000);
+  assert.equal(parseBrlAmountFromText('pix de um mil reais'), 1000);
+  assert.equal(parseBrlAmountFromText('ag: 1234 conta: 56789-0 quero pix'), null);
+  assert.equal(parseBrlAmountFromText('pedido: 150 quero pix'), null);
+  assert.equal(parseBrlAmountFromText('id: 500 quero pix'), null);
+  assert.equal(parseBrlAmountFromText('meu tel (011) 98888-7777 quero pix'), null);
+  assert.equal(parseBrlAmountFromText('meu tel 011 98888-7777 quero pix'), null);
+  assert.equal(parseBrlAmountFromText('quero 2 pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('quero fazer 1 pix de 50'), 50);
+  assert.equal(parseBrlAmountFromText('segue arquivo 15.pdf quero pix'), null);
+  assert.equal(parseBrlAmountFromText('acesse meu site 50.io quero pix'), null);
+  assert.equal(parseBrlAmountFromText('custa 100/mes no pix?'), null);
+  assert.equal(parseBrlAmountFromText('meu cnpj é 12.ABC.345/01DE-35 quero pix'), null);
+
+  // Casos da Busca #13 em isPaymentConfirmationMessage e parseActiveOrderMenuReply
+  assert.equal(isPaymentConfirmationMessage('Pago R$ 50'), false);
+  assert.equal(isPaymentConfirmationMessage('Pago R$ 50,00 no pix'), false);
+  assert.equal(isPaymentConfirmationMessage('Pago R$ 50 agora'), false);
+  assert.equal(isPaymentConfirmationMessage('Pago R$ 50 se fizer desconto'), false);
+  assert.equal(isPaymentConfirmationMessage('Por R$ 50 pago agora'), false);
+  assert.deepEqual(parseActiveOrderMenuReply('2.'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('manda de novo'), {
+    choice: 'resend',
+    explicitOptionDigit: null,
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('quero a 2'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('quero a opção 2'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('cancela e gera de 100'), {
+    choice: 'new',
+    explicitOptionDigit: null,
+    inlineNewAmountBrl: 100,
+  });
 
   // Proteção anti-ReDoS O(N) em mensagens gigantes (64 KB) + clampInt seguro
   const startRedos = performance.now();
@@ -556,6 +619,25 @@ test('Servidor HTTP bloqueia Bearer password brute-force, CSRF cross-site, NaN e
       body: '{"password":{"toString":null}}',
     });
     assert.equal(badLoginTypeRes.status, 400);
+
+    // 20 tentativas paralelas de brute-force em /api/auth/login são serializadas e bloqueiam com HTTP 429 a partir da 6ª!
+    const parallelBrute = await Promise.all(
+      Array.from({ length: 20 }, (_, i) =>
+        fetch(`${url}/api/auth/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: `chute_errado_${i}` }),
+        })
+      )
+    );
+    const count429 = parallelBrute.filter((r) => r.status === 429).length;
+    assert.ok(count429 >= 15, `Esperado >=15 respostas 429, obtido ${count429}`);
+    const afterBruteSeq = await fetch(`${url}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: 'outro_chute_sequencial' }),
+    });
+    assert.equal(afterBruteSeq.status, 429);
 
     const badUriSimRes = await fetch(`${url}/api/simulator/pay/%E0%A4%A`, {
       method: 'POST',

@@ -151,6 +151,39 @@ export function createAppHttpServer(params: {
   const loginAttempts = new Map<string, { count: number; resetAt: number }>();
   let globalLoginFailWindow = { count: 0, resetAt: 0 };
   let setupInProgress = false;
+  let loginQueue: Promise<void> = Promise.resolve();
+  let pendingLoginVerifications = 0;
+  const MAX_PENDING_LOGIN_VERIFICATIONS = 10;
+
+  const isIpOrGlobalRateLimited = (clientIp: string, ts: number): boolean => {
+    pruneLoginAttempts(ts);
+    if (ts >= globalLoginFailWindow.resetAt) {
+      globalLoginFailWindow = { count: 0, resetAt: ts + LOGIN_WINDOW_MS };
+    }
+    const currentAttempt = loginAttempts.get(clientIp);
+    return (
+      globalLoginFailWindow.count >= MAX_GLOBAL_LOGIN_FAILURES ||
+      Boolean(
+        currentAttempt &&
+          ts < currentAttempt.resetAt &&
+          currentAttempt.count >= MAX_LOGIN_ATTEMPTS_PER_IP
+      )
+    );
+  };
+
+  const recordLoginFailure = (clientIp: string, ts: number): void => {
+    if (ts >= globalLoginFailWindow.resetAt) {
+      globalLoginFailWindow = { count: 0, resetAt: ts + LOGIN_WINDOW_MS };
+    }
+    globalLoginFailWindow.count += 1;
+    const latest = loginAttempts.get(clientIp);
+    const prevCount = latest && ts < latest.resetAt ? latest.count : 0;
+    const resetAt = latest && ts < latest.resetAt ? latest.resetAt : ts + LOGIN_WINDOW_MS;
+    loginAttempts.set(clientIp, {
+      count: prevCount + 1,
+      resetAt,
+    });
+  };
 
   const getRuntimeDefaults = (): RuntimeAccountSettings => ({
     provider: config.cryptoProvider,
@@ -380,18 +413,10 @@ export function createAppHttpServer(params: {
       }
 
       if (method === 'POST' && pathname === '/api/auth/login') {
-        const now = Date.now();
-        pruneLoginAttempts(now);
-
-        if (now >= globalLoginFailWindow.resetAt) {
-          globalLoginFailWindow = { count: 0, resetAt: now + LOGIN_WINDOW_MS };
-        }
         const clientIp = extractClientIp(req);
-        const attempt = loginAttempts.get(clientIp);
-
         if (
-          globalLoginFailWindow.count >= MAX_GLOBAL_LOGIN_FAILURES ||
-          (attempt && now < attempt.resetAt && attempt.count >= MAX_LOGIN_ATTEMPTS_PER_IP)
+          isIpOrGlobalRateLimited(clientIp, Date.now()) ||
+          pendingLoginVerifications >= MAX_PENDING_LOGIN_VERIFICATIONS
         ) {
           sendJson(res, 429, {
             error: 'Muitas tentativas incorretas. Aguarde 5 minutos e tente novamente.',
@@ -400,33 +425,51 @@ export function createAppHttpServer(params: {
         }
 
         const body = parseJsonObject(await readRawBody(req));
-        if (typeof body.password !== 'string') {
-          globalLoginFailWindow.count += 1;
-          const prevCount = attempt && now < attempt.resetAt ? attempt.count : 0;
-          loginAttempts.set(clientIp, {
-            count: prevCount + 1,
-            resetAt: now + LOGIN_WINDOW_MS,
-          });
-          sendJson(res, 400, { error: 'Formato de senha inválido.' });
-          return;
-        }
-        const password = body.password.trim();
-        const valid = await verifyAdminPasswordAsync(password);
-        if (!valid) {
-          globalLoginFailWindow.count += 1;
-          const prevCount = attempt && now < attempt.resetAt ? attempt.count : 0;
-          loginAttempts.set(clientIp, {
-            count: prevCount + 1,
-            resetAt: now + LOGIN_WINDOW_MS,
-          });
-          sendJson(res, 401, { error: 'Senha incorreta.' });
-          return;
-        }
 
-        loginAttempts.delete(clientIp);
-        const token = createSessionToken();
-        res.setHeader('Set-Cookie', buildSessionCookie(req, token, SESSION_TTL_SECONDS));
-        sendJson(res, 200, { ok: true, token });
+        pendingLoginVerifications += 1;
+        const runSerializedLogin = loginQueue
+          .catch(() => {})
+          .then(async () => {
+            const ts = Date.now();
+            if (isIpOrGlobalRateLimited(clientIp, ts)) {
+              sendJson(res, 429, {
+                error: 'Muitas tentativas incorretas. Aguarde 5 minutos e tente novamente.',
+              });
+              return;
+            }
+
+            if (typeof body.password !== 'string') {
+              recordLoginFailure(clientIp, ts);
+              sendJson(res, 400, { error: 'Formato de senha inválido.' });
+              return;
+            }
+
+            const password = body.password.trim();
+            if (!password || password.length > 128) {
+              recordLoginFailure(clientIp, ts);
+              sendJson(res, 401, { error: 'Senha incorreta.' });
+              return;
+            }
+
+            const valid = await verifyAdminPasswordAsync(password);
+            if (!valid) {
+              recordLoginFailure(clientIp, Date.now());
+              sendJson(res, 401, { error: 'Senha incorreta.' });
+              return;
+            }
+
+            loginAttempts.delete(clientIp);
+            const token = createSessionToken();
+            res.setHeader('Set-Cookie', buildSessionCookie(req, token, SESSION_TTL_SECONDS));
+            sendJson(res, 200, { ok: true, token });
+          });
+
+        loginQueue = runSerializedLogin;
+        try {
+          await runSerializedLogin;
+        } finally {
+          pendingLoginVerifications -= 1;
+        }
         return;
       }
 
