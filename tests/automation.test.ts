@@ -3270,3 +3270,81 @@ test('15. Busca #35: R$50 colado, quebras de linha \\n, negações/Cancela a 1 n
     );
   }
 });
+
+test('16. Busca #36: parcelamento ("em 3x"/"divide"), desconto/taxa/frete/troco pospostos, "quando cair"/processando/MED/"é inválido", centavos vs Reais e menu "2 (R$ 150)"', async () => {
+  // Achado 1: Parcelamento ("em 3x", "divide", "sem juros"), desconto/taxa/frete/troco com valor anteposto, "dá 150?" e teto/limite
+  for (const msg of [
+    'Posso pagar 300 em 3x no pix?',
+    'Divide R$ 300 em 3x no pix?',
+    'Divide 300 em 3 vezes no pix?',
+    'R$ 300 em 3x sem juros ou pix?',
+    'Tem 5 reais de desconto no pix?',
+    'Ganho 10 reais de desconto pagando no pix?',
+    'Tem 10 reais de taxa no pix?',
+    'Cobra 5 reais de taxa no pix?',
+    'Tem R$ 15 de frete no pix?',
+    'Preciso de 50 de troco no pix',
+    'Me volta 20 de troco no pix?',
+    'Dá 150 no pix?',
+    'Já com o frete dá 150 no pix?',
+    'Tudo dá 150 no pix?',
+    'Até quanto posso mandar no pix? 6000?',
+    'Qual o teto do pix? 6000?',
+    'Aceita até 6000 no pix?',
+    'Posso mandar até 5000 no pix?',
+  ]) {
+    assert.equal(parseBrlAmountFromText(msg), null, `Deveria bloquear dúvida comercial: ${msg}`);
+  }
+  assert.equal(parseBrlAmountFromText('Dá pra mandar um pix de 80?'), 80);
+
+  // Achado 2: "quando cair", "está processando", "MED", "é inválido", "tempo esgotado" e pós-pagamento isolado
+  for (const stMsg of [
+    'Me avisa quando cair os 50 do pix',
+    'Assim que cair os 50 me confirma',
+    'Ainda está processando o pix de 50 no meu banco',
+    'Caiu no MED o pix de 200',
+    'Diz que o código pix de 50 é inválido',
+    'Deu tempo esgotado no QR Code de 50',
+  ]) {
+    assert.equal(isStatusQueryMessage(stMsg), true, `Deveria ser status/erro: ${stMsg}`);
+    assert.equal(parseBrlAmountFromText(stMsg), null, `Não deveria cobrar: ${stMsg}`);
+  }
+  assert.equal(isPostOrderFollowUpMessage('Me avisa quando cair os 50'), true);
+  assert.equal(isPostOrderFollowUpMessage('Me avisa quando chegar'), false);
+  for (const postPaid of [
+    'Acabei de pagar os 100 reais!',
+    'Segue comprovante de R$ 150,00',
+    'Pix de R$ 80,00 realizado com sucesso',
+    'Já caiu aí os 50 conto?',
+  ]) {
+    assert.equal(parseBrlAmountFromText(postPaid), null, `Não deveria retornar valor em pós-pagamento: ${postPaid}`);
+  }
+
+  // Achado 3: Colisão entre centavos coloquiais por extenso e múltiplos valores em Reais + contagens >= 2 pix
+  for (const multiMsg of [
+    'Pix de cinquenta e oitenta reais',
+    'Os valores são trinta e quarenta reais no pix',
+    'Quero dois pix: trinta e quarenta reais',
+    'Me manda 2 pix no valor de 50',
+    'Quero 2 pix: 50',
+    'Quero 2 pix, 50',
+    'Quero fazer 5 pix',
+  ]) {
+    assert.equal(parseBrlAmountFromText(multiMsg), null, `Deveria rejeitar múltiplos valores/pix: ${multiMsg}`);
+  }
+  assert.equal(parseBrlAmountFromText('Pix de dez e cinquenta'), 10.5);
+  assert.equal(parseBrlAmountFromText('Pix de trinta e cinco reais'), 35);
+  assert.equal(parseBrlAmountFromText('Quero fazer 1 pix de 50'), 50);
+
+  // Achado 4: Menu 1 / 2 com novo valor entre parênteses ("2 (R$ 150)", "Quero a 2 (80 reais)")
+  assert.deepEqual(parseActiveOrderMenuReply('2 (R$ 150)'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: 150,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('Quero a 2 (80 reais)'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: 80,
+  });
+});
