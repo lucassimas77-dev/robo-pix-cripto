@@ -775,6 +775,83 @@ test('Parsing monetário trata pontuação final, milhar, horários, telefones, 
   assert.equal(parseBrlAmountFromText('Quanto dá 100 reais em BTC no pix?'), null);
   assert.equal(parseBrlAmountFromText('Quero converter 100 reais em USDT'), null);
 
+  // Cobertura Busca #24: emojis keycap 1️⃣/2️⃣ no menu, falsos positivos em status/passei vs novos pedidos,
+  // L-BTC e cotações ("O dólar tá 5,80"), contáveis/modelos/limites/BRCode EMV/Erro 404/conta corrente, retenção/análise/agendamento
+  assert.deepEqual(parseActiveOrderMenuReply('1️⃣'), {
+    choice: 'resend',
+    explicitOptionDigit: '1',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('2️⃣'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('2️⃣ gerar 80'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: 80,
+  });
+  assert.equal(parseBrlAmountFromText('Passo 5️⃣ do pix'), null);
+
+  assert.equal(isStatusQueryMessage('Meu pedido chegou, pix de 120 por favor'), false);
+  assert.equal(parseBrlAmountFromText('Meu pedido chegou, pix de 120 por favor'), 120);
+  assert.equal(isStatusQueryMessage('Meu salário caiu hoje, pix de 200'), false);
+  assert.equal(parseBrlAmountFromText('Meu salário caiu hoje, pix de 200'), 200);
+  assert.equal(isStatusQueryMessage('Entrou dinheiro na conta, pix de 80'), false);
+  assert.equal(parseBrlAmountFromText('Entrou dinheiro na conta, pix de 80'), 80);
+  assert.equal(isPaymentConfirmationMessage('Passei na loja hoje, me cobra 50 no pix'), false);
+  assert.equal(parseBrlAmountFromText('Passei na loja hoje, me cobra 50 no pix'), 50);
+  assert.equal(isPaymentConfirmationMessage('Passei aí mais cedo, pix de 80 por favor'), false);
+  assert.equal(parseBrlAmountFromText('Passei aí mais cedo, pix de 80 por favor'), 80);
+  assert.equal(isPaymentConfirmationMessage('Já paguei aquele, agora cobra 80 no pix'), false);
+  assert.equal(parseBrlAmountFromText('Já paguei aquele, agora cobra 80 no pix'), 80);
+  assert.equal(isStatusQueryMessage('Deu erro antes, quero trocar pra 80 no pix'), false);
+  assert.equal(parseBrlAmountFromText('Deu erro antes, quero trocar pra 80 no pix'), 80);
+  assert.equal(isStatusQueryMessage('Estornou aquele, muda pra 50 no pix'), false);
+  assert.equal(parseBrlAmountFromText('Estornou aquele, muda pra 50 no pix'), 50);
+  assert.equal(isStatusQueryMessage('Deu erro no outro, faz um de 50'), false);
+  assert.equal(parseBrlAmountFromText('Deu erro no outro, faz um de 50'), 50);
+
+  assert.equal(parseBrlAmountFromText('Quanto dá 100 reais em L-BTC no pix?'), null);
+  assert.equal(parseBrlAmountFromText('O dólar tá 5,80 no pix?'), null);
+  assert.equal(parseBrlAmountFromText('Dólar hoje a R$ 5,80 no pix?'), null);
+  assert.equal(parseBrlAmountFromText('Cotação do USDT tá 5,85 no pix?'), null);
+  assert.equal(parseBrlAmountFromText('Euro está 6,20 no pix?'), null);
+
+  assert.equal(parseBrlAmountFromText('Comprei 10 camisas, quanto fica no pix?'), null);
+  assert.equal(parseBrlAmountFromText('Quero 6 garrafas, aceita pix?'), null);
+  assert.equal(parseBrlAmountFromText('Quero pagar 5 faturas no pix'), null);
+  assert.equal(parseBrlAmountFromText('Tenho 5 dúvidas sobre o pix'), null);
+  assert.equal(parseBrlAmountFromText('Qual o limite do pix? 5000?'), null);
+  assert.equal(parseBrlAmountFromText('O pix mínimo é 5 reais?'), null);
+  assert.equal(parseBrlAmountFromText('Quero comprar o iPhone 15 no pix'), null);
+  assert.equal(parseBrlAmountFromText('Tem PlayStation 5 no pix?'), null);
+  assert.equal(
+    parseBrlAmountFromText(
+      'Posso pagar esse pix 00020126580014br.gov.bcb.pix0136123e4567-e89b-12d3-a456-426614174000520400005303986540585.005802BR5912LOJA 24 LTDA6009SAO PAULO62070503***630412AB'
+    ),
+    null
+  );
+  assert.equal(parseBrlAmountFromText('Erro 404 no link do pix'), null);
+  assert.equal(isStatusQueryMessage('Erro 404 no link do pix'), true);
+  assert.equal(parseBrlAmountFromText('Erro 500 ao abrir o pix'), null);
+  assert.equal(parseBrlAmountFromText('Pix na conta corrente 12345'), null);
+
+  assert.equal(parseBrlAmountFromText('Não concluiu o pix de 50'), null);
+  assert.equal(isStatusQueryMessage('Não concluiu o pix de 50'), true);
+  assert.equal(parseBrlAmountFromText('Não finalizou o pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Deu saldo insuficiente no pix de 50'), null);
+  assert.equal(isStatusQueryMessage('Deu saldo insuficiente no pix de 50'), true);
+  assert.equal(parseBrlAmountFromText('Estourou meu limite no pix de 500'), null);
+  assert.equal(parseBrlAmountFromText('Travou o app do banco no pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Meu pix de 50 ficou em análise no banco'), null);
+  assert.equal(isStatusQueryMessage('Meu pix de 50 ficou em análise no banco'), true);
+  assert.equal(parseBrlAmountFromText('O banco segurou meu pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Agendei o pix de 50 sem querer'), null);
+  assert.equal(isStatusQueryMessage('Agendei o pix de 50 sem querer'), true);
+  assert.equal(parseBrlAmountFromText('Pix agendado de R$ 50,00'), null);
+
   assert.equal(formatTimeSaoPaulo('2026-07-01T18:15:00.000Z'), '15:15');
 });
 
