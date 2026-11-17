@@ -3348,3 +3348,131 @@ test('16. Busca #36: parcelamento ("em 3x"/"divide"), desconto/taxa/frete/troco 
     inlineNewAmountBrl: 80,
   });
 });
+
+test('17. Busca #37: corrida liquidação vs menu 1/2, "mil e quinhentos" / "2 mil e 500?", "não tá abrindo"/mil em status/follow-up, "semana que vem"/chave aleatória/menu "2 / 150"', async () => {
+  // Achado 1: Corrida entre Menu 1 / 2 (AWAITING_ACTIVE_ORDER_DECISION) e liquidação simultânea (PIX_CONFIRMED / SETTLED_CRYPTO)
+  {
+    const { engine, repository } = createPrivacyTestSetup();
+    const baileys = new BaileysDirectManager(repository, 'data/wa_auth_test_37', {
+      filterMode: 'keyword_only',
+    });
+    const phone = '5511977770037';
+
+    // Cliente cria cobrança de R$ 50 e pede novo Pix de R$ 80 -> abre menu 1 / 2 com pendingNewAmountBrl = 80
+    await engine.handleIncomingMessage({ phone, text: 'Pix de 50' });
+    const ord1 = repository.findActivePendingOrderByPhone(phone);
+    assert.ok(ord1);
+    await engine.handleIncomingMessage({ phone, text: 'Pix de 80' });
+    assert.equal(repository.getSession(phone).stage, 'AWAITING_ACTIVE_ORDER_DECISION');
+    assert.equal(repository.getSession(phone).pendingNewAmountBrl, 80);
+
+    // ord1 compensa (PIX_CONFIRMED e logo em seguida SETTLED_CRYPTO) enquanto o cliente olha o menu!
+    await engine.handleSettlementWebhook({
+      provider: 'mock',
+      providerChargeId: ord1.providerChargeId,
+      eventId: 'evt_37_confirm',
+      newStatus: 'PIX_CONFIRMED',
+      rawEventName: 'checkout.approved',
+    });
+    await engine.handleSettlementWebhook({
+      provider: 'mock',
+      providerChargeId: ord1.providerChargeId,
+      eventId: 'evt_37_settle',
+      newStatus: 'SETTLED_CRYPTO',
+      rawEventName: 'checkout.completed',
+    });
+
+    // Em keyword_only: conversa pessoal NÃO é encaminhada, mas resposta de menu "2" É encaminhada e emite R$ 80,00 (nunca R$ 2,00!)
+    assert.equal(baileys.shouldForwardIncomingMessage(phone, 'Oi, bora jantar?'), false);
+    assert.equal(baileys.shouldForwardIncomingMessage(phone, '2'), true);
+
+    await engine.handleIncomingMessage({ phone, text: '2' });
+    const ord2 = repository.findActivePendingOrderByPhone(phone);
+    assert.ok(ord2);
+    assert.equal(ord2.amountBrl, 80);
+
+    // Teste também da resposta "1" quando o pedido anterior compensou durante o menu: informa confirmação sem cobrar R$ 1,00!
+    await engine.handleIncomingMessage({ phone, text: 'Pix de 95' });
+    await engine.handleSettlementWebhook({
+      provider: 'mock',
+      providerChargeId: ord2.providerChargeId,
+      eventId: 'evt_37_settle_2',
+      newStatus: 'SETTLED_CRYPTO',
+      rawEventName: 'checkout.completed',
+    });
+    assert.equal(baileys.shouldForwardIncomingMessage(phone, '1'), true);
+    await engine.handleIncomingMessage({ phone, text: '1' });
+    assert.equal(repository.findActivePendingOrderByPhone(phone), null);
+    repository.close();
+  }
+
+  // Achado 2: "mil e quinhentos" após "mim"/"vista"/"gentileza"/"só"/"fechar" + pedidos educados com "?" ("2 mil e 500?", "50 reais e 50 centavos?")
+  assert.equal(parseBrlAmountFromText('Faz pra mim mil e quinhentos no pix'), 1500);
+  assert.equal(parseBrlAmountFromText('Vou pagar à vista mil e quinhentos no pix'), 1500);
+  assert.equal(parseBrlAmountFromText('Manda por gentileza mil e duzentos no pix'), 1200);
+  assert.equal(parseBrlAmountFromText('Faz só mil e quinhentos no pix'), 1500);
+  assert.equal(parseBrlAmountFromText('Bora fechar mil e quinhentos no pix'), 1500);
+  assert.equal(parseBrlAmountFromText('Manda pra mim mil reais no pix'), 1000);
+  assert.equal(parseBrlAmountFromText('Gera por gentileza mil reais no pix'), 1000);
+  assert.equal(parseBrlAmountFromText('pix de doiz mil'), null);
+  assert.equal(parseBrlAmountFromText('pix de doiz mil e quinhentos'), null);
+  assert.equal(parseBrlAmountFromText('Posso pagar 2 mil e 500 no pix?'), 2500);
+  assert.equal(parseBrlAmountFromText('Pode mandar um pix de 2 mil e 500?'), 2500);
+  assert.equal(parseBrlAmountFromText('Pode gerar um pix de 50 reais e 50 centavos?'), 50.5);
+  assert.equal(parseBrlAmountFromText('Consegue fazer um pix de 100 reais e 50 centavos?'), 100.5);
+
+  // Achado 3: "não tá abrindo"/"não está carregando"/"não tá lendo" e "mil" em débitos, erros, vencimentos e follow-ups
+  for (const stMsg of [
+    'O link do pix de 50 não tá abrindo',
+    'O link de 50 não está carregando',
+    'O QR Code de 50 não tá lendo',
+    'O QR Code de 50 não está escaneando',
+    'Saiu mil reais da minha conta no pix',
+    'O link do pix de mil reais venceu',
+    'Fiz o pix de mil reais errado',
+    'Enviei 2 mil a mais no pix',
+    'Mandei mil reais errado no pix',
+    'Cobrou mil reais duas vezes no pix',
+  ]) {
+    assert.equal(isStatusQueryMessage(stMsg), true, `Deveria ser status/erro: ${stMsg}`);
+    assert.equal(parseBrlAmountFromText(stMsg), null, `Não deveria cobrar: ${stMsg}`);
+  }
+  assert.equal(isPaymentConfirmationMessage('Fiz o pix de mil reais errado'), false);
+  assert.equal(isPaymentConfirmationMessage('Enviei 2 mil a mais no pix'), false);
+  for (const fuMil of [
+    'Já paguei os mil reais!',
+    'Já caiu os mil reais?',
+    'Transferi os mil e quinhentos',
+  ]) {
+    assert.equal(isPostOrderFollowUpMessage(fuMil), true, `Deveria aceitar follow-up com mil: ${fuMil}`);
+  }
+
+  // Achado 4: "semana/mês/ano que vem", pagamentos divididos/mistos, chave aleatória sainte e pós-pagamento/menu "2 / 150"
+  for (const blockedMsg of [
+    'Dou 50 hoje e 50 semana que vem no pix',
+    'Pago 50 hoje e 50 mês que vem no pix',
+    'Pago 50 hoje e 50 ano que vem no pix',
+    'Posso fazer metade hoje (50) e metade amanhã no pix?',
+    'Posso dar 50 hoje e o resto sexta no pix?',
+    'Tenho 50 em espécie e o resto faço pix?',
+    'Minha chave aleatória é 123e4567-e89b-12d3-a456-426614174000, me manda 50',
+    'Já fiz o pix de 50',
+    'Mandei o pix de 50 agora',
+    'Enviei os 50 reais no pix',
+    'Caiu aí os 50 no pix?',
+    'Vê aí se entrou os 500 do pix',
+    'Deu certo o pix de 50?',
+  ]) {
+    assert.equal(parseBrlAmountFromText(blockedMsg), null, `Não deveria extrair cobrança em: ${blockedMsg}`);
+  }
+  assert.deepEqual(parseActiveOrderMenuReply('2, já fiz o pix de 50'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('2 / 150'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: 150,
+  });
+});

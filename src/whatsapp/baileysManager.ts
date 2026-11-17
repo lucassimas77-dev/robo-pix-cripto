@@ -16,6 +16,7 @@ import {
   hasPixTriggerKeyword,
   isPostOrderFollowUpMessage,
   onlyDigits,
+  parseActiveOrderMenuReply,
 } from '../utils/cpfCnpjValidator.ts';
 
 export type { FilterMode };
@@ -32,6 +33,7 @@ export interface BaileysStatusSnapshot {
 const MAX_UNSCANNED_QR_CYCLES = 3;
 const MAX_JID_MAP_ENTRIES = 5_000;
 const SESSION_FLOW_FRESHNESS_MS = 2 * 60 * 60 * 1000; // 2 horas
+const SETTLED_MENU_TTL_MS = 5 * 60 * 1000; // 5 min para resposta "1"/"2" se a cobrança liquidou diante do menu
 const RECENT_ORDER_CONTEXT_MS = 24 * 60 * 60 * 1000; // 24 horas para comandos pós-pagamento ("já paguei", "status")
 
 export class BaileysDirectManager {
@@ -140,6 +142,15 @@ export class BaileysDirectManager {
         sessionAgeMs < SESSION_FLOW_FRESHNESS_MS;
 
       if (isFreshSession || activeOrder !== null || hasPixTriggerKeyword(text)) {
+        return true;
+      }
+
+      if (
+        session.draftAmountBrl === -2 &&
+        Number.isFinite(sessionAgeMs) &&
+        sessionAgeMs <= SETTLED_MENU_TTL_MS &&
+        parseActiveOrderMenuReply(text).choice !== 'none'
+      ) {
         return true;
       }
 

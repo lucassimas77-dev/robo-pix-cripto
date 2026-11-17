@@ -164,6 +164,7 @@ export class ConversationEngine {
       sessionAgeMs > DECISION_MENU_TTL_MS &&
       (session.stage === 'AWAITING_ACTIVE_ORDER_DECISION' ||
         session.draftAmountBrl === -1 ||
+        session.draftAmountBrl === -2 ||
         session.pendingNewAmountBrl !== undefined)
     ) {
       if (session.stage === 'AWAITING_ACTIVE_ORDER_DECISION') {
@@ -450,18 +451,26 @@ export class ConversationEngine {
       return;
     }
 
-    // Se o cliente estava diante do menu 1 / 2 no exato segundo em que a cobrança anterior expirou/falhou:
-    if (session.draftAmountBrl === -1 || session.pendingNewAmountBrl !== undefined) {
+    // Se o cliente estava diante do menu 1 / 2 no exato segundo em que a cobrança anterior expirou/falhou (-1) ou compensou (-2):
+    if (
+      session.draftAmountBrl === -1 ||
+      session.draftAmountBrl === -2 ||
+      session.pendingNewAmountBrl !== undefined
+    ) {
       const menuAfterExp = parseActiveOrderMenuReply(text);
       const savedPendingAmt = session.pendingNewAmountBrl;
       const hadExpiredMenu = session.draftAmountBrl === -1;
+      const hadSettledMenu = session.draftAmountBrl === -2;
 
       session.draftAmountBrl = undefined;
       session.pendingNewAmountBrl = undefined;
       this.repository.saveSession(session);
 
-      // Somente consome `savedPendingAmt` se o cliente clicou/digitou explicitamente a opção numérica `2` sem dígitos ambíguos extras!
-      if (menuAfterExp.explicitOptionDigit === '2') {
+      // Opção 2 explícita (ou intenção "new" quando havia menu recém-compensado): consome `savedPendingAmt` se não houver dígitos ambíguos extras!
+      if (
+        menuAfterExp.explicitOptionDigit === '2' ||
+        (hadSettledMenu && menuAfterExp.choice === 'new')
+      ) {
         const hasAmbiguousNewDigits =
           menuAfterExp.inlineNewAmountBrl === null && hasUnparsedDigitsInMenuReply(text);
         const targetAmt =
@@ -471,24 +480,38 @@ export class ConversationEngine {
           await this.proceedWithAmount(phone, targetAmt, session.customerJid);
           return;
         }
+        session.stage = 'AWAITING_AMOUNT';
+        this.repository.saveSession(session);
         await this.safeSendText(
           phone,
-          '⏰ A cobrança anterior já expirou! Qual o *novo valor em Reais* para o Pix? _(Ex: 200,00)_',
+          hadSettledMenu
+            ? '✅ A cobrança anterior já foi confirmada! Qual o *novo valor em Reais* para o Pix? _(Ex: 200,00)_'
+            : '⏰ A cobrança anterior já expirou! Qual o *novo valor em Reais* para o Pix? _(Ex: 200,00)_',
           session.customerJid
         );
         return;
       }
 
-      if (
-        hadExpiredMenu &&
-        (menuAfterExp.explicitOptionDigit === '1' || menuAfterExp.choice === 'resend')
-      ) {
-        await this.safeSendText(
-          phone,
-          '⏰ A cobrança anterior já expirou! Qual o *valor em Reais* que deseja gerar agora? _(Ex: 50,00)_',
-          session.customerJid
-        );
-        return;
+      if (menuAfterExp.explicitOptionDigit === '1' || menuAfterExp.choice === 'resend') {
+        if (hadSettledMenu) {
+          const recentSettled = this.repository.findMostRecentOrderByPhone(phone);
+          await this.safeSendText(
+            phone,
+            recentSettled
+              ? `✅ Sua cobrança anterior de *${formatBrl(recentSettled.amountBrl)}* (\`${recentSettled.externalId}\`) já está *confirmada*! Se desejar um novo Pix, envie *Pix de [valor]*.`
+              : '✅ Sua cobrança anterior já está confirmada! Se desejar um novo Pix, envie *Pix de [valor]*.',
+            session.customerJid
+          );
+          return;
+        }
+        if (hadExpiredMenu) {
+          await this.safeSendText(
+            phone,
+            '⏰ A cobrança anterior já expirou! Qual o *valor em Reais* que deseja gerar agora? _(Ex: 50,00)_',
+            session.customerJid
+          );
+          return;
+        }
       }
     }
 
@@ -749,16 +772,20 @@ export class ConversationEngine {
         );
         if (!otherActive) {
           const sess = this.repository.getSession(updatedOrder.customerPhone);
-          if (
-            sess.stage === 'AWAITING_ACTIVE_ORDER_DECISION' ||
-            sess.pendingNewAmountBrl !== undefined
-          ) {
-            this.repository.saveSession({
-              phone: updatedOrder.customerPhone,
-              customerJid: updatedOrder.customerJid ?? sess.customerJid,
-              stage: 'IDLE',
-              updatedAt: new Date().toISOString(),
-            });
+          const hadActiveMenu =
+            sess.stage === 'AWAITING_ACTIVE_ORDER_DECISION' || sess.draftAmountBrl === -2;
+          if (hadActiveMenu || sess.pendingNewAmountBrl !== undefined) {
+            this.repository.saveSession(
+              {
+                phone: updatedOrder.customerPhone,
+                customerJid: updatedOrder.customerJid ?? sess.customerJid,
+                stage: 'IDLE',
+                draftAmountBrl: hadActiveMenu ? -2 : undefined,
+                pendingNewAmountBrl: hadActiveMenu ? sess.pendingNewAmountBrl : undefined,
+                updatedAt: new Date().toISOString(),
+              },
+              true
+            );
           }
         }
       }
