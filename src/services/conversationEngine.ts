@@ -129,13 +129,15 @@ export class ConversationEngine {
       session.customerJid = customerJid;
     }
 
-    // Expira estados residuais de sessão / menu 1-2 por TTL para não resgatar valores antigos horas depois!
+    // Expira estados residuais de sessão / menu 1-2 por TTL apenas quando NÃO há cobrança PENDING ativa!
+    const liveActiveAtEntry = this.repository.findActivePendingOrderByPhone(phone);
     const sessionAgeMs = Date.now() - new Date(session.updatedAt).getTime();
-    if (!Number.isFinite(sessionAgeMs) || sessionAgeMs > SESSION_TTL_MS) {
+    if (!Number.isFinite(sessionAgeMs) || (sessionAgeMs > SESSION_TTL_MS && !liveActiveAtEntry)) {
       session.stage = 'IDLE';
       session.pendingNewAmountBrl = undefined;
       session.draftAmountBrl = undefined;
     } else if (
+      !liveActiveAtEntry &&
       sessionAgeMs > DECISION_MENU_TTL_MS &&
       (session.stage === 'AWAITING_ACTIVE_ORDER_DECISION' ||
         session.draftAmountBrl === -1 ||
@@ -381,7 +383,21 @@ export class ConversationEngine {
 
     const activeOrder = this.repository.findActivePendingOrderByPhone(phone);
     if (activeOrder) {
+      const directResendCheck = parseActiveOrderMenuReply(text);
       const possibleNewAmount = parseBrlAmountFromText(text);
+      if (
+        directResendCheck.choice === 'resend' &&
+        directResendCheck.explicitOptionDigit === null &&
+        (possibleNewAmount === null || possibleNewAmount === activeOrder.amountBrl)
+      ) {
+        session.stage = 'IDLE';
+        session.pendingNewAmountBrl = undefined;
+        session.draftAmountBrl = undefined;
+        this.repository.saveSession(session);
+        await this.resendActiveOrder(activeOrder);
+        return;
+      }
+
       const remainingMin = Math.max(
         1,
         Math.ceil((new Date(activeOrder.expiresAt).getTime() - Date.now()) / 60_000)
@@ -768,9 +784,8 @@ export class ConversationEngine {
         );
         if (!otherActive) {
           const sess = this.repository.getSession(updatedOrder.customerPhone);
-          const menuFresh =
-            sess.stage === 'AWAITING_ACTIVE_ORDER_DECISION' &&
-            Date.now() - new Date(sess.updatedAt).getTime() <= DECISION_MENU_TTL_MS;
+          const nowIso = new Date().toISOString();
+          const menuFresh = sess.stage === 'AWAITING_ACTIVE_ORDER_DECISION';
           this.repository.saveSession(
             {
               phone: updatedOrder.customerPhone,
@@ -778,9 +793,9 @@ export class ConversationEngine {
               stage: 'AWAITING_AMOUNT',
               draftAmountBrl: menuFresh ? -1 : undefined,
               pendingNewAmountBrl: menuFresh ? sess.pendingNewAmountBrl : undefined,
-              updatedAt: menuFresh ? sess.updatedAt : new Date().toISOString(),
+              updatedAt: nowIso,
             },
-            menuFresh
+            true
           );
         }
 
@@ -817,9 +832,8 @@ export class ConversationEngine {
 
         if (!hasNewerOrder) {
           const sess = this.repository.getSession(updatedOrder.customerPhone);
-          const menuFresh =
-            sess.stage === 'AWAITING_ACTIVE_ORDER_DECISION' &&
-            Date.now() - new Date(sess.updatedAt).getTime() <= DECISION_MENU_TTL_MS;
+          const nowIso = new Date().toISOString();
+          const menuFresh = sess.stage === 'AWAITING_ACTIVE_ORDER_DECISION';
           this.repository.saveSession(
             {
               phone: updatedOrder.customerPhone,
@@ -827,9 +841,9 @@ export class ConversationEngine {
               stage: 'AWAITING_AMOUNT',
               draftAmountBrl: menuFresh ? -1 : undefined,
               pendingNewAmountBrl: menuFresh ? sess.pendingNewAmountBrl : undefined,
-              updatedAt: menuFresh ? sess.updatedAt : new Date().toISOString(),
+              updatedAt: nowIso,
             },
-            menuFresh
+            true
           );
 
           await this.safeSendText(

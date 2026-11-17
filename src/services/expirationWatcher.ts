@@ -288,11 +288,11 @@ export class ExpirationWatcher {
 
             if (!hasNewerOrder) {
               const sess = this.repository.getSession(order.customerPhone);
-              const menuAgeMs = effectiveNowMs - new Date(sess.updatedAt).getTime();
+              const postExpiryAgeMs = effectiveNowMs - new Date(order.expiresAt).getTime();
               const menuFresh =
                 sess.stage === 'AWAITING_ACTIVE_ORDER_DECISION' &&
-                Number.isFinite(menuAgeMs) &&
-                menuAgeMs <= DECISION_MENU_TTL_MS;
+                Number.isFinite(postExpiryAgeMs) &&
+                postExpiryAgeMs <= DECISION_MENU_TTL_MS;
 
               this.repository.saveSession(
                 {
@@ -301,7 +301,7 @@ export class ExpirationWatcher {
                   stage: 'AWAITING_AMOUNT',
                   draftAmountBrl: menuFresh ? -1 : undefined,
                   pendingNewAmountBrl: menuFresh ? sess.pendingNewAmountBrl : undefined,
-                  updatedAt: menuFresh ? sess.updatedAt : effectiveNowIso,
+                  updatedAt: effectiveNowIso,
                 },
                 true
               );

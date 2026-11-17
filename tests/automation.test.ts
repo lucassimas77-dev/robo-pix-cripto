@@ -516,6 +516,43 @@ test('Parsing monetário trata pontuação final, milhar, horários, telefones, 
     inlineNewAmountBrl: null,
   });
 
+  // Casos da Busca #19: "Acabei de fazer/mandar/passar o pix de 50", "Consegui pagar", "Me manda o comprovante",
+  // "Cancela o pix de 50", negações/desistências, cripto/moedas estrangeiras, medidas/endereços e "50reais" colado
+  assert.equal(isPaymentConfirmationMessage('Acabei de fazer o pix de 50'), true);
+  assert.equal(isPaymentConfirmationMessage('Acabei de mandar R$ 50'), true);
+  assert.equal(isPaymentConfirmationMessage('Acabei de passar o pix de 50'), true);
+  assert.equal(isPaymentConfirmationMessage('Consegui pagar o pix de 50!'), true);
+  assert.equal(isPaymentConfirmationMessage('Consegui fazer o pix de 50!'), true);
+  assert.equal(isStatusQueryMessage('Pode mandar o comprovante do pix de 50?'), true);
+  assert.equal(isStatusQueryMessage('Pode enviar o comprovante de R$ 50?'), true);
+  assert.equal(isStatusQueryMessage('Me manda o comprovante do pix de 50'), true);
+
+  assert.equal(isCancelCommand('Cancela o pix de 50'), true);
+  assert.equal(isCancelCommand('Quero cancelar a cobrança de R$ 50,00'), true);
+  assert.equal(isCancelCommand('Pode cancelar a cobrança de 50?'), true);
+  assert.equal(isCancelCommand('cancela e gera de 100'), false);
+  assert.equal(parseBrlAmountFromText('Cancela o pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Não quero pagar 50 no pix'), null);
+  assert.equal(parseBrlAmountFromText('Não vou pagar R$ 50 agora'), null);
+  assert.equal(parseBrlAmountFromText('Não gera o pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Não manda o pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Não quero mais o pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Esquece o pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Deixa pra lá o pix de 50'), null);
+  assert.equal(parseBrlAmountFromText('Desisto do pix de 50'), null);
+
+  assert.equal(parseBrlAmountFromText('Quero comprar 100 USDT, manda o pix'), null);
+  assert.equal(parseBrlAmountFromText('Quanto fica US$ 50 no pix?'), null);
+  assert.equal(parseBrlAmountFromText('50 dólares no pix'), null);
+  assert.equal(parseBrlAmountFromText('0,05 BTC no pix'), null);
+  assert.equal(parseBrlAmountFromText('Quero 2 kg no pix'), null);
+  assert.equal(parseBrlAmountFromText('Quero 5 litros no pix'), null);
+  assert.equal(parseBrlAmountFromText('Moro na rua 10, quero fazer um pix'), null);
+  assert.equal(parseBrlAmountFromText('Moro no km 50, aceita pix?'), null);
+  assert.equal(parseBrlAmountFromText('pix de 50reais'), 50);
+  assert.equal(parseBrlAmountFromText('100reais no pix'), 100);
+  assert.equal(parseBrlAmountFromText('50,00reais'), 50);
+
   assert.equal(formatTimeSaoPaulo('2026-07-01T18:15:00.000Z'), '15:15');
 });
 
@@ -657,11 +694,22 @@ test('Concorrência, mensagens pós-pagamento ("já paguei"), estado AWAITING_AM
 
   // "Quero a (2)" preserva pendingNewAmountBrl sem perder o valor pendente!
   await engine.handleIncomingMessage({ phone: phoneMenu, text: 'Pix de 60' });
+  // Em IDLE com cobrança ativa, "Reenvia o pix de 60" reenvia direto sem abrir menu contraditório
+  await engine.handleIncomingMessage({ phone: phoneMenu, text: 'Reenvia o pix de 60' });
+  assert.equal(repository.getSession(phoneMenu).stage, 'IDLE');
+
   await engine.handleIncomingMessage({ phone: phoneMenu, text: 'Pix de 85' });
   assert.equal(repository.getSession(phoneMenu).stage, 'AWAITING_ACTIVE_ORDER_DECISION');
+  // Mesmo 8 minutos após abrir o menu (> 5 min), enquanto a cobrança ativa de 15 min existir, "2" gera R$ 85 e nunca R$ 2!
+  const agedMenuSess = repository.getSession(phoneMenu);
+  repository.saveSession(
+    { ...agedMenuSess, updatedAt: new Date(Date.now() - 8 * 60_000).toISOString() },
+    true
+  );
   await engine.handleIncomingMessage({ phone: phoneMenu, text: 'Quero a (2)' });
   assert.equal(repository.findMostRecentOrderByPhone(phoneMenu)?.amountBrl, 85);
-  await engine.handleIncomingMessage({ phone: phoneMenu, text: 'Quero cancelar o pix!' });
+  await engine.handleIncomingMessage({ phone: phoneMenu, text: 'Cancela o pix de 85' });
+  assert.equal(repository.findMostRecentOrderByPhone(phoneMenu)?.status, 'CANCELLED');
 
   // Comando de ajuda funciona e mantém AWAITING_AMOUNT
   await engine.handleIncomingMessage({ phone: phoneMenu, text: 'Como funciona?' });
