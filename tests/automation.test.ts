@@ -3113,3 +3113,160 @@ test('Busca #34: menu "2 mesmo"/"Fico na 2"/"Manda 2", bloqueio não-financeiro 
   assert.equal(parseBrlAmountFromText('pix de R$ 10,50 (dez reais e cinquenta centavos)'), 10.5);
   assert.equal(parseBrlAmountFromText('pix de 50 (80 reais)'), null);
 });
+
+test('15. Busca #35: R$50 colado, quebras de linha \\n, negações/Cancela a 1 no menu, O(N) sem backtracking, ficaria/custaria/QR leu e mil/k em cancelar/follow-up', async () => {
+  // Achado 1: Valores colados a R$ sem espaço ("R$50", "R$50,00") em débitos, erros, vencimentos e payouts
+  assert.equal(parseBrlAmountFromText('Pix de R$50'), 50);
+  assert.equal(parseBrlAmountFromText('ARS$50'), null);
+  for (const msg of [
+    'Saiu R$50,00 da minha conta no pix',
+    'Cobrou R$50 a mais no pix',
+    'O link de R$50 não abriu',
+    'O pix de R$50 venceu',
+    'Baixou R$50 do pix?',
+  ]) {
+    assert.equal(isStatusQueryMessage(msg), true, `Deveria ser status: ${msg}`);
+    assert.equal(parseBrlAmountFromText(msg), null, `Não deveria cobrar: ${msg}`);
+  }
+  assert.equal(isPostOrderFollowUpMessage('Saiu R$50,00 da minha conta'), true);
+  assert.equal(parseBrlAmountFromText('Manda R$50 na minha conta'), null);
+  for (const errMsg of ['Mandei R$50 errado no pix', 'Mandei R$50 a mais no pix', 'Fiz R$50 2 vezes no pix']) {
+    assert.equal(isStatusQueryMessage(errMsg), true, `Deveria ser erro/status: ${errMsg}`);
+    assert.equal(isPaymentConfirmationMessage(errMsg), false, `Não deveria confirmar pagamento normal: ${errMsg}`);
+    assert.equal(parseBrlAmountFromText(errMsg), null, `Não deveria cobrar: ${errMsg}`);
+  }
+
+  // Achado 2: Quebras de linha (\n) em confirmações, negações, novos pedidos e follow-ups
+  assert.equal(isPaymentConfirmationMessage('Pix de 50\npago!'), true);
+  assert.equal(parseBrlAmountFromText('Pix de 50\npago!'), null);
+  assert.equal(isPaymentConfirmationMessage('Não\npaguei o pix de 50'), false);
+  assert.equal(isPaymentConfirmationMessage('Já paguei aquele\ngera\num pix de 80'), false);
+  assert.equal(parseBrlAmountFromText('Já paguei aquele\ngera\num pix de 80'), 80);
+  assert.equal(isStatusQueryMessage('Saiu 50 reais\nda minha conta'), true);
+  assert.equal(isPostOrderFollowUpMessage('Saiu 50 reais\nda minha conta'), true);
+  assert.equal(isPostOrderFollowUpMessage('Já paguei\nos 50 reais'), true);
+
+  // Achado 3: Negações com artigos/demonstrativos/"vou querer", "Não quero a 2" e "Cancela a 1" no menu 1 / 2
+  for (const negMsg of [
+    'Não quero os 50 no pix',
+    'Não quero o de 50 no pix',
+    'Não quero esse de 50 no pix',
+    'Não quero essa cobrança de 50',
+    'Não vou querer o pix de 50',
+  ]) {
+    assert.equal(parseBrlAmountFromText(negMsg), null, `Deveria bloquear negação: ${negMsg}`);
+  }
+  assert.deepEqual(parseActiveOrderMenuReply('Não quero a 2'), {
+    choice: 'none',
+    explicitOptionDigit: null,
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('Não a 2'), {
+    choice: 'none',
+    explicitOptionDigit: null,
+    inlineNewAmountBrl: null,
+  });
+  assert.equal(hasUnparsedDigitsInMenuReply('Cancela a 1'), false);
+  assert.deepEqual(parseActiveOrderMenuReply('Cancela a 1'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: null,
+  });
+  assert.deepEqual(parseActiveOrderMenuReply('Cancela a 1 e manda 100'), {
+    choice: 'new',
+    explicitOptionDigit: '2',
+    inlineNewAmountBrl: 100,
+  });
+
+  // E2E no ConversationEngine: "Não quero a 2" preserva pendingNewAmountBrl = 80 e "Cancela a 1" emite R$ 80,00!
+  {
+    const { engine, repository } = createPrivacyTestSetup();
+    const phone = '5511977770035';
+    await engine.handleIncomingMessage({ phone, text: 'Pix de 60' });
+    await engine.handleIncomingMessage({ phone, text: 'Pix de 80' });
+    await engine.handleIncomingMessage({ phone, text: 'Não quero a 2' });
+    assert.equal(repository.getSession(phone).pendingNewAmountBrl, 80);
+    await engine.handleIncomingMessage({ phone, text: 'Cancela a 1' });
+    assert.equal(repository.findActivePendingOrderByPhone(phone)?.amountBrl, 80);
+    repository.close();
+  }
+
+  // Achado 4: Complexidade estritamente O(N) sem backtracking quadrático em sequências numéricas longas
+  {
+    const t0 = performance.now();
+    assert.equal(parseBrlAmountFromText('1'.repeat(1990) + '?'), null);
+    assert.equal(parseBrlAmountFromText('1'.repeat(1900) + ' (abc)'), null);
+    assert.equal(isStatusQueryMessage('1'.repeat(1990) + '?'), false);
+    assert.equal(isPaymentConfirmationMessage('1'.repeat(1990)), false);
+    assert.equal(isPostOrderFollowUpMessage('1'.repeat(1990)), false);
+    const elapsedMs = performance.now() - t0;
+    assert.ok(elapsedMs < 20, `Execução O(N) em 5 entradas longas demorou ${elapsedMs.toFixed(2)}ms (esperado < 20ms)`);
+  }
+
+  // Achado 5: Condicionais de preço ("ficaria"/"custaria"/"sairia"), pechinchas com "no pix" final e "não leu o QR Code"
+  for (const q of [
+    'Ficaria quanto no pix? 80?',
+    'Custaria quanto no pix? 80?',
+    'Ficaria 80 no pix?',
+    'Custaria 80 no pix?',
+    'Sairia por 80 no pix?',
+    'Daria 80 no pix?',
+    '80 reais você faz no pix?',
+    'Por 80 faz no pix?',
+    '80 aceita no pix?',
+    'Por R$ 80 fecha no pix?',
+  ]) {
+    assert.equal(parseBrlAmountFromText(q), null, `Deveria bloquear pergunta/proposta: ${q}`);
+  }
+  assert.equal(parseBrlAmountFromText('Daria pra mandar um pix de 80?'), 80);
+
+  for (const qrErr of [
+    'Não leu o QR Code de 50',
+    'O QR Code de 50 não leu',
+    'Não escaneou o QR Code de 50',
+    'A câmera não leu o QR de 50',
+  ]) {
+    assert.equal(isStatusQueryMessage(qrErr), true, `Deveria ser erro/status: ${qrErr}`);
+    assert.equal(parseBrlAmountFromText(qrErr), null, `Não deveria cobrar: ${qrErr}`);
+  }
+
+  // Achado 6: isCancelCommand com mil/k/50reais, saudações antes de status/pago, follow-ups com mil/k/50reais e verbos conjugados no menu
+  for (const cancelMsg of [
+    'Cancela o pix de 2 mil',
+    'Cancela o pix de dois mil reais',
+    'Cancela o pix de 5k',
+    'Cancela o pix de 50reais',
+    'Cancela o pix de R$50',
+  ]) {
+    assert.equal(isCancelCommand(cancelMsg), true, `Deveria cancelar: ${cancelMsg}`);
+  }
+  assert.equal(isCancelCommand('Cancelar a atual'), false);
+  assert.equal(isCancelCommand('Cancela a 1'), false);
+
+  for (const stGreeting of ['Oi, status', 'Bom dia, status', 'Oi, situação do meu pix']) {
+    assert.equal(isStatusQueryMessage(stGreeting), true, `Deveria ser status: ${stGreeting}`);
+    assert.equal(isPostOrderFollowUpMessage(stGreeting), true, `Deveria aceitar follow-up: ${stGreeting}`);
+  }
+  for (const paidGreeting of ['Oi, pago!', 'Pronto, pago!']) {
+    assert.equal(isPaymentConfirmationMessage(paidGreeting), true, `Deveria confirmar pago: ${paidGreeting}`);
+    assert.equal(isPostOrderFollowUpMessage(paidGreeting), true, `Deveria aceitar follow-up: ${paidGreeting}`);
+  }
+
+  for (const fuMsg of [
+    'Já paguei os 2 mil!',
+    'Já caiu os 2 mil?',
+    'Paguei 2k',
+    'Enviei 50reais',
+    'Saiu 50reais da minha conta',
+  ]) {
+    assert.equal(isPostOrderFollowUpMessage(fuMsg), true, `Deveria aceitar follow-up: ${fuMsg}`);
+  }
+
+  for (const menuVerb of ['Altera pra 100', 'Substitui por 100', 'Troque pra 100', 'Mude pra 100']) {
+    assert.deepEqual(
+      parseActiveOrderMenuReply(menuVerb),
+      { choice: 'new', explicitOptionDigit: null, inlineNewAmountBrl: 100 },
+      `Deveria interpretar substituição no menu: ${menuVerb}`
+    );
+  }
+});
