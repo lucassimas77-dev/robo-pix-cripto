@@ -3476,3 +3476,238 @@ test('17. Busca #37: corrida liquidação vs menu 1/2, "mil e quinhentos" / "2 m
     inlineNewAmountBrl: 150,
   });
 });
+
+test('BaileysDirectManager v7: self-chat ("Você") sem loop, resolução @lid com allowedTestPhone, append recente vs histórico antigo, CIPHERTEXT e fallback de envio', async () => {
+  const { repository } = createPrivacyTestSetup();
+  try {
+    const baileys = new BaileysDirectManager(repository, 'data/wa_auth_test_v7', {
+      filterMode: 'keyword_only',
+      allowedTestPhone: '5511999998888',
+    });
+
+    const received: Array<{ phone: string; customerJid: string; text: string }> = [];
+    baileys.setIncomingHandler(async (params) => {
+      received.push({ phone: params.phone, customerJid: params.customerJid, text: params.text });
+    });
+
+    const mockSock = {
+      user: {
+        id: '5511911112222:12@s.whatsapp.net',
+        lid: '299999888877777:12@lid',
+      },
+      signalRepository: {
+        lidMapping: {
+          getPNForLID: async (lid: string) =>
+            lid.startsWith('198765432109876') ? '5511999998888:0@s.whatsapp.net' : null,
+          getLIDForPN: async (pn: string) =>
+            pn === '551199998888@s.whatsapp.net' ? '155555444433333@lid' : null,
+        },
+      },
+    } as unknown as Parameters<BaileysDirectManager['handleUpsertMessages']>[2];
+
+    // 1. Mensagem vinda como @lid SEM remoteJidAlt resolve PN via getPNForLID e passa pelo allowedTestPhone!
+    await baileys.handleUpsertMessages(
+      [
+        {
+          key: { id: 'MSG_LID_1', remoteJid: '198765432109876@lid', fromMe: false },
+          messageTimestamp: Math.floor(Date.now() / 1000),
+          message: { conversation: 'Me manda um Pix de 50' },
+        },
+      ] as unknown as Parameters<BaileysDirectManager['handleUpsertMessages']>[0],
+      'notify',
+      mockSock
+    );
+    assert.equal(received.length, 1);
+    assert.equal(received[0].phone, '5511999998888');
+    assert.equal(received[0].customerJid, '198765432109876@lid');
+
+    // 2. Mensagem @lid sem PN no cache resolve via getLIDForPN com variante sem 9º dígito BR!
+    await baileys.handleUpsertMessages(
+      [
+        {
+          key: { id: 'MSG_LID_2', remoteJid: '155555444433333@lid', fromMe: false },
+          messageTimestamp: Math.floor(Date.now() / 1000),
+          message: { extendedTextMessage: { text: 'Pix de 75' } },
+        },
+      ] as unknown as Parameters<BaileysDirectManager['handleUpsertMessages']>[0],
+      'notify',
+      mockSock
+    );
+    assert.equal(received.length, 2);
+    assert.equal(received[1].text, 'Pix de 75');
+
+    // 3. Mensagem de número diferente do allowedTestPhone é bloqueada e registrada no diagnóstico!
+    await baileys.handleUpsertMessages(
+      [
+        {
+          key: { id: 'MSG_OTHER_PHONE', remoteJid: '5521977776666@s.whatsapp.net', fromMe: false },
+          messageTimestamp: Math.floor(Date.now() / 1000),
+          message: { conversation: 'Pix de 20' },
+        },
+      ] as unknown as Parameters<BaileysDirectManager['handleUpsertMessages']>[0],
+      'notify',
+      mockSock
+    );
+    assert.equal(received.length, 2);
+    assert.ok(
+      baileys.getStatus().recentEvents.some((e) => e.summary.includes('teste restrito ao número ...8888'))
+    );
+
+    // 4. Limpa allowedTestPhone -> testa Self-Chat ("Você") vs envio para terceiros!
+    baileys.updateFilterSettings({ allowedTestPhone: '' });
+
+    // 4a. Mensagem fromMe enviada pelo dono para OUTRO contato NUNCA é respondida!
+    await baileys.handleUpsertMessages(
+      [
+        {
+          key: { id: 'MSG_OUT_FRIEND', remoteJid: '5521977776666@s.whatsapp.net', fromMe: true },
+          messageTimestamp: Math.floor(Date.now() / 1000),
+          message: { conversation: 'Vou te mandar um Pix de 100' },
+        },
+      ] as unknown as Parameters<BaileysDirectManager['handleUpsertMessages']>[0],
+      'notify',
+      mockSock
+    );
+    assert.equal(received.length, 2);
+
+    // 4b. Mensagem fromMe na conversa consigo mesmo ("Você", tanto por PN quanto por LID) FUNCIONA!
+    await baileys.handleUpsertMessages(
+      [
+        {
+          key: { id: 'MSG_SELF_1', remoteJid: '299999888877777@lid', fromMe: true },
+          messageTimestamp: Math.floor(Date.now() / 1000),
+          message: { conversation: 'Pix de 30' },
+        },
+      ] as unknown as Parameters<BaileysDirectManager['handleUpsertMessages']>[0],
+      'notify',
+      mockSock
+    );
+    assert.equal(received.length, 3);
+    assert.equal(received[2].phone, '5511911112222');
+    assert.equal(received[2].text, 'Pix de 30');
+
+    // 5. type === 'append': recente (5s atrás) é processado; duplicado e histórico antigo (2h atrás) são ignorados!
+    const nowSec = Math.floor(Date.now() / 1000);
+    await baileys.handleUpsertMessages(
+      [
+        {
+          key: { id: 'MSG_APPEND_RECENT', remoteJid: '5511988887777@s.whatsapp.net', fromMe: false },
+          messageTimestamp: nowSec - 5,
+          message: { conversation: 'Quero pagar 45 no pix' },
+        },
+        {
+          key: { id: 'MSG_APPEND_RECENT', remoteJid: '5511988887777@s.whatsapp.net', fromMe: false },
+          messageTimestamp: nowSec - 5,
+          message: { conversation: 'Quero pagar 45 no pix' },
+        },
+        {
+          key: { id: 'MSG_APPEND_OLD', remoteJid: '5511988887777@s.whatsapp.net', fromMe: false },
+          messageTimestamp: nowSec - 7200,
+          message: { conversation: 'Pix de 999 antigo' },
+        },
+      ] as unknown as Parameters<BaileysDirectManager['handleUpsertMessages']>[0],
+      'append',
+      mockSock
+    );
+    assert.equal(received.length, 4);
+    assert.equal(received[3].text, 'Quero pagar 45 no pix');
+
+    // 6. Stub CIPHERTEXT (2) sem msg.message gera aviso claro no diagnóstico
+    await baileys.handleUpsertMessages(
+      [
+        {
+          key: { id: 'MSG_CIPHERTEXT', remoteJid: '5511988887777@s.whatsapp.net', fromMe: false },
+          messageTimestamp: nowSec,
+          messageStubType: 2,
+        },
+      ] as unknown as Parameters<BaileysDirectManager['handleUpsertMessages']>[0],
+      'notify',
+      mockSock
+    );
+    assert.ok(
+      baileys.getStatus().recentEvents.some((e) => e.summary.includes('criptografada'))
+    );
+
+    // 7. Mensagem editada (protocolMessage.editedMessage) é extraída corretamente
+    await baileys.handleUpsertMessages(
+      [
+        {
+          key: { id: 'MSG_EDITED_1', remoteJid: '5511988887777@s.whatsapp.net', fromMe: false },
+          messageTimestamp: nowSec,
+          message: {
+            protocolMessage: {
+              editedMessage: { conversation: 'Pix de 88' },
+            },
+          },
+        },
+      ] as unknown as Parameters<BaileysDirectManager['handleUpsertMessages']>[0],
+      'notify',
+      mockSock
+    );
+    assert.equal(received.length, 5);
+    assert.equal(received[4].text, 'Pix de 88');
+
+    // 8. sendText: fallback para endereço alternativo (@s.whatsapp.net quando @lid falha) + anti-loop no self-chat!
+    const sendAttempts: Array<{ jid: string; id?: string }> = [];
+    const internal = baileys as unknown as {
+      sock: Record<string, unknown>;
+      state: string;
+    };
+    internal.state = 'CONNECTED';
+    internal.sock = {
+      user: {
+        id: '5511911112222:12@s.whatsapp.net',
+        lid: '299999888877777:12@lid',
+      },
+      sendMessage: async (jid: string, content: { text?: string }, opts?: { messageId?: string }) => {
+        sendAttempts.push({ jid, id: opts?.messageId });
+        if (jid === '198765432109876@lid') {
+          throw new Error('Falha simulada no LID');
+        }
+        return {
+          key: { id: opts?.messageId || 'SENT_OK', remoteJid: jid, fromMe: true },
+          message: { conversation: content.text || '' },
+        };
+      },
+    };
+
+    const okFallback = await baileys.sendText(
+      '5511999998888',
+      'Seu link Pix de R$ 50,00',
+      '198765432109876@lid'
+    );
+    assert.equal(okFallback, true);
+    assert.deepEqual(
+      sendAttempts.map((a) => a.jid),
+      ['198765432109876@lid', '5511999998888@s.whatsapp.net']
+    );
+
+    // 8b. Envio ao próprio chat ("Você") marca ID e texto -> se o WhatsApp ecoar, NÃO entra em loop!
+    const okSelfSend = await baileys.sendText(
+      '5511911112222',
+      '✅ Link Pix gerado: R$ 30,00',
+      '299999888877777@lid'
+    );
+    assert.equal(okSelfSend, true);
+    const selfSentId = sendAttempts[sendAttempts.length - 1]?.id || '';
+    await baileys.handleUpsertMessages(
+      [
+        {
+          key: { id: selfSentId, remoteJid: '299999888877777@lid', fromMe: true },
+          messageTimestamp: nowSec,
+          message: { conversation: '✅ Link Pix gerado: R$ 30,00' },
+        },
+        {
+          key: { id: 'DIFF_ECHO_ID', remoteJid: '299999888877777@lid', fromMe: true },
+          messageTimestamp: nowSec,
+          message: { conversation: '✅ Link Pix gerado: R$ 30,00' },
+        },
+      ] as unknown as Parameters<BaileysDirectManager['handleUpsertMessages']>[0],
+      'notify',
+      mockSock
+    );
+    assert.equal(received.length, 5, 'Eco da própria resposta do robô no self-chat NUNCA pode gerar loop!');
+  } finally {
+    repository.close();
+  }
+});

@@ -686,7 +686,13 @@ export function createAppHttpServer(params: {
           200,
           baileys
             ? baileys.getStatus()
-            : { state: 'DISCONNECTED', filterMode: 'keyword_only', allowedTestPhone: '' }
+            : {
+                state: 'DISCONNECTED',
+                filterMode: 'keyword_only',
+                allowedTestPhone: '',
+                initialSyncDone: false,
+                recentEvents: [],
+              }
         );
         return;
       }

@@ -28,7 +28,7 @@ export class UnifiedWhatsAppGateway implements IWhatsAppGateway {
       createdAt: new Date().toISOString(),
     });
 
-    if (this.baileys?.isConnected()) {
+    if (this.baileys?.isConnected() || this.baileys?.isConnecting?.()) {
       await this.baileys.sendText(phone, text, preferredJid);
       return;
     }
@@ -68,7 +68,7 @@ export class UnifiedWhatsAppGateway implements IWhatsAppGateway {
       createdAt: new Date().toISOString(),
     });
 
-    if (this.baileys?.isConnected()) {
+    if (this.baileys?.isConnected() || this.baileys?.isConnecting?.()) {
       let sentSummary = false;
       if (params.qrCodeBase64) {
         sentSummary = await this.baileys.sendImageWithCaption(

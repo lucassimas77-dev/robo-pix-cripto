@@ -115,6 +115,38 @@ export function renderDashboardHtml(): string {
     }
     .toast { color: #34d399; font-size: 13px; font-weight: 600; }
     .err-msg { color: #f87171; font-size: 13px; font-weight: 600; }
+    .warn-banner {
+      background: rgba(245, 158, 11, 0.12);
+      border: 1px solid rgba(245, 158, 11, 0.35);
+      color: #fde68a;
+      padding: 8px 12px;
+      border-radius: 8px;
+      font-size: 12.5px;
+      line-height: 1.4;
+    }
+    .diag-box {
+      background: var(--card-2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .diag-list {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      max-height: 185px;
+      overflow-y: auto;
+      font-size: 12.5px;
+      line-height: 1.35;
+    }
+    .diag-item { color: var(--text); }
+    .diag-item.ok { color: #6ee7b7; }
+    .diag-item.warn { color: #fcd34d; }
+    .diag-item.error { color: #fca5a5; }
+    .diag-time { color: var(--muted); font-family: monospace; margin-right: 6px; }
     .hidden { display: none !important; }
   </style>
 </head>
@@ -218,9 +250,14 @@ export function renderDashboardHtml(): string {
             </label>
             <label>
               Opcional: Restringir teste apenas a 1 telefone (ex: 5511999998888)
-              <input id="allowedPhone" placeholder="Deixe vazio para atender qualquer cliente que pedir Pix" />
+              <div style="display:flex;gap:8px;align-items:center;">
+                <input id="allowedPhone" style="flex:1;" placeholder="Deixe vazio para atender qualquer cliente (recomendado)" />
+                <button id="saveWaFilterBtn" class="btn-ghost" type="button" style="padding:10px 12px;white-space:nowrap;">💾 Salvar Filtro</button>
+              </div>
             </label>
+            <div id="waFilterWarn" class="warn-banner hidden"></div>
             <span id="waFilterErr" class="err-msg"></span>
+            <span id="waFilterOk" class="toast"></span>
             <div style="display:flex;gap:10px;flex-wrap:wrap;">
               <button id="connectWaBtn" class="btn" type="button">📲 Gerar QR Code do WhatsApp</button>
               <button id="disconnectWaBtn" class="btn btn-red" type="button">Desconectar WhatsApp</button>
@@ -228,6 +265,15 @@ export function renderDashboardHtml(): string {
             <p id="waHint" style="font-size:13px;color:var(--muted);"></p>
           </div>
           <div id="qrBox" class="qr-box">Clique em "Gerar QR Code" ao lado</div>
+        </div>
+        <div class="diag-box">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+            <strong style="font-size:13px;">📡 Diagnóstico ao Vivo do WhatsApp</strong>
+            <span id="waSyncPill" class="pill" style="font-size:11px;">Aguardando conexão</span>
+          </div>
+          <div id="waDiagList" class="diag-list">
+            <span style="color:var(--muted);">Nenhuma atividade ainda. Conecte o WhatsApp e envie "Pix de 50" (pode testar até na conversa "Você" consigo mesmo!).</span>
+          </div>
         </div>
       </section>
 
@@ -271,8 +317,13 @@ export function renderDashboardHtml(): string {
     const qrBox = document.getElementById('qrBox');
     const waHint = document.getElementById('waHint');
     const waFilterErr = document.getElementById('waFilterErr');
+    const waFilterOk = document.getElementById('waFilterOk');
+    const waFilterWarn = document.getElementById('waFilterWarn');
+    const waSyncPill = document.getElementById('waSyncPill');
+    const waDiagList = document.getElementById('waDiagList');
     const filterModeEl = document.getElementById('filterMode');
     const allowedPhoneEl = document.getElementById('allowedPhone');
+    const saveWaFilterBtn = document.getElementById('saveWaFilterBtn');
     const connectWaBtn = document.getElementById('connectWaBtn');
     const disconnectWaBtn = document.getElementById('disconnectWaBtn');
     const ordersList = document.getElementById('ordersList');
@@ -462,6 +513,7 @@ export function renderDashboardHtml(): string {
 
     async function saveWaFilter() {
       waFilterErr.textContent = '';
+      waFilterOk.textContent = '';
       try {
         const res = await fetch('/api/whatsapp/settings', {
           method: 'POST',
@@ -474,7 +526,11 @@ export function renderDashboardHtml(): string {
         if (!res.ok) {
           const out = await res.json();
           waFilterErr.textContent = out.error || 'Telefone inválido.';
+          return;
         }
+        waFilterOk.textContent = '✅ Filtro salvo!';
+        setTimeout(() => { waFilterOk.textContent = ''; }, 3000);
+        await pollStatus();
       } catch {
         // Ignora
       }
@@ -482,6 +538,7 @@ export function renderDashboardHtml(): string {
 
     filterModeEl.addEventListener('change', saveWaFilter);
     allowedPhoneEl.addEventListener('change', saveWaFilter);
+    saveWaFilterBtn.addEventListener('click', saveWaFilter);
 
     connectWaBtn.addEventListener('click', async () => {
       waFilterErr.textContent = '';
@@ -533,7 +590,9 @@ export function renderDashboardHtml(): string {
         badgeDiv.style.fontWeight = '700';
         badgeDiv.textContent = '🟢 Conectado! +' + String(wa.connectedPhone || '');
         qrBox.appendChild(badgeDiv);
-        waHint.textContent = 'Tudo pronto! Basta alguém mandar "Me manda um Pix de 50" para esse WhatsApp.';
+        waHint.textContent = wa.initialSyncDone
+          ? 'Tudo pronto! Envie "Me manda um Pix de 50" de outro celular ou na conversa "Você" (consigo mesmo).'
+          : 'Conectado! Aguarde ~15 segundos terminando a sincronização inicial e depois mande "Pix de 50" (funciona até na conversa "Você"!).';
       } else if (
         wa.state === 'QR_READY' &&
         typeof wa.qrCodeDataUrl === 'string' &&
@@ -545,10 +604,53 @@ export function renderDashboardHtml(): string {
         qrBox.appendChild(img);
         waHint.textContent = 'No celular: Abra o WhatsApp > Aparelhos Conectados > Conectar Aparelho e aponte para o QR ao lado.';
       } else if (wa.state === 'CONNECTING') {
-        qrBox.textContent = 'Aguarde...';
+        qrBox.textContent = 'Conectando ao WhatsApp...';
+        waHint.textContent = 'Estabelecendo conexão segura (pode levar alguns segundos após ler o QR).';
       } else {
         qrBox.textContent = 'Clique em "Gerar QR Code"';
         waHint.textContent = wa.lastError ? String(wa.lastError) : '';
+      }
+    }
+
+    function renderDiagSafe(wa) {
+      if (wa.allowedTestPhone) {
+        waFilterWarn.textContent = '⚠️ Atenção: o robô só vai responder ao número final ...' + String(wa.allowedTestPhone).slice(-4) + '. Apague o campo acima e clique em "Salvar Filtro" para responder qualquer cliente.';
+        waFilterWarn.classList.remove('hidden');
+      } else {
+        waFilterWarn.classList.add('hidden');
+      }
+
+      if (wa.state === 'CONNECTED') {
+        waSyncPill.textContent = wa.initialSyncDone ? '🟢 Pronto para responder' : '⏳ Sincronizando contatos...';
+      } else if (wa.state === 'CONNECTING') {
+        waSyncPill.textContent = '⏳ Conectando...';
+      } else if (wa.state === 'QR_READY') {
+        waSyncPill.textContent = '📲 Aguardando leitura do QR';
+      } else {
+        waSyncPill.textContent = 'Desconectado';
+      }
+
+      waDiagList.replaceChildren();
+      const events = Array.isArray(wa.recentEvents) ? wa.recentEvents : [];
+      if (events.length === 0) {
+        const empty = document.createElement('span');
+        empty.style.color = 'var(--muted)';
+        empty.textContent = 'Nenhuma atividade ainda. Conecte o WhatsApp e mande "Pix de 50" (pode testar na conversa "Você" consigo mesmo ou de outro celular).';
+        waDiagList.appendChild(empty);
+        return;
+      }
+
+      for (const ev of events) {
+        const row = document.createElement('div');
+        const level = ev.level === 'ok' || ev.level === 'warn' || ev.level === 'error' ? ev.level : 'info';
+        row.className = 'diag-item ' + level;
+        const tSpan = document.createElement('span');
+        tSpan.className = 'diag-time';
+        tSpan.textContent = '[' + String(ev.time || '') + ']';
+        const txt = document.createTextNode(String(ev.summary || ''));
+        row.appendChild(tSpan);
+        row.appendChild(txt);
+        waDiagList.appendChild(row);
       }
     }
 
@@ -632,6 +734,7 @@ export function renderDashboardHtml(): string {
 
         waBadge.textContent = wa.state === 'CONNECTED' ? '🟢 WHATSAPP CONECTADO' : String(wa.state || 'DESCONECTADO');
         renderQrBoxSafe(wa);
+        renderDiagSafe(wa);
         renderOrdersSafe(orders);
       } catch {
         // Ignora oscilação momentânea de rede sem estourar Promise rejeitada
